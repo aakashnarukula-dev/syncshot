@@ -8,6 +8,7 @@ import type { KeyboardShortcut } from "./components/preferences/KeyboardShortcut
 import { toast } from "sonner";
 import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { editorActions } from "@/stores/editorStore";
+import { startSyncEngine } from "@/lib/sync/engine";
 import { loadLicenseStatus, type LicenseStatus } from "@/lib/license";
 import { Paywall } from "@/components/Paywall";
 // Startup-critical: static import so it ships in the entry chunk and never
@@ -17,8 +18,9 @@ import { ScreenshotThumbnail } from "./components/ScreenshotThumbnail";
 // Lazy load heavy components
 const ImageEditor = lazy(() => import("./components/ImageEditor").then(m => ({ default: m.ImageEditor })));
 const PreferencesPage = lazy(() => import("./components/preferences/PreferencesPage").then(m => ({ default: m.PreferencesPage })));
+const LibraryView = lazy(() => import("./components/Library/LibraryView").then(m => ({ default: m.LibraryView })));
 
-type AppMode = "main" | "preferences" | "thumbnail";
+type AppMode = "main" | "preferences" | "thumbnail" | "library";
 
 const THUMB_WIDTH = 240;
 const COLLAPSED_WIDTH = 18;
@@ -343,6 +345,43 @@ function MainApp() {
     setLicenseStatus(status);
     licenseStatusRef.current = status;
     setShowPaywall(false);
+  }, []);
+
+  // Boot the Firebase realtime sync engine once. It runs for the life of this
+  // (always-alive, usually hidden) main webview — independent of which mode is
+  // showing — so screenshot/clipboard sync keeps working in the background.
+  useEffect(() => {
+    startSyncEngine().catch((e) => console.error("sync engine start failed:", e));
+  }, []);
+
+  // Open the ScreenshotX/ClipboardX library as a normal decorated window
+  // (reuses the main window, like Preferences).
+  const openLibrary = useCallback(async () => {
+    try {
+      const w = getCurrentWindow();
+      await w.setAlwaysOnTop(false);
+      await w.setContentProtected(false);
+      await w.setResizable(true);
+      await w.setDecorations(true);
+      await w.setTitle("ScreenshotX");
+      await w.setSize(new LogicalSize(1100, 720));
+      await w.center();
+      await w.show();
+      await w.setFocus();
+    } catch (e) {
+      console.error("open library failed:", e);
+    }
+    setMode("library");
+  }, []);
+
+  const closeLibrary = useCallback(async () => {
+    setMode("main");
+    try {
+      const w = getCurrentWindow();
+      await w.setDecorations(false);
+      await w.setTitle("");
+      await w.hide();
+    } catch {}
   }, []);
 
   const updateThumbs = useCallback((updater: (prev: string[]) => string[]) => {
@@ -831,8 +870,10 @@ function MainApp() {
           setIsCollapsed(true);
         }
       });
+      // Tray "Library…" (or another launch) opens the sync library window.
+      const unlisten9 = await listen("open-library", () => { openLibrary(); });
       const prevCleanup = unlisten6;
-      unlisten6 = () => { prevCleanup(); unlisten7(); unlisten8(); };
+      unlisten6 = () => { prevCleanup(); unlisten7(); unlisten8(); unlisten9(); };
     };
 
     setupListeners();
@@ -962,6 +1003,14 @@ function MainApp() {
         onToggleCollapsed={handleToggleCollapsed}
         onHoverChange={handleHoverChange}
       />
+    );
+  }
+
+  if (mode === "library") {
+    return (
+      <Suspense fallback={<LoadingFallback />}>
+        <LibraryView onClose={closeLibrary} />
+      </Suspense>
     );
   }
 
