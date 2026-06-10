@@ -141,29 +141,33 @@ default in the client.)
 **not** committed — regenerate with
 `firebase apps:sdkconfig android <appId> --out android/app/google-services.json -P screenshot-x-v1`).
 
-## Integration checklist (console / gcloud — not deployable from this dir)
+## Deployment status — LIVE on `screenshot-x-v1` ✅
 
-These must be done on `screenshot-x-v1` for the clients to actually work (see the
-Mac sync notes):
+All deployed/configured on 2026-06-11:
 
-1. **Enable Anonymous auth** — Auth → Sign-in method → Anonymous → Enable. The Mac
-   client signs in anonymously before calling the pairing callables.
-2. **Authorized domains** — Auth → Settings → Authorized domains → add the Tauri
-   webview origins `tauri://localhost` and `http://asset.localhost`, else anonymous
-   auth / callables fail in the desktop app.
-3. **Storage CORS** — the Tauri webview reads `thumb.webp` / `full.png` via
-   `getBytes` (CORS XHR); the default bucket CORS blocks it. Apply a CORS config
-   that allows the Tauri origins to the bucket
-   `screenshot-x-v1.firebasestorage.app`:
-   ```bash
-   gcloud storage buckets update gs://screenshot-x-v1.firebasestorage.app \
-     --cors-file=cors.json
-   # cors.json: [{"origin":["tauri://localhost","http://asset.localhost"],
-   #              "method":["GET"],"responseHeader":["Content-Type"],"maxAgeSeconds":3600}]
-   ```
-4. **Firestore + Storage provisioned** — created as part of the deploy below
-   (Firestore default DB in `us-central1`; default Storage bucket already exists).
+- ✅ **Firestore** — default DB created, `firestore.rules` + `firestore.indexes.json` released.
+- ✅ **Storage** — default bucket `screenshot-x-v1.firebasestorage.app` (US-CENTRAL1) created + `storage.rules` released.
+- ✅ **Functions** — all 5 deployed, Node 20 (2nd gen), us-central1:
+  `createLibrary`, `createPairingCode`, `redeemPairingCode`, `revokeDevice` (callable) + `cleanupExpiredCodes` (scheduled hourly).
+- ✅ **Storage CORS** — `tauri://localhost` + `http://asset.localhost` (GET/HEAD) allowed on the bucket.
+- ✅ **Auth** — Anonymous sign-in enabled; authorized domains include `localhost`, `asset.localhost` (the Tauri webview hostnames).
 
-Auth: the clients sign in (e.g. Anonymous or Email) to get a `uid`, then call
-`createLibrary` (first device) or `redeemPairingCode` (additional devices) to
-acquire the `libId` claim.
+Redeploy any time with:
+```bash
+cd firebase && firebase use screenshot-x-v1
+firebase deploy --only firestore:rules,firestore:indexes,storage,functions --force
+```
+
+> ⚠️ **Org-policy gotcha (gyftalala.com):** the first functions deploy failed with
+> *"missing permission on the build service account"*. This project is under an org
+> whose policy strips the automatic Editor grant from default service accounts, so
+> the Compute Engine default SA (`428592678377-compute@developer.gserviceaccount.com`,
+> the build+runtime SA for 2nd-gen functions) had **no** roles. Fixed by granting it
+> `roles/cloudbuild.builds.builder` (build) + `roles/editor` (runtime: Firestore +
+> Auth-admin for `setCustomUserClaims`). If functions deploys start failing again
+> after a project/SA reset, re-grant those two roles to that SA.
+
+Client flow: sign in anonymously → `uid` → call `createLibrary` (first device) or
+`redeemPairingCode` (additional devices) → force-refresh the ID token
+(`getIdToken(true)`) so the new `libId` claim is live → read/write under
+`libraries/{libId}/**`.
