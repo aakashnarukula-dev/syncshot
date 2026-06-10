@@ -1,3 +1,4 @@
 <resources>
     <string name="app_name">ScreenshotX</string>
+    <string name="accessibility_description">Lets ScreenshotX capture copied text in the background so it syncs to your other devices. ScreenshotX only reads the clipboard when you copy; nothing else is accessed.</string>
 </resources>
