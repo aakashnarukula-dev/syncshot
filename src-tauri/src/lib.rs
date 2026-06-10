@@ -16,7 +16,7 @@ use commands::{
     get_desktop_directory, get_desktop_root, get_mouse_position, get_temp_directory,
     list_screenshots, native_capture_fullscreen, native_capture_interactive,
     native_capture_window, open_editor_window, play_screenshot_sound, save_edited_image,
-    save_native_screenshot,
+    save_native_screenshot, save_synced_image, set_clipboard_text,
 };
 use license::{get_machine_id, keychain_delete, keychain_get, keychain_set};
 
@@ -63,6 +63,10 @@ pub fn run() {
                 eprintln!("Failed to enable autostart: {}", e);
             }
 
+            // Start the clipboard watcher: polls NSPasteboard.changeCount and
+            // emits `clipboard-changed` so the webview can sync copies.
+            crate::clipboard::start_clipboard_watcher(app.handle().clone());
+
             if let Some(window) = app.get_webview_window("main") {
                 let window_clone = window.clone();
                 window.on_window_event(move |event| {
@@ -76,6 +80,9 @@ pub fn run() {
             }
 
             use tauri::menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem};
+
+            let library_item =
+                MenuItemBuilder::with_id("library", "Library…").build(app)?;
 
             let preferences_item =
                 MenuItemBuilder::with_id("preferences", "Preferences…").build(app)?;
@@ -101,6 +108,7 @@ pub fn run() {
                     &capture_screen_item,
                     &capture_window_item,
                     &PredefinedMenuItem::separator(app)?,
+                    &library_item,
                     &preferences_item,
                     &license_item,
                     &PredefinedMenuItem::separator(app)?,
@@ -117,6 +125,9 @@ pub fn run() {
                 .on_menu_event(move |app, event| {
                     use tauri::Emitter;
                     match event.id().as_ref() {
+                        "library" => {
+                            let _ = app.emit("open-library", ());
+                        }
                         "preferences" => {
                             let _ = app.emit("open-preferences", ());
                         }
@@ -159,6 +170,8 @@ pub fn run() {
             native_capture_fullscreen,
             native_capture_window,
             play_screenshot_sound,
+            save_synced_image,
+            set_clipboard_text,
             get_mouse_position,
             get_machine_id,
             keychain_get,

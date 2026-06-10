@@ -65,6 +65,7 @@ pub async fn capture_region(
 /// Save a native screenshot file to the user's save dir and optionally copy to clipboard
 #[tauri::command]
 pub async fn save_native_screenshot(
+    app: AppHandle,
     source_path: String,
     save_dir: String,
     copy_to_clip: bool,
@@ -73,7 +74,48 @@ pub async fn save_native_screenshot(
     if copy_to_clip {
         copy_image_to_clipboard(&saved_path)?;
     }
+    // Notify the webview so the Firebase sync engine can upload this capture.
+    // (The publisher dedupes by sha256, so a spurious emit is harmless.)
+    use tauri::Emitter;
+    let _ = app.emit("new-screenshot", saved_path.clone());
     Ok(saved_path)
+}
+
+/// Save a screenshot received via Firebase sync into the ScreenshotX folder and
+/// copy it to the clipboard. Returns the saved file path. The existing save-dir
+/// poll then surfaces it in the thumbnail column.
+#[tauri::command]
+pub async fn save_synced_image(bytes: Vec<u8>, name: String) -> Result<String, String> {
+    let dir = get_screenshotx_dir()?;
+    // Sanitize the supplied name into a safe filename; fall back to a generated
+    // one if it sanitizes to empty.
+    let safe: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let filename = if safe.is_empty() {
+        generate_filename("synced", "png")?
+    } else {
+        safe
+    };
+    let path = PathBuf::from(&dir).join(&filename);
+    fs::write(&path, &bytes).map_err(|e| format!("Failed to save synced image: {}", e))?;
+    let path_str = path.to_string_lossy().into_owned();
+    // Mirror local-capture behavior: place the received image on the clipboard.
+    let _ = copy_image_to_clipboard(&path_str);
+    Ok(path_str)
+}
+
+/// Write text to the system clipboard (re-copy a synced ClipboardX entry).
+#[tauri::command]
+pub async fn set_clipboard_text(text: String) -> Result<(), String> {
+    crate::clipboard::set_clipboard_string(&text)
 }
 
 /// Copy an existing image file to the system clipboard.
