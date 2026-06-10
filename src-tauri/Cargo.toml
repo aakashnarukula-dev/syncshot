@@ -1,0 +1,43 @@
+[package]
+name = "screenshotx"
+version = "0.2.4"
+description = "ScreenshotX — fast screenshot capture, edit, and share"
+authors = ["kartik labhshetwar"]
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The lib name matches the package name to allow `screenshotx::run()` usage
+# On Windows, if there's a conflict with bin name, we can add `_lib` suffix
+name = "screenshotx"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+base64 = "0.22"
+dirs = "5"
+image = "0.24"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = ["macos-private-api", "protocol-asset", "tray-icon", "image-png"] }
+tauri-plugin-autostart = "2"
+tauri-plugin-drag = "2.1.1"
+tauri-plugin-global-shortcut = "2"
+tauri-plugin-opener = "2"
+tauri-plugin-screenshots = "2"
+tauri-plugin-store = "2"
+urlencoding = "2"
+xcap = "0.8"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.5"
+
+# Desktop-only: prevents a second app instance (autostart + manual launch) from
+# registering a duplicate global shortcut and spawning a second column window.
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+tauri-plugin-single-instance = "2"
+
+

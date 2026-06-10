@@ -1,0 +1,7 @@
+- generic [active]:
+  - generic:
+    - region "Notifications alt+T":
+      - list:
+        - listitem [ref=e1]:
+          - img [ref=e3]
+          - generic [ref=e6]: "Failed to get Desktop directory: Cannot read properties of undefined (reading 'invoke')"
