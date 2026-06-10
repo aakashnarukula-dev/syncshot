@@ -151,6 +151,7 @@ All deployed/configured on 2026-06-11:
   `createLibrary`, `createPairingCode`, `redeemPairingCode`, `revokeDevice` (callable) + `cleanupExpiredCodes` (scheduled hourly).
 - ✅ **Storage CORS** — `tauri://localhost` + `http://asset.localhost` (GET/HEAD) allowed on the bucket.
 - ✅ **Auth** — Anonymous sign-in enabled; authorized domains include `localhost`, `asset.localhost` (the Tauri webview hostnames).
+- ✅ **Public invoker** — `allUsers` `roles/run.invoker` granted on the 4 callables (auth is enforced in-code). Verified: an unauthenticated call returns the function's own `{"status":"UNAUTHENTICATED"}`.
 
 Redeploy any time with:
 ```bash
@@ -166,6 +167,18 @@ firebase deploy --only firestore:rules,firestore:indexes,storage,functions --for
 > `roles/cloudbuild.builds.builder` (build) + `roles/editor` (runtime: Firestore +
 > Auth-admin for `setCustomUserClaims`). If functions deploys start failing again
 > after a project/SA reset, re-grant those two roles to that SA.
+
+> ⚠️ **Org-policy gotcha #2 — Domain Restricted Sharing:** Firebase **callable**
+> functions must be invokable by `allUsers` (the Firebase ID token is verified
+> inside the function, not at IAM). The `gyftalala.com` org enforces
+> `constraints/iam.allowedPolicyMemberDomains`, which blocked the `allUsers`
+> binding (`"users... do not belong to a permitted customer"`) — so the deployed
+> callables returned a GFE **403** before reaching the code. Fixed by adding a
+> **project-level org-policy override** on `screenshot-x-v1`
+> (`iam.allowedPolicyMemberDomains` → `allowAll: true`, scoped to this project),
+> then granting `allUsers` `roles/run.invoker` on the 4 callable Cloud Run
+> services. Org-policy propagation took ~1 min. If callables start returning 403
+> again, re-check this override and the invoker bindings.
 
 Client flow: sign in anonymously → `uid` → call `createLibrary` (first device) or
 `redeemPairingCode` (additional devices) → force-refresh the ID token
