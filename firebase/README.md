@@ -5,8 +5,8 @@ Realtime backend for the multi-device screenshot + clipboard sync: **Firestore**
 Functions** (library bootstrap + device pairing). All authorization hangs off a
 single Auth custom claim, `libId`.
 
-- **Project:** `screenshot-x` (`#905091147949`)
-- **Plan:** Blaze (required for Cloud Functions egress + scheduler)
+- **Project:** `screenshot-x-v1` (`#428592678377`, parent org `gyftalala.com`)
+- **Plan:** Blaze (required for Cloud Functions egress + scheduler) — confirmed on the project
 - **Region:** `us-central1`
 - **Functions runtime:** Node.js 20 (TypeScript → `functions/lib`)
 
@@ -14,7 +14,7 @@ single Auth custom claim, `libId`.
 
 ```
 firebase/
-  .firebaserc              default project → screenshot-x
+  .firebaserc              default project → screenshot-x-v1
   firebase.json            wires rules + indexes + storage + functions
   firestore.rules          libId-claim gate; pairingCodes locked to admin SDK
   firestore.indexes.json   (empty — see "Indexes" below)
@@ -33,8 +33,8 @@ libraries/{libId}/clipboard/{id}      { ..., createdAt }   ← written by client
 pairingCodes/{code}                   { libId, createdBy, expiresAt, used }  ← functions only
 ```
 
-Storage blobs live under `libraries/{libId}/...` in bucket
-`screenshot-x.appspot.com`.
+Storage blobs live under `libraries/{libId}/...` in the project's default bucket
+(`screenshot-x-v1.firebasestorage.app` — confirm via `apps:sdkconfig`).
 
 ## Authorization
 
@@ -92,7 +92,7 @@ npm install -g firebase-tools
 firebase login                       # interactive (browser)
 
 cd firebase
-firebase use screenshot-x
+firebase use screenshot-x-v1
 
 # deploy everything this dir owns
 firebase deploy --only firestore:rules,firestore:indexes,storage,functions
@@ -103,36 +103,66 @@ Functions, Cloud Build, Artifact Registry, and Cloud Scheduler APIs — accept.
 
 ## Web app config the Mac client needs
 
-The Mac (and Android) clients initialize the Firebase Web SDK with these values.
-Known-from-project:
+The Mac (and Android) clients initialize the Firebase Web SDK with these values
+(captured from the registered `screenshotx-web` app — these are public client
+config, not secrets):
 
 ```js
 const firebaseConfig = {
-  apiKey:            "TODO — from Firebase console",   // ⬅ MISSING, see below
-  authDomain:        "screenshot-x.firebaseapp.com",
-  projectId:         "screenshot-x",
-  storageBucket:     "screenshot-x.appspot.com",
-  messagingSenderId: "905091147949",
-  appId:             "TODO — from Firebase console",   // ⬅ MISSING, see below
+  apiKey:            "AIzaSyDM8WuSfhIkQg4NkDLXLoN_KCMKROUbnvM",
+  authDomain:        "screenshot-x-v1.firebaseapp.com",
+  projectId:         "screenshot-x-v1",
+  storageBucket:     "screenshot-x-v1.firebasestorage.app",
+  messagingSenderId: "428592678377",
+  appId:             "1:428592678377:web:9e202fb9f86ecd9710b778",
 };
 ```
 
-`apiKey` and `appId` are per-registered-app and **cannot be derived here** — they
-require a Web app registered in the project, which needs console/CLI login (not
-done in this worktree). To obtain them:
+The Mac app (`src/lib/sync/firebaseConfig.ts`, on the mac branch) reads these from
+Vite env at integration time — set:
 
-```bash
-# register a Web app (once), then print the config:
-firebase apps:create web "screenshotx-web"     # if no web app exists yet
-firebase apps:sdkconfig web                     # prints apiKey + appId + the rest
+```
+VITE_FB_API_KEY=AIzaSyDM8WuSfhIkQg4NkDLXLoN_KCMKROUbnvM
+VITE_FB_APP_ID=1:428592678377:web:9e202fb9f86ecd9710b778
 ```
 
-Paste the printed `apiKey` and `appId` into the clients' Firebase config.
+(authDomain/projectId/storageBucket/messagingSenderId are already hardcoded or
+default in the client.)
 
-> Note: newer Firebase projects sometimes report the bucket as
-> `screenshot-x.firebasestorage.app` instead of `screenshot-x.appspot.com`.
-> Confirm the actual value from `apps:sdkconfig` / the console and use that for
-> Storage.
+### Apps registered on `screenshot-x-v1`
+
+| Platform | App ID | Package / nickname |
+|---|---|---|
+| Web | `1:428592678377:web:9e202fb9f86ecd9710b778` | `screenshotx-web` |
+| Android | `1:428592678377:android:eeae517abb21732410b778` | `com.aakash.ssx` |
+
+`google-services.json` for the Android app has been written to
+`android/app/google-services.json` (gitignored by `android/.gitignore`, so it is
+**not** committed — regenerate with
+`firebase apps:sdkconfig android <appId> --out android/app/google-services.json -P screenshot-x-v1`).
+
+## Integration checklist (console / gcloud — not deployable from this dir)
+
+These must be done on `screenshot-x-v1` for the clients to actually work (see the
+Mac sync notes):
+
+1. **Enable Anonymous auth** — Auth → Sign-in method → Anonymous → Enable. The Mac
+   client signs in anonymously before calling the pairing callables.
+2. **Authorized domains** — Auth → Settings → Authorized domains → add the Tauri
+   webview origins `tauri://localhost` and `http://asset.localhost`, else anonymous
+   auth / callables fail in the desktop app.
+3. **Storage CORS** — the Tauri webview reads `thumb.webp` / `full.png` via
+   `getBytes` (CORS XHR); the default bucket CORS blocks it. Apply a CORS config
+   that allows the Tauri origins to the bucket
+   `screenshot-x-v1.firebasestorage.app`:
+   ```bash
+   gcloud storage buckets update gs://screenshot-x-v1.firebasestorage.app \
+     --cors-file=cors.json
+   # cors.json: [{"origin":["tauri://localhost","http://asset.localhost"],
+   #              "method":["GET"],"responseHeader":["Content-Type"],"maxAgeSeconds":3600}]
+   ```
+4. **Firestore + Storage provisioned** — created as part of the deploy below
+   (Firestore default DB in `us-central1`; default Storage bucket already exists).
 
 Auth: the clients sign in (e.g. Anonymous or Email) to get a `uid`, then call
 `createLibrary` (first device) or `redeemPairingCode` (additional devices) to
