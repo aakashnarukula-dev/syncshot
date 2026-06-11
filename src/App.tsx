@@ -44,6 +44,35 @@ function computeThumbWindowHeight(count: number): number {
 }
 type CaptureMode = "region" | "fullscreen" | "window";
 
+// Cosmetic window flags (decorations/title/alwaysOnTop/contentProtected) can
+// throw on the borderless transparent macOS window. Run each one in isolation so
+// a single failure can't abort the caller and skip the geometry calls that
+// follow — that bug stranded the Library window in the thin edge "column"
+// geometry (setSize/center never ran). geometry-from-cosmetic separation.
+async function tweak(fn: () => Promise<void>) {
+  try { await fn(); } catch (e) { console.error("window flag failed:", e); }
+}
+
+// Turn the (possibly column-geometry) main window into a normal decorated,
+// centered window of the given size. Cosmetic flags are best-effort; the
+// geometry (size → center → show → focus) ALWAYS runs.
+async function showNormalWindow(
+  w: ReturnType<typeof getCurrentWindow>,
+  width: number,
+  height: number,
+  opts: { title?: string; resizable?: boolean; alwaysOnTop?: boolean; decorations?: boolean } = {},
+) {
+  if (opts.alwaysOnTop !== undefined) await tweak(() => w.setAlwaysOnTop(opts.alwaysOnTop!));
+  await tweak(() => w.setContentProtected(false));
+  if (opts.resizable !== undefined) await tweak(() => w.setResizable(opts.resizable!));
+  await tweak(() => w.setDecorations(opts.decorations ?? true));
+  if (opts.title !== undefined) await tweak(() => w.setTitle(opts.title!));
+  try { await w.setSize(new LogicalSize(width, height)); } catch (e) { console.error("setSize failed:", e); }
+  try { await w.center(); } catch (e) { console.error("center failed:", e); }
+  try { await w.show(); } catch (e) { console.error("show failed:", e); }
+  try { await w.setFocus(); } catch (e) { console.error("setFocus failed:", e); }
+}
+
 // Loading fallback for lazy loaded components
 function LoadingFallback() {
   return (
@@ -305,6 +334,11 @@ function App() {
 
 function MainApp() {
   const [mode, setMode] = useState<AppMode>("main");
+  // Mirror `mode` into a ref so background pollers (folder watch) can tell when a
+  // normal decorated window (library/preferences) is open and NOT yank it back
+  // into the thin thumbnail-column geometry on a new screenshot.
+  const modeRef = useRef<AppMode>("main");
+  useEffect(() => { modeRef.current = mode; }, [mode]);
   const [saveDir, setSaveDir] = useState<string>("");
   const [copyToClipboard, setCopyToClipboard] = useState(true);
   const reportError = useCallback((msg: string) => {
@@ -357,31 +391,20 @@ function MainApp() {
   // Open the ScreenshotX/ClipboardX library as a normal decorated window
   // (reuses the main window, like Preferences).
   const openLibrary = useCallback(async () => {
-    try {
-      const w = getCurrentWindow();
-      await w.setAlwaysOnTop(false);
-      await w.setContentProtected(false);
-      await w.setResizable(true);
-      await w.setDecorations(true);
-      await w.setTitle("ScreenshotX");
-      await w.setSize(new LogicalSize(1100, 720));
-      await w.center();
-      await w.show();
-      await w.setFocus();
-    } catch (e) {
-      console.error("open library failed:", e);
-    }
+    await showNormalWindow(getCurrentWindow(), 1100, 720, {
+      title: "ScreenshotX",
+      resizable: true,
+      alwaysOnTop: false,
+    });
     setMode("library");
   }, []);
 
   const closeLibrary = useCallback(async () => {
     setMode("main");
-    try {
-      const w = getCurrentWindow();
-      await w.setDecorations(false);
-      await w.setTitle("");
-      await w.hide();
-    } catch {}
+    const w = getCurrentWindow();
+    await tweak(() => w.setDecorations(false));
+    await tweak(() => w.setTitle(""));
+    try { await w.hide(); } catch (e) { console.error("hide failed:", e); }
   }, []);
 
   const updateThumbs = useCallback((updater: (prev: string[]) => string[]) => {
@@ -593,6 +616,13 @@ function MainApp() {
         const hasNew = newOnes.length > 0;
         const next = updateThumbs(() => disk);
 
+        // A normal decorated window (Library/Preferences) is showing — keep the
+        // thumb list current but don't switch mode or re-apply column geometry,
+        // or the open window collapses to the thin edge strip.
+        if (modeRef.current === "library" || modeRef.current === "preferences") {
+          return;
+        }
+
         if (next.length > 0) {
           setMode("thumbnail");
           // New file arrived (likely synced in) — surface the window.
@@ -630,15 +660,9 @@ function MainApp() {
 
     if (licenseStatusRef.current?.state === "expired") {
       setShowPaywall(true);
-      try {
-        const w = getCurrentWindow();
-        await w.setDecorations(true);
-        await w.setTitle("Activate ScreenshotX");
-        await w.setSize(new LogicalSize(520, 640));
-        await w.center();
-        await w.show();
-        await w.setFocus();
-      } catch {}
+      await showNormalWindow(getCurrentWindow(), 520, 640, {
+        title: "Activate ScreenshotX",
+      });
       setMode("main");
       return;
     }
@@ -806,19 +830,11 @@ function MainApp() {
       unlisten2 = await listen("capture-fullscreen", () => handleCapture("fullscreen"));
       unlisten3 = await listen("capture-window", () => handleCapture("window"));
       unlisten4 = await listen("open-preferences", async () => {
-        try {
-          const w = getCurrentWindow();
-          await w.setAlwaysOnTop(false);
-          await w.setResizable(true);
-          await w.setDecorations(true);
-          await w.setTitle("Preferences");
-          await w.setSize(new LogicalSize(640, 620));
-          await w.center();
-          await w.show();
-          await w.setFocus();
-        } catch (e) {
-          console.error("open preferences failed:", e);
-        }
+        await showNormalWindow(getCurrentWindow(), 640, 620, {
+          title: "Preferences",
+          resizable: true,
+          alwaysOnTop: false,
+        });
         setMode("preferences");
       });
       unlisten5 = await listen<{ originalPath: string; newPath: string }>(
@@ -840,15 +856,9 @@ function MainApp() {
         }
       });
       const unlisten7 = await listen("open-license", async () => {
-        try {
-          const w = getCurrentWindow();
-          await w.setDecorations(true);
-          await w.setTitle("Activate ScreenshotX");
-          await w.setSize(new LogicalSize(520, 640));
-          await w.center();
-          await w.show();
-          await w.setFocus();
-        } catch {}
+        await showNormalWindow(getCurrentWindow(), 520, 640, {
+          title: "Activate ScreenshotX",
+        });
         setMode("main");
         setShowPaywall(true);
       });
@@ -898,26 +908,18 @@ function MainApp() {
     await loadSettings();
     setSettingsVersion(v => v + 1);
     setMode("main");
-    try {
-      const w = getCurrentWindow();
-      await w.setDecorations(false);
-      await w.setTitle("");
-      await w.hide();
-    } catch {}
+    const w = getCurrentWindow();
+    await tweak(() => w.setDecorations(false));
+    await tweak(() => w.setTitle(""));
+    try { await w.hide(); } catch (e) { console.error("hide failed:", e); }
   }, [loadSettings]);
 
   const handleThumbnailItemEdit = useCallback(async (path: string) => {
     if (licenseStatusRef.current?.state === "expired") {
       setShowPaywall(true);
-      try {
-        const w = getCurrentWindow();
-        await w.setDecorations(true);
-        await w.setTitle("Activate ScreenshotX");
-        await w.setSize(new LogicalSize(520, 640));
-        await w.center();
-        await w.show();
-        await w.setFocus();
-      } catch {}
+      await showNormalWindow(getCurrentWindow(), 520, 640, {
+        title: "Activate ScreenshotX",
+      });
       setMode("main");
       return;
     }
