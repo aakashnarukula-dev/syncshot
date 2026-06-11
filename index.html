@@ -5,6 +5,11 @@
     <link rel="icon" type="image/svg+xml" href="/tauri.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>ScreenshotX</title>
+    <!-- Critical: transparent default background so the transparent column
+         window never flashes a solid dark box before React/CSS load. Full
+         window modes (Library/Preferences/Editor) render their own opaque
+         bg-background container, so a transparent body is safe. -->
+    <style>html,body,#root{margin:0;background:transparent!important}</style>
   </head>
 
   <body>
