@@ -36,6 +36,15 @@ export default defineConfig(async () => ({
           "vendor-state": ["zustand", "immer"],
           // OCR engine (heavy, loaded on demand)
           "vendor-ocr": ["tesseract.js"],
+          // Firebase SDK (heavy, loaded on demand after first paint via the
+          // dynamic import of @/lib/sync/engine) — keep OFF the entry chunk.
+          "vendor-firebase": [
+            "firebase/app",
+            "firebase/auth",
+            "firebase/firestore",
+            "firebase/storage",
+            "firebase/functions",
+          ],
         },
       },
     },

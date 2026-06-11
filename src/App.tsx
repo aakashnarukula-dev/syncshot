@@ -8,7 +8,6 @@ import type { KeyboardShortcut } from "./components/preferences/KeyboardShortcut
 import { toast } from "sonner";
 import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { editorActions } from "@/stores/editorStore";
-import { startSyncEngine } from "@/lib/sync/engine";
 import { loadLicenseStatus, type LicenseStatus } from "@/lib/license";
 import { Paywall } from "@/components/Paywall";
 // Startup-critical: static import so it ships in the entry chunk and never
@@ -384,8 +383,25 @@ function MainApp() {
   // Boot the Firebase realtime sync engine once. It runs for the life of this
   // (always-alive, usually hidden) main webview — independent of which mode is
   // showing — so screenshot/clipboard sync keeps working in the background.
+  // Defer + code-split Firebase off the critical path. The sync engine
+  // transitively pulls in the whole Firebase SDK (~715KB); loading it before
+  // first paint stalls the column. Dynamic-import it after the column paints.
   useEffect(() => {
-    startSyncEngine().catch((e) => console.error("sync engine start failed:", e));
+    let cancelled = false;
+    const start = () => {
+      if (cancelled) return;
+      import("@/lib/sync/engine")
+        .then((m) => m.startSyncEngine())
+        .catch((e) => console.error("sync engine start failed:", e));
+    };
+    if ("requestIdleCallback" in window) {
+      (window as Window & { requestIdleCallback: (cb: () => void, opts?: { timeout: number }) => void }).requestIdleCallback(start, { timeout: 1500 });
+    } else {
+      setTimeout(start, 200);
+    }
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   // Open the ScreenshotX/ClipboardX library as a normal decorated window
