@@ -82,7 +82,7 @@ pub fn run() {
             use tauri::menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem};
 
             let library_item =
-                MenuItemBuilder::with_id("library", "Library…").build(app)?;
+                MenuItemBuilder::with_id("library", "Pair").build(app)?;
 
             let preferences_item =
                 MenuItemBuilder::with_id("preferences", "Preferences…").build(app)?;
