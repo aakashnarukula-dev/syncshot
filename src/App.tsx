@@ -10,6 +10,8 @@ import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react"
 import { editorActions } from "@/stores/editorStore";
 import { loadLicenseStatus, type LicenseStatus } from "@/lib/license";
 import { Paywall } from "@/components/Paywall";
+// Light module (zustand + types only — no Firebase): safe in the entry chunk.
+import { useSyncStore } from "@/stores/syncStore";
 // Startup-critical: static import so it ships in the entry chunk and never
 // needs a runtime protocol fetch that can stall behind the launch IPC burst.
 import { ScreenshotThumbnail } from "./components/ScreenshotThumbnail";
@@ -20,6 +22,7 @@ const PreferencesPage = lazy(() => import("./components/preferences/PreferencesP
 const PairingView = lazy(() => import("./components/Pairing/PairingView").then(m => ({ default: m.PairingView })));
 
 type AppMode = "main" | "preferences" | "thumbnail" | "pairing";
+export type ColumnView = "screenshots" | "clipboard";
 
 const THUMB_WIDTH = 240;
 const COLLAPSED_WIDTH = 18;
@@ -35,11 +38,31 @@ const THUMB_MAX_HEIGHT =
   THUMB_VERT_PAD;
 const THUMB_MIN_HEIGHT = THUMB_ITEM_HEIGHT + THUMB_VERT_PAD;
 const THUMB_MARGIN = 24;
+// Segmented Screenshots/Text toggle pinned at the top of the expanded column
+// (pt-3 + control + pb-1.5) — added on top of each view's content height.
+const COL_TOGGLE_HEIGHT = 46;
+// Compact copied-text card estimate (4 clamped text lines + meta + padding).
+const CLIP_ITEM_HEIGHT = 96;
+const CLIP_GAP = 8; // gap-2
 
 function computeThumbWindowHeight(count: number): number {
-  if (count <= 0) return THUMB_MIN_HEIGHT;
+  if (count <= 0) return THUMB_MIN_HEIGHT + COL_TOGGLE_HEIGHT;
   const raw = count * THUMB_ITEM_HEIGHT + Math.max(0, count - 1) * THUMB_GAP + THUMB_VERT_PAD;
-  return Math.max(THUMB_MIN_HEIGHT, Math.min(raw, THUMB_MAX_HEIGHT));
+  return Math.max(THUMB_MIN_HEIGHT, Math.min(raw, THUMB_MAX_HEIGHT)) + COL_TOGGLE_HEIGHT;
+}
+
+// Clipboard view height: fit the card count, clamped to the same max as the
+// screenshot list (internal scroll past that). Empty state gets one-card height.
+function computeClipWindowHeight(count: number): number {
+  if (count <= 0) return THUMB_MIN_HEIGHT + COL_TOGGLE_HEIGHT;
+  const raw = count * CLIP_ITEM_HEIGHT + Math.max(0, count - 1) * CLIP_GAP + THUMB_VERT_PAD;
+  return Math.max(THUMB_MIN_HEIGHT, Math.min(raw, THUMB_MAX_HEIGHT)) + COL_TOGGLE_HEIGHT;
+}
+
+function columnWindowHeight(view: ColumnView, thumbCount: number): number {
+  return view === "clipboard"
+    ? computeClipWindowHeight(useSyncStore.getState().clipboard.length)
+    : computeThumbWindowHeight(thumbCount);
 }
 type CaptureMode = "region" | "fullscreen" | "window";
 
@@ -184,9 +207,8 @@ async function showCollapsedThumbnail() {
 // set, so we skip the decoration/alwaysOnTop/show IPC (pure latency on expand)
 // and only change geometry. Caller resizes while the column is still transparent
 // (opacity 0, pre-reveal) so the grow/move is invisible — no jump.
-async function expandThumbWindow(count: number) {
+async function expandThumbWindow(height: number) {
   const appWindow = getCurrentWindow();
-  const height = computeThumbWindowHeight(count);
   let mon = cachedMon;
   if (!mon) {
     try {
@@ -348,6 +370,14 @@ function MainApp() {
   const thumbsRef = useRef<string[]>([]);
   const [isCollapsed, setIsCollapsed] = useState(false);
   const isCollapsedRef = useRef(false);
+  // Which list the edge column shows: local screenshot thumbnails or the
+  // synced copied-text history. Ref mirrors state for stale-closure-free reads.
+  const [columnView, setColumnView] = useState<ColumnView>("screenshots");
+  const columnViewRef = useRef<ColumnView>("screenshots");
+  const setColumnViewBoth = useCallback((view: ColumnView) => {
+    columnViewRef.current = view;
+    setColumnView(view);
+  }, []);
   // Bumped to ask the thumbnail column to animate its collapse (auto-hide).
   const [collapseSignal, setCollapseSignal] = useState(0);
   // Bumped after the window is shown so the column replays its open animation
@@ -431,7 +461,10 @@ function MainApp() {
   }, []);
 
   // Show the column, then trigger its open animation (now that it's visible).
+  // Fresh reveals (capture / synced-in shot / dock click) always land on the
+  // screenshots view so the new shot is what the user sees.
   const openThumbnailWindow = useCallback(async (count: number, mouseX?: number, mouseY?: number) => {
+    setColumnViewBoth("screenshots");
     await showThumbnailWindow(count, mouseX, mouseY);
     // Wait for the freshly-shown window (already at final geometry, content
     // opacity:0) to paint before running the genie-in — a single rAF can fire
@@ -440,7 +473,7 @@ function MainApp() {
       requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
     );
     setOpenSignal((n) => n + 1);
-  }, []);
+  }, [setColumnViewBoth]);
 
   // Idle-based auto-hide: restarts a 5s countdown on every pointer signal. There
   // is NO sticky "hovering" flag — a flag wedges open forever if a mouseleave is
@@ -476,6 +509,20 @@ function MainApp() {
     // Enter / move / leave all just re-arm the idle countdown.
     startAutoHide();
   }, [startAutoHide]);
+
+  // Toggle Screenshots/Text while expanded: swap the view instantly (both
+  // lists stay mounted), let the new content paint at the current size, then
+  // resize the window to fit the active view. Content-stable-then-resize —
+  // same anti-flash ordering as expand — so there's no jump.
+  const handleColumnViewChange = useCallback(async (view: ColumnView) => {
+    if (columnViewRef.current === view) return;
+    setColumnViewBoth(view);
+    startAutoHide();
+    await new Promise<void>((resolve) =>
+      requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
+    );
+    await expandThumbWindow(columnWindowHeight(view, thumbsRef.current.length));
+  }, [setColumnViewBoth, startAutoHide]);
   const [shortcuts, setShortcuts] = useState<KeyboardShortcut[]>(DEFAULT_SHORTCUTS);
   const [settingsVersion, setSettingsVersion] = useState(0);
   const [tempDir, setTempDir] = useState<string>("/tmp");
@@ -757,8 +804,10 @@ function MainApp() {
         // content protection in place (no hide) and only adjust geometry —
         // skip show/reposition-to-cursor/openSignal so there's no flash or
         // open-animation replay.
+        // In clipboard view the geometry already fits that list — keep it; the
+        // shot is saved + prepended and shows when the user switches back.
         try { await appWindow.setContentProtected(false); } catch {}
-        await expandThumbWindow(next.length);
+        await expandThumbWindow(columnWindowHeight(columnViewRef.current, next.length));
       } else {
         // Was hidden/collapsed / first screenshot: full reveal at the cursor.
         await openThumbnailWindow(next.length, mouseX, mouseY);
@@ -1027,7 +1076,7 @@ function MainApp() {
       await new Promise<void>((resolve) =>
         requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
       );
-      await expandThumbWindow(thumbsRef.current.length);
+      await expandThumbWindow(columnWindowHeight(columnViewRef.current, thumbsRef.current.length));
       // Double rAF: a single rAF fires BEFORE the native resize is composited to
       // screen, so the genie would start inside a pill-sized window (the "jump up").
       // Two frames guarantee the new window geometry has painted before we reveal.
@@ -1058,6 +1107,8 @@ function MainApp() {
         isCollapsed={isCollapsed}
         collapseSignal={collapseSignal}
         openSignal={openSignal}
+        columnView={columnView}
+        onColumnViewChange={handleColumnViewChange}
         onEdit={handleThumbnailItemEdit}
         onRemove={handleThumbnailItemRemove}
         onToggleCollapsed={handleToggleCollapsed}

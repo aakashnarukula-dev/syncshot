@@ -25,7 +25,7 @@ interface ClipboardEntryProps {
   entry: ClipboardDoc;
 }
 
-function relativeTime(ms: number | null): string {
+export function relativeTime(ms: number | null): string {
   if (!ms) return "syncing…";
   const diff = Date.now() - ms;
   const sec = Math.round(diff / 1000);
