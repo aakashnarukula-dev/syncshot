@@ -17,9 +17,9 @@ import { ScreenshotThumbnail } from "./components/ScreenshotThumbnail";
 // Lazy load heavy components
 const ImageEditor = lazy(() => import("./components/ImageEditor").then(m => ({ default: m.ImageEditor })));
 const PreferencesPage = lazy(() => import("./components/preferences/PreferencesPage").then(m => ({ default: m.PreferencesPage })));
-const LibraryView = lazy(() => import("./components/Library/LibraryView").then(m => ({ default: m.LibraryView })));
+const PairingView = lazy(() => import("./components/Pairing/PairingView").then(m => ({ default: m.PairingView })));
 
-type AppMode = "main" | "preferences" | "thumbnail" | "library";
+type AppMode = "main" | "preferences" | "thumbnail" | "pairing";
 
 const THUMB_WIDTH = 240;
 const COLLAPSED_WIDTH = 18;
@@ -404,18 +404,18 @@ function MainApp() {
     };
   }, []);
 
-  // Open the ScreenshotX/ClipboardX library as a normal decorated window
-  // (reuses the main window, like Preferences).
-  const openLibrary = useCallback(async () => {
-    await showNormalWindow(getCurrentWindow(), 1100, 720, {
-      title: "ScreenshotX",
-      resizable: true,
+  // Open a small, pairing-only decorated window (reuses the main window, like
+  // Preferences). Just the QR + 6-digit code + enter-code field — no Library.
+  const openPairing = useCallback(async () => {
+    await showNormalWindow(getCurrentWindow(), 420, 640, {
+      title: "Pair Device",
+      resizable: false,
       alwaysOnTop: false,
     });
-    setMode("library");
+    setMode("pairing");
   }, []);
 
-  const closeLibrary = useCallback(async () => {
+  const closePairing = useCallback(async () => {
     setMode("main");
     const w = getCurrentWindow();
     await tweak(() => w.setDecorations(false));
@@ -641,7 +641,7 @@ function MainApp() {
         // A normal decorated window (Library/Preferences) is showing — keep the
         // thumb list current but don't switch mode or re-apply column geometry,
         // or the open window collapses to the thin edge strip.
-        if (modeRef.current === "library" || modeRef.current === "preferences") {
+        if (modeRef.current === "pairing" || modeRef.current === "preferences") {
           return;
         }
 
@@ -915,8 +915,8 @@ function MainApp() {
           setIsCollapsed(true);
         }
       });
-      // Tray "Library…" (or another launch) opens the sync library window.
-      const unlisten9 = await listen("open-library", () => { openLibrary(); });
+      // Tray "Pair" opens the small pairing-only window.
+      const unlisten9 = await listen("open-library", () => { openPairing(); });
       const prevCleanup = unlisten6;
       unlisten6 = () => { prevCleanup(); unlisten7(); unlisten8(); unlisten9(); };
     };
@@ -1066,10 +1066,10 @@ function MainApp() {
     );
   }
 
-  if (mode === "library") {
+  if (mode === "pairing") {
     return (
       <Suspense fallback={<LoadingFallback />}>
-        <LibraryView onClose={closeLibrary} />
+        <PairingView onClose={closePairing} />
       </Suspense>
     );
   }
