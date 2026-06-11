@@ -1,10 +1,18 @@
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { animate } from "motion";
 import { startDrag } from "@crabnebula/tauri-plugin-drag";
-import { ChevronLeft, ChevronRight, Link2, Loader2, Trash2 } from "lucide-react";
+import { ChevronLeft, ChevronRight, ClipboardList, Image as ImageIcon, Link2, Loader2, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 import { useSyncStore } from "@/stores/syncStore";
+import type { ColumnView } from "@/App";
+
+// Lazy: the clipboard list transitively pulls Firebase (~715KB) via
+// lib/sync/clipboard — keep it out of the startup-critical column chunk and
+// only fetch it the first time the user switches to the Text view.
+const ClipboardColumnList = lazy(() =>
+  import("./ClipboardX/ClipboardColumnList").then((m) => ({ default: m.ClipboardColumnList })),
+);
 
 // Genie-style open/close for the column, driven by motion's imperative animate()
 // on a STABLE element (no remount → thumbnails don't reload, no flash). The
@@ -33,6 +41,8 @@ interface ScreenshotThumbnailProps {
   collapseSignal?: number;
   /** Bumped after the window is shown so the open animation replays while visible. */
   openSignal?: number;
+  columnView: ColumnView;
+  onColumnViewChange: (view: ColumnView) => void;
   onEdit: (path: string) => void;
   onRemove: (path: string) => void;
   onToggleCollapsed: () => void;
@@ -44,12 +54,20 @@ export function ScreenshotThumbnail({
   isCollapsed,
   collapseSignal = 0,
   openSignal = 0,
+  columnView,
+  onColumnViewChange,
   onEdit,
   onRemove,
   onToggleCollapsed,
   onHoverChange,
 }: ScreenshotThumbnailProps) {
   const [animatingOut, setAnimatingOut] = useState(false);
+  // Fetch the (Firebase-heavy) clipboard chunk only after the first switch to
+  // the Text view, then keep it mounted so toggling back and forth is instant.
+  const [clipboardLoaded, setClipboardLoaded] = useState(false);
+  useEffect(() => {
+    if (columnView === "clipboard") setClipboardLoaded(true);
+  }, [columnView]);
   const colRef = useRef<HTMLDivElement>(null);
   const animRef = useRef<ReturnType<typeof animate> | null>(null);
   const prevOpenRef = useRef(openSignal);
@@ -102,13 +120,13 @@ export function ScreenshotThumbnail({
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape" && !isCollapsed && paths.length > 0) {
+      if (e.key === "Escape" && !isCollapsed && columnView === "screenshots" && paths.length > 0) {
         onRemove(paths[0]);
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [paths, onRemove, isCollapsed]);
+  }, [paths, onRemove, isCollapsed, columnView]);
 
   if (isCollapsed) {
     return (
@@ -144,26 +162,72 @@ export function ScreenshotThumbnail({
           <ChevronLeft className="size-4" aria-hidden="true" />
         </button>
       </div>
-      <div
-        data-thumb-scroll
-        className="flex-1 min-w-0 overflow-y-auto pt-3 pb-4 pr-3 pl-1 flex flex-col gap-5 items-stretch [&::-webkit-scrollbar]:hidden [-ms-overflow-style:none] [scrollbar-width:none]"
-        style={{
-          background: "transparent",
-          maskImage:
-            "linear-gradient(to bottom, transparent 0, black 4px, black calc(100% - 6px), transparent 100%)",
-          WebkitMaskImage:
-            "linear-gradient(to bottom, transparent 0, black 4px, black calc(100% - 6px), transparent 100%)",
-        }}
-      >
-        {paths.map((path, i) => (
-          <ThumbnailItem
-            key={path}
-            path={path}
-            eager={i < EAGER_COUNT}
-            onEdit={() => onEdit(path)}
-            onRemove={() => onRemove(path)}
-          />
-        ))}
+      <div className="flex-1 min-w-0 flex flex-col">
+        {/* Screenshots / Text segmented toggle, pinned above the active list. */}
+        <div className="shrink-0 pt-3 pb-1.5 pr-3 pl-1">
+          <div className="flex gap-0.5 rounded-md bg-neutral-900/90 p-0.5">
+            <button
+              type="button"
+              onClick={() => onColumnViewChange("screenshots")}
+              aria-pressed={columnView === "screenshots"}
+              className={`flex-1 flex items-center justify-center gap-1.5 rounded px-2 py-1 text-xs cursor-pointer transition-colors ${
+                columnView === "screenshots"
+                  ? "bg-neutral-700 text-white"
+                  : "text-neutral-400 hover:text-white"
+              }`}
+            >
+              <ImageIcon className="size-3.5" aria-hidden="true" />
+              Screenshots
+            </button>
+            <button
+              type="button"
+              onClick={() => onColumnViewChange("clipboard")}
+              aria-pressed={columnView === "clipboard"}
+              className={`flex-1 flex items-center justify-center gap-1.5 rounded px-2 py-1 text-xs cursor-pointer transition-colors ${
+                columnView === "clipboard"
+                  ? "bg-neutral-700 text-white"
+                  : "text-neutral-400 hover:text-white"
+              }`}
+            >
+              <ClipboardList className="size-3.5" aria-hidden="true" />
+              Text
+            </button>
+          </div>
+        </div>
+
+        {/* Both views stay mounted once loaded (hidden, not unmounted) so
+            toggling never re-decodes thumbnails or refetches clipboard. */}
+        <div
+          data-thumb-scroll
+          className={`flex-1 min-w-0 overflow-y-auto pt-1 pb-4 pr-3 pl-1 flex-col gap-5 items-stretch [&::-webkit-scrollbar]:hidden [-ms-overflow-style:none] [scrollbar-width:none] ${
+            columnView === "screenshots" ? "flex" : "hidden"
+          }`}
+          style={{
+            background: "transparent",
+            maskImage:
+              "linear-gradient(to bottom, transparent 0, black 4px, black calc(100% - 6px), transparent 100%)",
+            WebkitMaskImage:
+              "linear-gradient(to bottom, transparent 0, black 4px, black calc(100% - 6px), transparent 100%)",
+          }}
+        >
+          {paths.map((path, i) => (
+            <ThumbnailItem
+              key={path}
+              path={path}
+              eager={i < EAGER_COUNT}
+              onEdit={() => onEdit(path)}
+              onRemove={() => onRemove(path)}
+            />
+          ))}
+        </div>
+
+        {clipboardLoaded ? (
+          <div className={`flex-1 min-w-0 flex-col ${columnView === "clipboard" ? "flex" : "hidden"}`}>
+            <Suspense fallback={null}>
+              <ClipboardColumnList />
+            </Suspense>
+          </div>
+        ) : null}
       </div>
     </div>
   );
