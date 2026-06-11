@@ -2,7 +2,9 @@ import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { animate } from "motion";
 import { startDrag } from "@crabnebula/tauri-plugin-drag";
-import { ChevronLeft, ChevronRight, Trash2 } from "lucide-react";
+import { ChevronLeft, ChevronRight, Link2, Loader2, Trash2 } from "lucide-react";
+import { toast } from "sonner";
+import { useSyncStore } from "@/stores/syncStore";
 
 // Genie-style open/close for the column, driven by motion's imperative animate()
 // on a STABLE element (no remount → thumbnails don't reload, no flash). The
@@ -184,6 +186,7 @@ function ThumbnailItem({ path, eager = false, onEdit, onRemove }: ThumbnailItemP
   const [src, setSrc] = useState<string>("");
   const [dragIconPath, setDragIconPath] = useState<string | null>(null);
   const [isExiting, setIsExiting] = useState(false);
+  const [isSharing, setIsSharing] = useState(false);
   const [inView, setInView] = useState(eager);
   const rootRef = useRef<HTMLDivElement>(null);
   const exitingRef = useRef(false);
@@ -273,6 +276,43 @@ function ThumbnailItem({ path, eager = false, onEdit, onRemove }: ThumbnailItemP
     };
   }, [path, inView]);
 
+  // Copy a PUBLIC shareable link for this image. Firebase/upload code is pulled
+  // in lazily here (keeps it off the launch critical path) and only on tap, so
+  // the column never uploads eagerly. Reuses the sync engine's auth/device and
+  // the publisher's dedup+upload path — no Firebase re-init or duplicate upload.
+  const copyShareLink = async () => {
+    if (isSharing) return;
+    const libId = useSyncStore.getState().libId;
+    if (!libId) {
+      toast.error("Pair a device first to share links", { duration: 4000 });
+      return;
+    }
+    setIsSharing(true);
+    try {
+      const [{ shareScreenshotLink }, { getDevice }] = await Promise.all([
+        import("@/lib/sync/screenshots"),
+        import("@/lib/sync/engine"),
+      ]);
+      const device = getDevice();
+      if (!device) {
+        toast.error("Pair a device first to share links", { duration: 4000 });
+        return;
+      }
+      const url = await shareScreenshotLink(libId, device, path);
+      const { setLocalClipboard } = await import("@/lib/sync/clipboard");
+      await setLocalClipboard(url);
+      toast.success("Link copied", { description: url, duration: 2500 });
+    } catch (err) {
+      console.error("share link failed:", err);
+      toast.error("Couldn't create share link", {
+        description: err instanceof Error ? err.message : "Upload failed — check your connection",
+        duration: 5000,
+      });
+    } finally {
+      setIsSharing(false);
+    }
+  };
+
   const slideOutAndRemove = () => {
     if (exitingRef.current) return;
     exitingRef.current = true;
@@ -308,6 +348,25 @@ function ThumbnailItem({ path, eager = false, onEdit, onRemove }: ThumbnailItemP
           }}
         />
       ) : null}
+
+      <button
+        type="button"
+        onClick={(e) => {
+          e.stopPropagation();
+          copyShareLink();
+        }}
+        onPointerDown={(e) => e.stopPropagation()}
+        disabled={isSharing}
+        aria-label="Copy share link"
+        title="Copy share link"
+        className="absolute top-1.5 left-1.5 size-6 rounded-full bg-black/55 hover:bg-blue-600/90 text-white flex items-center justify-center backdrop-blur-sm shadow-md z-10 cursor-pointer disabled:cursor-wait"
+      >
+        {isSharing ? (
+          <Loader2 className="size-3 animate-spin" aria-hidden="true" />
+        ) : (
+          <Link2 className="size-3" aria-hidden="true" />
+        )}
+      </button>
 
       <button
         type="button"

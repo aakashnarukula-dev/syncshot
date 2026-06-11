@@ -26,7 +26,7 @@ import {
   Timestamp,
   type DocumentData,
 } from "firebase/firestore";
-import { getBytes, ref, uploadBytes } from "firebase/storage";
+import { getBytes, getDownloadURL, ref, uploadBytes } from "firebase/storage";
 import { db, storage } from "./firebase";
 import { sha256Hex } from "./hash";
 import {
@@ -177,6 +177,85 @@ export async function publishScreenshot(
   });
 
   return true;
+}
+
+/**
+ * Resolve a PUBLIC, shareable download URL for a locally-captured screenshot
+ * at `path`, uploading it to the library first if it isn't synced yet.
+ *
+ * Reuses the publisher's content-addressed dedup (same sha256): if a doc for
+ * this image already exists with its full.png uploaded, we reuse that Storage
+ * object; if only the thumb exists we finish the full upload onto the same doc;
+ * otherwise we run the full thumb+doc+full publish. The returned URL carries a
+ * long-lived download token that anyone can open (capability, not rule-gated).
+ */
+export async function shareScreenshotLink(
+  libId: string,
+  device: DeviceRef,
+  path: string,
+): Promise<string> {
+  const resp = await fetch(convertFileSrc(path));
+  const blob = await resp.blob();
+  const buf = await blob.arrayBuffer();
+  const sha256 = await sha256Hex(buf);
+
+  const dupes = await getDocs(
+    query(screenshotsCol(libId), where("sha256", "==", sha256), limit(1)),
+  );
+
+  // Already synced: reuse the existing object, finishing the full upload if the
+  // earlier publish only got as far as the thumbnail.
+  if (!dupes.empty) {
+    const existing = dupes.docs[0];
+    const data = existing.data();
+    if (data.fullPath) {
+      return getDownloadURL(ref(storage, data.fullPath as string));
+    }
+    const fullRef = ref(
+      storage,
+      `libraries/${libId}/screenshots/${existing.id}/full.png`,
+    );
+    await uploadBytes(fullRef, blob, { contentType: "image/png" });
+    await updateDoc(existing.ref, {
+      status: "full",
+      fullPath: fullRef.fullPath,
+      bytes: blob.size,
+    });
+    return getDownloadURL(fullRef);
+  }
+
+  // Not synced yet: full publish (mirrors publishScreenshot's thumb-first path).
+  const { width, height, thumb } = await makeThumb(blob);
+
+  const docRef = doc(screenshotsCol(libId));
+  const id = docRef.id;
+
+  const thumbRef = ref(storage, `libraries/${libId}/screenshots/${id}/thumb.webp`);
+  await uploadBytes(thumbRef, thumb, { contentType: "image/webp" });
+
+  await setDoc(docRef, {
+    sha256,
+    createdAt: serverTimestamp(),
+    device,
+    width,
+    height,
+    bytes: blob.size,
+    mime: "image/png",
+    thumbPath: thumbRef.fullPath,
+    fullPath: null,
+    status: "thumb",
+  });
+
+  const fullRef = ref(storage, `libraries/${libId}/screenshots/${id}/full.png`);
+  await uploadBytes(fullRef, blob, { contentType: "image/png" });
+
+  await updateDoc(docRef, {
+    status: "full",
+    fullPath: fullRef.fullPath,
+    bytes: blob.size,
+  });
+
+  return getDownloadURL(fullRef);
 }
 
 /** Download Storage bytes at `fullPath` (a `libraries/.../full.png` path). */
