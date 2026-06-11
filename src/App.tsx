@@ -1017,9 +1017,16 @@ function MainApp() {
       // geometry -> wait for that resize to actually PAINT -> run the genie-in.
       isCollapsedRef.current = false;
       setIsCollapsed(false);
-      // One frame so React commits the (transparent, opacity:0) expanded column —
-      // the pill is unmounted before we resize, so the geometry change is invisible.
-      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+      // Double rAF so React doesn't just COMMIT the swap but the pill-removed /
+      // opacity:0 column state is actually COMPOSITED to screen before we touch
+      // native geometry. A single rAF fires after the commit but before paint, so
+      // the old collapsed pill was still on screen during the resize and rode the
+      // window's top edge upward (the "pill jumps up, vanishes, returns"). Two
+      // frames guarantee the pill is painted away first → the centered grow is
+      // invisible and the genie unfurls in place.
+      await new Promise<void>((resolve) =>
+        requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
+      );
       await expandThumbWindow(thumbsRef.current.length);
       // Double rAF: a single rAF fires BEFORE the native resize is composited to
       // screen, so the genie would start inside a pill-sized window (the "jump up").
