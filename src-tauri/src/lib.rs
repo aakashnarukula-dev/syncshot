@@ -87,30 +87,14 @@ pub fn run() {
             let preferences_item =
                 MenuItemBuilder::with_id("preferences", "Preferences…").build(app)?;
 
-            let license_item = MenuItemBuilder::with_id("license", "License…").build(app)?;
-
-            let capture_region_item =
-                MenuItemBuilder::with_id("capture_region", "Capture Region").build(app)?;
-
-            let capture_screen_item =
-                MenuItemBuilder::with_id("capture_screen", "Capture Screen").build(app)?;
-
-            let capture_window_item =
-                MenuItemBuilder::with_id("capture_window", "Capture Window").build(app)?;
-
             let quit_item = MenuItemBuilder::with_id("quit", "Quit")
                 .accelerator("CommandOrControl+Q")
                 .build(app)?;
 
             let menu = MenuBuilder::new(app)
                 .items(&[
-                    &capture_region_item,
-                    &capture_screen_item,
-                    &capture_window_item,
-                    &PredefinedMenuItem::separator(app)?,
                     &library_item,
                     &preferences_item,
-                    &license_item,
                     &PredefinedMenuItem::separator(app)?,
                     &quit_item,
                 ])
@@ -130,18 +114,6 @@ pub fn run() {
                         }
                         "preferences" => {
                             let _ = app.emit("open-preferences", ());
-                        }
-                        "license" => {
-                            let _ = app.emit("open-license", ());
-                        }
-                        "capture_region" => {
-                            let _ = app.emit("capture-triggered", ());
-                        }
-                        "capture_screen" => {
-                            let _ = app.emit("capture-fullscreen", ());
-                        }
-                        "capture_window" => {
-                            let _ = app.emit("capture-window", ());
                         }
                         "quit" => {
                             app.exit(0);
