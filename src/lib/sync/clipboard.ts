@@ -35,6 +35,27 @@ function clipboardCol(libId: string) {
   return collection(db, "libraries", libId, "clipboard");
 }
 
+// Hashes of app-initiated copies (setLocalClipboard) awaiting their
+// clipboard-changed echo. Consumed once, expired after 5s so a stale entry
+// can't suppress a later genuine user copy of the same text.
+const SELF_COPY_TTL_MS = 5000;
+const selfCopyHashes = new Map<string, number>();
+
+function markSelfCopy(hash: string): void {
+  const now = Date.now();
+  for (const [h, at] of selfCopyHashes) {
+    if (now - at > SELF_COPY_TTL_MS) selfCopyHashes.delete(h);
+  }
+  selfCopyHashes.set(hash, now);
+}
+
+function consumeSelfCopy(hash: string): boolean {
+  const at = selfCopyHashes.get(hash);
+  if (at === undefined) return false;
+  selfCopyHashes.delete(hash);
+  return Date.now() - at <= SELF_COPY_TTL_MS;
+}
+
 function tsToMillis(value: unknown): number | null {
   return value instanceof Timestamp ? value.toMillis() : null;
 }
@@ -89,6 +110,9 @@ export async function writeClipboardEntry(
   if (byteLen > CLIPBOARD_MAX_BYTES) return null;
 
   const hash = await sha256Text(text);
+  // Echo of our own setLocalClipboard — the NSPasteboard poller can't tell
+  // app-initiated copies from user copies, so skip the marked ones here.
+  if (consumeSelfCopy(hash)) return null;
   if (recentHash && hash === recentHash) return null;
 
   await addDoc(clipboardCol(libId), {
@@ -102,8 +126,13 @@ export async function writeClipboardEntry(
   return hash;
 }
 
-/** Write `text` to this Mac's system clipboard (re-copy a past entry). */
+/**
+ * Write `text` to this Mac's system clipboard (re-copy a past entry).
+ * Marks the hash as self-initiated so the poller's clipboard-changed echo
+ * is not re-captured as a new history entry.
+ */
 export async function setLocalClipboard(text: string): Promise<void> {
+  markSelfCopy(await sha256Text(text));
   await invoke("set_clipboard_text", { text });
 }
 
