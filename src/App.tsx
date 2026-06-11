@@ -433,6 +433,12 @@ function MainApp() {
   // Show the column, then trigger its open animation (now that it's visible).
   const openThumbnailWindow = useCallback(async (count: number, mouseX?: number, mouseY?: number) => {
     await showThumbnailWindow(count, mouseX, mouseY);
+    // Wait for the freshly-shown window (already at final geometry, content
+    // opacity:0) to paint before running the genie-in — a single rAF can fire
+    // before the compositor shows it, which reads as a flash.
+    await new Promise<void>((resolve) =>
+      requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
+    );
     setOpenSignal((n) => n + 1);
   }, []);
 
@@ -992,19 +998,35 @@ function MainApp() {
 
   const handleToggleCollapsed = useCallback(async () => {
     const next = !isCollapsedRef.current;
-    isCollapsedRef.current = next;
-    setIsCollapsed(next);
     if (autoHideTimerRef.current) {
       clearTimeout(autoHideTimerRef.current);
       autoHideTimerRef.current = null;
     }
     if (next) {
+      // COLLAPSE. triggerCollapse already played the genie-out so the column is
+      // fully invisible (opacity:0, curled into the pill). Resize the native
+      // window DOWN to the pill while the (invisible) column is still the rendered
+      // element, and ONLY THEN swap to the pill render. Doing it the other way —
+      // setIsCollapsed(true) before the resize — paints the full-screen pill box
+      // inside the still-column-sized window for a frame: that was the close flash.
+      isCollapsedRef.current = true;
       await showCollapsedThumbnail();
+      setIsCollapsed(true);
     } else {
+      // EXPAND. Sequence: render column invisible -> resize window to final
+      // geometry -> wait for that resize to actually PAINT -> run the genie-in.
+      isCollapsedRef.current = false;
+      setIsCollapsed(false);
       // One frame so React commits the (transparent, opacity:0) expanded column —
       // the pill is unmounted before we resize, so the geometry change is invisible.
       await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
       await expandThumbWindow(thumbsRef.current.length);
+      // Double rAF: a single rAF fires BEFORE the native resize is composited to
+      // screen, so the genie would start inside a pill-sized window (the "jump up").
+      // Two frames guarantee the new window geometry has painted before we reveal.
+      await new Promise<void>((resolve) =>
+        requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
+      );
       setOpenSignal((n) => n + 1);
       startAutoHide();
     }
