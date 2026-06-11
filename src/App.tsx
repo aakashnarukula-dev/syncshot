@@ -692,6 +692,9 @@ function MainApp() {
 
     try {
       const hadThumbs = thumbsRef.current.length > 0;
+      // Was the column already on screen (expanded) before this capture? If so we
+      // prepend in place via geometry-only expand — no hide/reposition/re-show.
+      const wasVisible = hadThumbs && !isCollapsedRef.current;
       if (hadThumbs) {
         try { await appWindow.setContentProtected(true); } catch {}
       } else {
@@ -743,7 +746,17 @@ function MainApp() {
       setMode("thumbnail");
       isCollapsedRef.current = false;
       setIsCollapsed(false);
-      await openThumbnailWindow(next.length, mouseX, mouseY);
+      if (wasVisible) {
+        // Column was already visible: instantly prepend the new shot. Reset
+        // content protection in place (no hide) and only adjust geometry —
+        // skip show/reposition-to-cursor/openSignal so there's no flash or
+        // open-animation replay.
+        try { await appWindow.setContentProtected(false); } catch {}
+        await expandThumbWindow(next.length);
+      } else {
+        // Was hidden/collapsed / first screenshot: full reveal at the cursor.
+        await openThumbnailWindow(next.length, mouseX, mouseY);
+      }
       startAutoHide();
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : String(err);
