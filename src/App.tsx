@@ -504,17 +504,6 @@ function MainApp() {
   // Initial app setup
   useEffect(() => {
     const initializeApp = async () => {
-      // Show the thumbnail column FIRST, before any directory resolution or
-      // list_screenshots I/O. The user must see the column immediately on
-      // launch — gating it behind hundreds of file reads gave a ~5-8s blank
-      // delay. Start empty/expanded at the left edge; thumbnails stream in
-      // below once the async load resolves. NO startAutoHide on this launch
-      // path — the column stays visible until the user dismisses it.
-      setMode("thumbnail");
-      isCollapsedRef.current = false;
-      setIsCollapsed(false);
-      await openThumbnailWindow(0);
-
       // These three are independent — fetch them concurrently instead of three
       // serial IPC round-trips on the critical path to showing the window.
       // defaultDir = ~/Desktop/ScreenshotX (created if missing); desktopRoot =
@@ -581,17 +570,17 @@ function MainApp() {
         }
       }
 
-      // Pre-populate the (already-visible) thumbnail column with existing
-      // screenshots. The column is up; here we just fill it in and grow the
-      // window to fit. Deliberately NO startAutoHide — the launch column must
-      // stay open. expandThumbWindow only changes geometry (window already
-      // shown), so the count-0 placeholder grows in place with no re-show.
+      // Pre-populate thumbnail column with existing screenshots
       if (effectiveSaveDir) {
         try {
           const existing = await invoke<string[]>("list_screenshots", { dir: effectiveSaveDir });
           if (existing.length > 0) {
             const next = updateThumbs(() => existing);
-            await expandThumbWindow(next.length);
+            setMode("thumbnail");
+            isCollapsedRef.current = false;
+            setIsCollapsed(false);
+            await openThumbnailWindow(next.length);
+            startAutoHide();
           }
         } catch (err) {
           console.error("Failed to list existing screenshots:", err);
