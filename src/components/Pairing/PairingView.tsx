@@ -1,5 +1,5 @@
 import { useEffect, useState, type ReactNode } from "react";
-import { AlertTriangle, Check, Loader2, QrCode, RefreshCw } from "lucide-react";
+import { AlertTriangle, ArrowLeft, Check, Loader2, QrCode, RefreshCw } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { hasRealFirebaseConfig } from "@/lib/sync/firebaseConfig";
@@ -18,7 +18,7 @@ interface PairCode {
   expiresAt: number;
 }
 
-export function PairingView() {
+export function PairingView({ onClose }: { onClose?: () => void }) {
   const authState = useAuthState();
   const authError = useSyncStore((s) => s.authError);
   const libId = useLibId();
@@ -98,6 +98,7 @@ export function PairingView() {
   if (!hasRealFirebaseConfig) {
     return (
       <Notice
+        onClose={onClose}
         icon={<AlertTriangle className="size-6" aria-hidden="true" />}
         title="Firebase isn't configured yet"
         body="Set VITE_FB_API_KEY and VITE_FB_APP_ID for the screenshot-x web app, then rebuild. Pairing and sync are disabled until then."
@@ -108,6 +109,7 @@ export function PairingView() {
   if (authState === "loading") {
     return (
       <Notice
+        onClose={onClose}
         icon={<Loader2 className="size-6 animate-spin" aria-hidden="true" />}
         title="Connecting…"
         body="Signing this Mac in to Firebase."
@@ -118,6 +120,7 @@ export function PairingView() {
   if (authState === "error") {
     return (
       <Notice
+        onClose={onClose}
         icon={<AlertTriangle className="size-6" aria-hidden="true" />}
         title="Couldn't reach Firebase"
         body={authError ?? "Check your network and that anonymous auth is enabled, then reopen this window."}
@@ -131,6 +134,13 @@ export function PairingView() {
 
   return (
     <div className="mx-auto h-full w-full max-w-xl overflow-y-auto p-6">
+      {onClose && (
+        <div className="mb-4 flex items-center gap-2">
+          <Button variant="ghost" size="sm" onClick={onClose}>
+            <ArrowLeft className="size-4" aria-hidden="true" /> Done
+          </Button>
+        </div>
+      )}
       <div className="mb-6">
         <label htmlFor="device-name" className="mb-1.5 block text-sm font-medium">
           This device's name
@@ -239,11 +249,19 @@ interface NoticeProps {
   icon: ReactNode;
   title: string;
   body: string;
+  onClose?: () => void;
 }
 
-function Notice({ icon, title, body }: NoticeProps) {
+function Notice({ icon, title, body, onClose }: NoticeProps) {
   return (
-    <div className="flex h-full flex-col items-center justify-center gap-3 p-8 text-center">
+    <div className="relative flex h-full flex-col items-center justify-center gap-3 p-8 text-center">
+      {onClose && (
+        <div className="absolute left-4 top-4">
+          <Button variant="ghost" size="sm" onClick={onClose}>
+            <ArrowLeft className="size-4" aria-hidden="true" /> Done
+          </Button>
+        </div>
+      )}
       <div className="flex size-12 items-center justify-center rounded-full bg-muted text-muted-foreground">
         {icon}
       </div>
