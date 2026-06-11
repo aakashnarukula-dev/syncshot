@@ -1,22 +1,28 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { animate } from "motion";
 import { startDrag } from "@crabnebula/tauri-plugin-drag";
 import { ChevronLeft, ChevronRight, Trash2 } from "lucide-react";
 
-// Genie-style open/close for the column, played via the Web Animations API on a
-// stable element (no remount → thumbnails don't reload, no flash).
-// Open: fast opacity + small horizontal slide only. No vertical scale — the
-// scaleY "unfold" was what made opening read as slow.
-const COL_IN_KEYFRAMES: Keyframe[] = [
-  { opacity: 0, transform: "translateX(-12%)" },
-  { opacity: 1, transform: "translateX(0)" },
-];
-const COL_OUT_KEYFRAMES: Keyframe[] = [
-  { opacity: 1, transform: "translateX(0) scaleX(1) scaleY(1)" },
-  { opacity: 0, transform: "translateX(-38%) scaleX(0.3) scaleY(0.1)" },
-];
-const COL_IN_MS = 130;
-const COL_OUT_MS = 260;
+// Genie-style open/close for the column, driven by motion's imperative animate()
+// on a STABLE element (no remount → thumbnails don't reload, no flash). The
+// transform-origin is anchored at the left edge (the pill) so it reads as the
+// column emanating from / curling back into the pill rather than the center.
+// Open: eased scale + slight vertical stretch + horizontal unfurl + fade-in.
+const COL_IN_KEYFRAMES = {
+  opacity: [0, 1],
+  x: ["-16%", "0%"],
+  scaleX: [0.55, 1],
+  scaleY: [0.82, 1],
+};
+const COL_OUT_KEYFRAMES = {
+  opacity: [1, 0],
+  x: ["0%", "-38%"],
+  scaleX: [1, 0.3],
+  scaleY: [1, 0.1],
+};
+const COL_IN_MS = 300;
+const COL_OUT_MS = 280;
 
 interface ScreenshotThumbnailProps {
   paths: string[];
@@ -43,7 +49,7 @@ export function ScreenshotThumbnail({
 }: ScreenshotThumbnailProps) {
   const [animatingOut, setAnimatingOut] = useState(false);
   const colRef = useRef<HTMLDivElement>(null);
-  const animRef = useRef<Animation | null>(null);
+  const animRef = useRef<ReturnType<typeof animate> | null>(null);
   const prevOpenRef = useRef(openSignal);
 
   useEffect(() => {
@@ -53,16 +59,17 @@ export function ScreenshotThumbnail({
   // Play the open animation only once the window is actually visible (the parent
   // bumps openSignal after showing it). Skips the initial mount, which happens
   // while the window is still hidden — that's what made open look instant/flashy.
+  // The window geometry is already correct (parent resized it transparent,
+  // pre-reveal) so only the GPU transform/opacity animates — no resize flicker.
   useLayoutEffect(() => {
     if (prevOpenRef.current === openSignal) return;
     prevOpenRef.current = openSignal;
     const el = colRef.current;
     if (!el) return;
-    animRef.current?.cancel();
-    animRef.current = el.animate(COL_IN_KEYFRAMES, {
-      duration: COL_IN_MS,
-      easing: "ease-out",
-      fill: "both",
+    animRef.current?.stop();
+    animRef.current = animate(el, COL_IN_KEYFRAMES, {
+      duration: COL_IN_MS / 1000,
+      ease: [0.16, 1, 0.3, 1], // ease-out genie unfurl
     });
   }, [openSignal]);
 
@@ -74,14 +81,13 @@ export function ScreenshotThumbnail({
       setTimeout(() => onToggleCollapsed(), COL_OUT_MS + 10);
       return;
     }
-    animRef.current?.cancel();
-    const anim = el.animate(COL_OUT_KEYFRAMES, {
-      duration: COL_OUT_MS,
-      easing: "cubic-bezier(0.5, 0, 0.75, 0)",
-      fill: "both",
+    animRef.current?.stop();
+    const anim = animate(el, COL_OUT_KEYFRAMES, {
+      duration: COL_OUT_MS / 1000,
+      ease: [0.5, 0, 0.75, 0], // ease-in genie curl-back
     });
     animRef.current = anim;
-    anim.addEventListener("finish", () => onToggleCollapsed(), { once: true });
+    anim.finished.then(() => onToggleCollapsed()).catch(() => {});
   };
 
   // Auto-hide: parent bumps collapseSignal → play the same slide-out as the button.
@@ -137,6 +143,7 @@ export function ScreenshotThumbnail({
         </button>
       </div>
       <div
+        data-thumb-scroll
         className="flex-1 min-w-0 overflow-y-auto pt-3 pb-4 pr-3 pl-1 flex flex-col gap-5 items-stretch [&::-webkit-scrollbar]:hidden [-ms-overflow-style:none] [scrollbar-width:none]"
         style={{
           background: "transparent",
@@ -146,10 +153,11 @@ export function ScreenshotThumbnail({
             "linear-gradient(to bottom, transparent 0, black 4px, black calc(100% - 6px), transparent 100%)",
         }}
       >
-        {paths.map((path) => (
+        {paths.map((path, i) => (
           <ThumbnailItem
             key={path}
             path={path}
+            eager={i < EAGER_COUNT}
             onEdit={() => onEdit(path)}
             onRemove={() => onRemove(path)}
           />
@@ -159,23 +167,60 @@ export function ScreenshotThumbnail({
   );
 }
 
+// Render the first few items (which include the newest, top-of-column shot)
+// eagerly so they're instantly visible/draggable; everything below is mounted
+// lazily as it scrolls near view (IntersectionObserver) so expanding the pill
+// no longer decodes all ~371 images at once.
+const EAGER_COUNT = 6;
+
 interface ThumbnailItemProps {
   path: string;
+  eager?: boolean;
   onEdit: () => void;
   onRemove: () => void;
 }
 
-function ThumbnailItem({ path, onEdit, onRemove }: ThumbnailItemProps) {
+function ThumbnailItem({ path, eager = false, onEdit, onRemove }: ThumbnailItemProps) {
   const [src, setSrc] = useState<string>("");
   const [dragIconPath, setDragIconPath] = useState<string | null>(null);
   const [isExiting, setIsExiting] = useState(false);
+  const [inView, setInView] = useState(eager);
+  const rootRef = useRef<HTMLDivElement>(null);
   const exitingRef = useRef(false);
 
+  // Mount the heavy work (image decode + drag-icon canvas) only once the item is
+  // near the viewport. Once shown it stays mounted so drag/edit/remove are intact.
   useEffect(() => {
-    setSrc(`${convertFileSrc(path)}?t=${Date.now()}`);
-  }, [path]);
+    if (inView) return;
+    const el = rootRef.current;
+    if (!el) return;
+    const io = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((e) => e.isIntersecting)) {
+          setInView(true);
+          io.disconnect();
+        }
+      },
+      {
+        root: el.closest("[data-thumb-scroll]"),
+        rootMargin: "500px 0px",
+      },
+    );
+    io.observe(el);
+    return () => io.disconnect();
+  }, [inView]);
+
+  // No `?t=Date.now()` cache-bust: that forced every image to re-decode on every
+  // render/expand. Each screenshot has a unique path and edits produce a new path,
+  // so a plain asset URL caches across collapse/expand cycles and still refreshes
+  // when the file actually changes.
+  useEffect(() => {
+    if (!inView) return;
+    setSrc(convertFileSrc(path));
+  }, [path, inView]);
 
   useEffect(() => {
+    if (!inView) return;
     let cancelled = false;
     let savedIconPath: string | null = null;
     (async () => {
@@ -226,7 +271,7 @@ function ThumbnailItem({ path, onEdit, onRemove }: ThumbnailItemProps) {
         invoke("delete_file", { path: savedIconPath }).catch(() => {});
       }
     };
-  }, [path]);
+  }, [path, inView]);
 
   const slideOutAndRemove = () => {
     if (exitingRef.current) return;
@@ -237,6 +282,7 @@ function ThumbnailItem({ path, onEdit, onRemove }: ThumbnailItemProps) {
 
   return (
     <div
+      ref={rootRef}
       className={`relative w-full shrink-0 overflow-visible transition-all duration-200 ease-in ${
         isExiting ? "-translate-x-full opacity-0" : "translate-x-0 opacity-100"
       }`}
@@ -246,6 +292,8 @@ function ThumbnailItem({ path, onEdit, onRemove }: ThumbnailItemProps) {
         <img
           src={src}
           alt="Screenshot preview"
+          loading="lazy"
+          decoding="async"
           className="block h-full w-full object-cover select-none rounded-md cursor-pointer"
           draggable
           onDragStart={(e) => {
