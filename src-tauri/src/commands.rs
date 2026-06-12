@@ -238,6 +238,18 @@ pub async fn get_temp_directory() -> Result<String, String> {
         .ok_or_else(|| "Failed to convert temp directory path to string".to_string())
 }
 
+/// Return a cached, downscaled thumbnail path for the screenshot at `path`.
+/// Decode/resize/encode runs on a blocking thread so fast scrolling (many
+/// concurrent calls) never stalls the async runtime.
+#[tauri::command]
+pub async fn get_screenshot_thumbnail(path: String, max_px: u32) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::image::screenshot_thumbnail(&path, max_px)
+    })
+    .await
+    .map_err(|e| format!("Thumbnail task failed: {}", e))?
+}
+
 /// Check if screencapture is already running
 fn is_screencapture_running() -> bool {
     let output = Command::new("pgrep")

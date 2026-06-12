@@ -251,8 +251,16 @@ interface ThumbnailItemProps {
   onRemove: () => void;
 }
 
+// Longest side of the cached column thumbnail. ~2x the 240px column width so
+// it stays crisp on Retina while decoding ~50-100x faster than a full shot.
+const THUMB_MAX_PX = 512;
+
 function ThumbnailItem({ path, eager = false, onEdit, onRemove }: ThumbnailItemProps) {
-  const [src, setSrc] = useState<string>("");
+  // Eager (newest, top) items show the full-res original IMMEDIATELY so a fresh
+  // capture appears with zero delay, then swap to the cached thumbnail once it's
+  // decoded (the swap is invisible: same box, pre-decoded bitmap).
+  const [src, setSrc] = useState<string>(() => (eager ? convertFileSrc(path) : ""));
+  const [ready, setReady] = useState(eager);
   const [isExiting, setIsExiting] = useState(false);
   const [isSharing, setIsSharing] = useState(false);
   const [inView, setInView] = useState(eager);
@@ -263,8 +271,11 @@ function ThumbnailItem({ path, eager = false, onEdit, onRemove }: ThumbnailItemP
   // items scrolled far past it RELEASE theirs (src cleared) — otherwise a long
   // scroll through hundreds of full-res screenshots retains every decode and
   // OOMs the WKWebView (transparent column, app hang). Two observers give the
-  // load/unload hysteresis (load at 600px, unload past 1200px) so items near
-  // the edge don't thrash. Eager (newest, top) items stay loaded always.
+  // load/unload hysteresis (load at 1200px, unload past 2400px) so items near
+  // the edge don't thrash. The load margin doubles as the PRELOAD BUFFER: now
+  // that column items decode small cached thumbnails (not full-res shots), a
+  // generous ~1200px look-ahead is cheap and keeps fast scrolling gap-free.
+  // Eager (newest, top) items stay loaded always.
   useEffect(() => {
     if (eager) return;
     const el = rootRef.current;
@@ -274,13 +285,13 @@ function ThumbnailItem({ path, eager = false, onEdit, onRemove }: ThumbnailItemP
       (entries) => {
         if (entries.some((e) => e.isIntersecting)) setInView(true);
       },
-      { root, rootMargin: "600px 0px" },
+      { root, rootMargin: "1200px 0px" },
     );
     const unloadIO = new IntersectionObserver(
       (entries) => {
         if (entries.every((e) => !e.isIntersecting)) setInView(false);
       },
-      { root, rootMargin: "1200px 0px" },
+      { root, rootMargin: "2400px 0px" },
     );
     loadIO.observe(el);
     unloadIO.observe(el);
@@ -290,16 +301,42 @@ function ThumbnailItem({ path, eager = false, onEdit, onRemove }: ThumbnailItemP
     };
   }, [eager]);
 
-  // No `?t=Date.now()` cache-bust: that forced every image to re-decode on every
-  // render/expand. Each screenshot has a unique path and edits produce a new path,
-  // so a plain asset URL caches across collapse/expand cycles and still refreshes
-  // when the file actually changes.
+  // Column preview loads a small CACHED THUMBNAIL (native-side downscale) —
+  // decoding a ~512px PNG is dramatically cheaper than a multi-MB screenshot,
+  // which is what made fast scrolling lag. The thumbnail URL is pre-decoded
+  // off-DOM (img.decode()) before swapping in, so the crossfade over the
+  // shimmer never shows a half-painted frame. All ACTIONS (edit, drag payload,
+  // share upload, delete) still use the original full-res `path`. Falls back
+  // to the original if thumbnail generation fails. No `?t=` cache-bust: thumb
+  // paths are content-keyed (path+mtime+size), so they cache across cycles
+  // and change when the file does.
   useEffect(() => {
     if (!inView) {
       setSrc("");
+      setReady(false);
       return;
     }
-    setSrc(convertFileSrc(path));
+    let cancelled = false;
+    const show = (url: string) => {
+      const pre = new Image();
+      pre.src = url;
+      const swap = () => {
+        if (cancelled) return;
+        setSrc(url);
+        setReady(true);
+      };
+      pre.decode().then(swap, swap);
+    };
+    invoke<string>("get_screenshot_thumbnail", { path, maxPx: THUMB_MAX_PX })
+      .then((thumbPath) => {
+        if (!cancelled) show(convertFileSrc(thumbPath));
+      })
+      .catch(() => {
+        if (!cancelled) show(convertFileSrc(path));
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [path, inView]);
 
   // Drag preview is generated ON DRAG START from the already-decoded <img>
@@ -399,14 +436,23 @@ function ThumbnailItem({ path, eager = false, onEdit, onRemove }: ThumbnailItemP
       }`}
       style={{ aspectRatio: "4 / 3" }}
     >
+      {/* Skeleton keeps the slot's fixed size and animates while the thumbnail
+          decodes, so fast scrolling shows a shimmer instead of blank gaps. */}
+      <div
+        aria-hidden="true"
+        className={`absolute inset-0 rounded-md bs-thumb-shimmer transition-opacity duration-200 ${
+          ready ? "opacity-0 bs-thumb-shimmer-done" : "opacity-100"
+        }`}
+      />
       {src ? (
         <img
           src={src}
           alt="Screenshot preview"
           crossOrigin="anonymous"
-          loading="lazy"
           decoding="async"
-          className="block h-full w-full object-cover select-none rounded-md cursor-pointer"
+          className={`relative block h-full w-full object-cover select-none rounded-md cursor-pointer transition-opacity duration-200 ${
+            ready ? "opacity-100" : "opacity-0"
+          }`}
           draggable
           onDragStart={(e) => {
             e.preventDefault();
