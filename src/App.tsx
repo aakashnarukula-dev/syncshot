@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
 import { availableMonitors } from "@tauri-apps/api/window";
 import { getCurrentWindow, LogicalPosition, LogicalSize } from "@tauri-apps/api/window";
+import { getAllWebviewWindows } from "@tauri-apps/api/webviewWindow";
 import { register, unregister } from "@tauri-apps/plugin-global-shortcut";
 import { Store } from "@tauri-apps/plugin-store";
 import type { KeyboardShortcut } from "./components/preferences/KeyboardShortcutManager";
@@ -303,6 +304,10 @@ function EditorOnlyApp({ imagePath }: { imagePath: string }) {
       await emit("editor-saved", { originalPath: imagePath, newPath });
       editorActions.reset();
       try { await emit("editor-closed"); } catch {}
+      // Let the event reach the main window before tearing this one down —
+      // destroy() right after emit() can drop it (the auto-hide guard also
+      // reconciles against real windows, this just avoids the 5s wait).
+      await new Promise((r) => setTimeout(r, 60));
       try { await getCurrentWindow().destroy(); } catch (e) { console.error("destroy failed:", e); }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -313,6 +318,7 @@ function EditorOnlyApp({ imagePath }: { imagePath: string }) {
   const onCancel = async () => {
     editorActions.reset();
     try { await emit("editor-closed"); } catch {}
+    await new Promise((r) => setTimeout(r, 60));
     try { await getCurrentWindow().destroy(); } catch (e) { console.error("destroy failed:", e); }
   };
 
@@ -483,14 +489,31 @@ function MainApp() {
     if (autoHideTimerRef.current) clearTimeout(autoHideTimerRef.current);
     autoHideTimerRef.current = null;
     if (isCollapsedRef.current || thumbsRef.current.length === 0) return;
-    autoHideTimerRef.current = setTimeout(() => {
+    autoHideTimerRef.current = setTimeout(async () => {
       autoHideTimerRef.current = null;
       if (isCollapsedRef.current || thumbsRef.current.length === 0) return;
-      // An open editor suspends auto-hide, but keep polling so a missed
-      // "editor-closed" event can't wedge the column open forever.
+      // An open editor suspends auto-hide — but the editor destroys itself
+      // right after emitting "editor-closed", so that event can be dropped
+      // and the counter wedged > 0 forever. Reconcile against the actual
+      // windows: only keep suspending if an editor-* window really exists.
       if (openEditorsRef.current > 0) {
-        startAutoHide();
-        return;
+        const countBefore = openEditorsRef.current;
+        let anyEditor = true;
+        try {
+          anyEditor = (await getAllWebviewWindows()).some((w) =>
+            w.label.startsWith("editor-"),
+          );
+        } catch {}
+        // A new editor may have opened mid-await (its window might not be
+        // listed yet) — trust the bumped counter over the stale snapshot.
+        if (anyEditor || openEditorsRef.current > countBefore) {
+          startAutoHide();
+          return;
+        }
+        openEditorsRef.current = 0;
+        // Re-check state that may have changed during the await; if a fresh
+        // timer was armed meanwhile, defer to it instead of collapsing now.
+        if (isCollapsedRef.current || thumbsRef.current.length === 0 || autoHideTimerRef.current) return;
       }
       // Pointer parked over the column (window) = still browsing — re-arm.
       // Checked live at fire time (no sticky hover flag, so a missed
