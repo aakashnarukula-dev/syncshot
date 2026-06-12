@@ -224,7 +224,10 @@ export function ScreenshotThumbnail({
         </div>
 
         {clipboardLoaded ? (
-          <div className={`flex-1 min-w-0 flex-col ${columnView === "clipboard" ? "flex" : "hidden"}`}>
+          <div
+            onScroll={() => onHoverChange?.(true)}
+            className={`flex-1 min-w-0 min-h-0 flex-col ${columnView === "clipboard" ? "flex" : "hidden"}`}
+          >
             <Suspense fallback={null}>
               <ClipboardColumnList />
             </Suspense>
