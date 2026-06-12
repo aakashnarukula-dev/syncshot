@@ -2,8 +2,11 @@
 
 use base64::{engine::general_purpose, Engine as _};
 use image::DynamicImage;
+use std::collections::hash_map::DefaultHasher;
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::utils::{ensure_dir, generate_filename, AppResult};
 
@@ -127,6 +130,66 @@ pub fn save_base64_image_to_path(image_data: &str, file_path: &str) -> AppResult
     fs::write(&path, image_bytes).map_err(|e| format!("Failed to save image: {}", e))?;
 
     Ok(path.to_string_lossy().into_owned())
+}
+
+/// Sequence for unique temp filenames so concurrent thumbnail generations of
+/// the same source never write to the same file.
+static THUMB_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Return the path to a cached, downscaled thumbnail of the screenshot at
+/// `source_path` (longest side ≈ `max_px`). The cache key covers the source
+/// path, its mtime and size, so an edited/replaced file regenerates while an
+/// unchanged one reuses the cached encode. Concurrent calls are safe: each
+/// writes to a unique temp file and atomically renames it into place.
+pub fn screenshot_thumbnail(source_path: &str, max_px: u32) -> AppResult<String> {
+    let src = PathBuf::from(source_path);
+    let meta =
+        fs::metadata(&src).map_err(|e| format!("Failed to stat screenshot: {}", e))?;
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+
+    let mut hasher = DefaultHasher::new();
+    source_path.hash(&mut hasher);
+    mtime.hash(&mut hasher);
+    meta.len().hash(&mut hasher);
+    max_px.hash(&mut hasher);
+    let key = hasher.finish();
+
+    let cache_dir = std::env::temp_dir().join("screenshotx-thumbnails");
+    ensure_dir(&cache_dir)?;
+    let thumb_path = cache_dir.join(format!("thumb-{:016x}.png", key));
+    if thumb_path.exists() {
+        return Ok(thumb_path.to_string_lossy().into_owned());
+    }
+
+    let img = image::open(&src).map_err(|e| format!("Failed to open screenshot: {}", e))?;
+    let max_px = max_px.max(1);
+    let thumb = if img.width() <= max_px && img.height() <= max_px {
+        img
+    } else {
+        img.thumbnail(max_px, max_px)
+    };
+
+    let seq = THUMB_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp_path = cache_dir.join(format!(
+        "thumb-{:016x}.{}-{}.tmp.png",
+        key,
+        std::process::id(),
+        seq
+    ));
+    thumb
+        .save_with_format(&tmp_path, image::ImageFormat::Png)
+        .map_err(|e| format!("Failed to save thumbnail: {}", e))?;
+    fs::rename(&tmp_path, &thumb_path).map_err(|e| {
+        let _ = fs::remove_file(&tmp_path);
+        format!("Failed to finalize thumbnail: {}", e)
+    })?;
+
+    Ok(thumb_path.to_string_lossy().into_owned())
 }
 
 /// Copy a screenshot file to a destination directory
