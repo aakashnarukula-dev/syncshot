@@ -2,7 +2,7 @@ import { lazy, Suspense, useEffect, useLayoutEffect, useRef, useState } from "re
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { animate } from "motion";
 import { startDrag } from "@crabnebula/tauri-plugin-drag";
-import { ChevronLeft, ChevronRight, ClipboardList, Image as ImageIcon, Link2, Loader2, Trash2 } from "lucide-react";
+import { Check, ChevronLeft, ChevronRight, ClipboardList, Copy, Image as ImageIcon, Link2, Loader2, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 import { useSyncStore } from "@/stores/syncStore";
 import type { ColumnView } from "@/App";
@@ -263,6 +263,8 @@ function ThumbnailItem({ path, eager = false, onEdit, onRemove }: ThumbnailItemP
   const [ready, setReady] = useState(eager);
   const [isExiting, setIsExiting] = useState(false);
   const [isSharing, setIsSharing] = useState(false);
+  const [isCopied, setIsCopied] = useState(false);
+  const copiedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [inView, setInView] = useState(eager);
   const rootRef = useRef<HTMLDivElement>(null);
   const exitingRef = useRef(false);
@@ -421,6 +423,30 @@ function ThumbnailItem({ path, eager = false, onEdit, onRemove }: ThumbnailItemP
     }
   };
 
+  useEffect(() => {
+    return () => {
+      if (copiedTimerRef.current) clearTimeout(copiedTimerRef.current);
+    };
+  }, []);
+
+  // Copies the ORIGINAL full-res image file (not the downscaled column
+  // thumbnail) via the same Rust command used on editor open.
+  const copyImage = async () => {
+    try {
+      await invoke("copy_to_clipboard", { path });
+      toast.success("Copied to clipboard", { duration: 1500 });
+      setIsCopied(true);
+      if (copiedTimerRef.current) clearTimeout(copiedTimerRef.current);
+      copiedTimerRef.current = setTimeout(() => setIsCopied(false), 1500);
+    } catch (err) {
+      console.error("copy image failed:", err);
+      toast.error("Couldn't copy image", {
+        description: err instanceof Error ? err.message : String(err),
+        duration: 4000,
+      });
+    }
+  };
+
   const slideOutAndRemove = () => {
     if (exitingRef.current) return;
     exitingRef.current = true;
@@ -469,28 +495,51 @@ function ThumbnailItem({ path, eager = false, onEdit, onRemove }: ThumbnailItemP
         type="button"
         onClick={(e) => {
           e.stopPropagation();
+          slideOutAndRemove();
+        }}
+        onPointerDown={(e) => e.stopPropagation()}
+        aria-label="Delete"
+        title="Delete"
+        className="absolute top-1.5 left-1.5 size-6 rounded-full bg-black/55 hover:bg-red-600/90 text-white flex items-center justify-center backdrop-blur-sm shadow-md z-10 cursor-pointer"
+      >
+        <Trash2 className="size-3" aria-hidden="true" />
+      </button>
+
+      <button
+        type="button"
+        onClick={(e) => {
+          e.stopPropagation();
+          copyImage();
+        }}
+        onPointerDown={(e) => e.stopPropagation()}
+        aria-label="Copy image"
+        title="Copy image"
+        className="absolute top-1.5 right-1.5 size-6 rounded-full bg-black/55 hover:bg-blue-600/90 text-white flex items-center justify-center backdrop-blur-sm shadow-md z-10 cursor-pointer"
+      >
+        {isCopied ? (
+          <Check className="size-3" aria-hidden="true" />
+        ) : (
+          <Copy className="size-3" aria-hidden="true" />
+        )}
+      </button>
+
+      <button
+        type="button"
+        onClick={(e) => {
+          e.stopPropagation();
           copyShareLink();
         }}
         onPointerDown={(e) => e.stopPropagation()}
         disabled={isSharing}
         aria-label="Copy share link"
         title="Copy share link"
-        className="absolute top-1.5 left-1.5 size-6 rounded-full bg-black/55 hover:bg-blue-600/90 text-white flex items-center justify-center backdrop-blur-sm shadow-md z-10 cursor-pointer disabled:cursor-wait"
+        className="absolute bottom-1.5 right-1.5 size-6 rounded-full bg-black/55 hover:bg-blue-600/90 text-white flex items-center justify-center backdrop-blur-sm shadow-md z-10 cursor-pointer disabled:cursor-wait"
       >
         {isSharing ? (
           <Loader2 className="size-3 animate-spin" aria-hidden="true" />
         ) : (
           <Link2 className="size-3" aria-hidden="true" />
         )}
-      </button>
-
-      <button
-        type="button"
-        onClick={slideOutAndRemove}
-        aria-label="Delete"
-        className="absolute top-1.5 right-1.5 size-6 rounded-full bg-black/55 hover:bg-red-600/90 text-white flex items-center justify-center backdrop-blur-sm shadow-md z-10 cursor-pointer"
-      >
-        <Trash2 className="size-3" aria-hidden="true" />
       </button>
     </div>
   );
