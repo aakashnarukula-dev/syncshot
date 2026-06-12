@@ -149,6 +149,7 @@ export function ScreenshotThumbnail({
       onMouseEnter={() => onHoverChange?.(true)}
       onMouseMove={() => onHoverChange?.(true)}
       onMouseLeave={() => onHoverChange?.(false)}
+      onWheel={() => onHoverChange?.(true)}
     >
       {/* Same edge pill as the collapsed handle, vertically centered on the left,
           flipped arrow — click to close. */}
@@ -199,6 +200,7 @@ export function ScreenshotThumbnail({
             toggling never re-decodes thumbnails or refetches clipboard. */}
         <div
           data-thumb-scroll
+          onScroll={() => onHoverChange?.(true)}
           className={`flex-1 min-w-0 overflow-y-auto pt-1 pb-4 pr-3 pl-1 flex-col gap-5 items-stretch [&::-webkit-scrollbar]:hidden [-ms-overflow-style:none] [scrollbar-width:none] ${
             columnView === "screenshots" ? "flex" : "hidden"
           }`}
@@ -248,97 +250,99 @@ interface ThumbnailItemProps {
 
 function ThumbnailItem({ path, eager = false, onEdit, onRemove }: ThumbnailItemProps) {
   const [src, setSrc] = useState<string>("");
-  const [dragIconPath, setDragIconPath] = useState<string | null>(null);
   const [isExiting, setIsExiting] = useState(false);
   const [isSharing, setIsSharing] = useState(false);
   const [inView, setInView] = useState(eager);
   const rootRef = useRef<HTMLDivElement>(null);
   const exitingRef = useRef(false);
 
-  // Mount the heavy work (image decode + drag-icon canvas) only once the item is
-  // near the viewport. Once shown it stays mounted so drag/edit/remove are intact.
+  // Windowed mounting: only items near the viewport hold a decoded bitmap, and
+  // items scrolled far past it RELEASE theirs (src cleared) — otherwise a long
+  // scroll through hundreds of full-res screenshots retains every decode and
+  // OOMs the WKWebView (transparent column, app hang). Two observers give the
+  // load/unload hysteresis (load at 600px, unload past 1200px) so items near
+  // the edge don't thrash. Eager (newest, top) items stay loaded always.
   useEffect(() => {
-    if (inView) return;
+    if (eager) return;
     const el = rootRef.current;
     if (!el) return;
-    const io = new IntersectionObserver(
+    const root = el.closest("[data-thumb-scroll]");
+    const loadIO = new IntersectionObserver(
       (entries) => {
-        if (entries.some((e) => e.isIntersecting)) {
-          setInView(true);
-          io.disconnect();
-        }
+        if (entries.some((e) => e.isIntersecting)) setInView(true);
       },
-      {
-        root: el.closest("[data-thumb-scroll]"),
-        rootMargin: "500px 0px",
-      },
+      { root, rootMargin: "600px 0px" },
     );
-    io.observe(el);
-    return () => io.disconnect();
-  }, [inView]);
+    const unloadIO = new IntersectionObserver(
+      (entries) => {
+        if (entries.every((e) => !e.isIntersecting)) setInView(false);
+      },
+      { root, rootMargin: "1200px 0px" },
+    );
+    loadIO.observe(el);
+    unloadIO.observe(el);
+    return () => {
+      loadIO.disconnect();
+      unloadIO.disconnect();
+    };
+  }, [eager]);
 
   // No `?t=Date.now()` cache-bust: that forced every image to re-decode on every
   // render/expand. Each screenshot has a unique path and edits produce a new path,
   // so a plain asset URL caches across collapse/expand cycles and still refreshes
   // when the file actually changes.
   useEffect(() => {
-    if (!inView) return;
+    if (!inView) {
+      setSrc("");
+      return;
+    }
     setSrc(convertFileSrc(path));
   }, [path, inView]);
 
-  useEffect(() => {
-    if (!inView) return;
-    let cancelled = false;
-    let savedIconPath: string | null = null;
+  // Drag preview is generated ON DRAG START from the already-decoded <img>
+  // (no extra full-res decode, no per-item temp file on mount). The temp icon
+  // is deleted once the drag session ends.
+  const beginDrag = (imgEl: HTMLImageElement) => {
     (async () => {
+      let iconPath: string | null = null;
       try {
-        const img = new Image();
-        img.crossOrigin = "anonymous";
-        img.src = convertFileSrc(path);
-        await new Promise<void>((resolve, reject) => {
-          img.onload = () => resolve();
-          img.onerror = () => reject(new Error("icon load failed"));
-        });
-        if (cancelled) return;
         const target = 160;
-        const ratio = Math.min(target / img.width, target / img.height, 1);
-        const w = Math.max(1, Math.round(img.width * ratio));
-        const h = Math.max(1, Math.round(img.height * ratio));
+        const ratio = Math.min(target / imgEl.naturalWidth, target / imgEl.naturalHeight, 1);
+        const w = Math.max(1, Math.round(imgEl.naturalWidth * ratio));
+        const h = Math.max(1, Math.round(imgEl.naturalHeight * ratio));
         const canvas = document.createElement("canvas");
         canvas.width = w;
         canvas.height = h;
         const ctx = canvas.getContext("2d");
-        if (!ctx) return;
-        ctx.imageSmoothingEnabled = true;
-        ctx.imageSmoothingQuality = "high";
-        ctx.drawImage(img, 0, 0, w, h);
-        const dataUrl = canvas.toDataURL("image/png");
-        const tempDir = await invoke<string>("get_temp_directory");
-        // Unique, stable icon path derived from the source path. Concurrent
-        // thumbnails previously saved to the same timestamped filename and
-        // overwrote each other, so every drag showed the same preview. A
-        // per-source path is collision-free and reused (no temp churn).
-        const safe = path.replace(/[^a-zA-Z0-9._-]/g, "_");
-        const iconPath = `${tempDir}/sx-drag-${safe}`;
-        const saved = await invoke<string>("save_edited_image", {
-          imageData: dataUrl,
-          saveDir: tempDir,
-          copyToClip: false,
-          overwritePath: iconPath,
-        });
-        savedIconPath = saved;
-        if (!cancelled) setDragIconPath(saved);
+        if (ctx) {
+          ctx.imageSmoothingEnabled = true;
+          ctx.imageSmoothingQuality = "high";
+          ctx.drawImage(imgEl, 0, 0, w, h);
+          const dataUrl = canvas.toDataURL("image/png");
+          const tempDir = await invoke<string>("get_temp_directory");
+          const safe = path.replace(/[^a-zA-Z0-9._-]/g, "_");
+          iconPath = await invoke<string>("save_edited_image", {
+            imageData: dataUrl,
+            saveDir: tempDir,
+            copyToClip: false,
+            overwritePath: `${tempDir}/sx-drag-${safe}`,
+          });
+        }
       } catch (err) {
         console.error("drag icon generation failed:", err);
+        iconPath = null;
+      }
+      try {
+        await startDrag({ item: [path], icon: iconPath || path });
+      } catch (err) {
+        console.error("startDrag failed:", err);
+      } finally {
+        if (iconPath) {
+          invoke("delete_file", { path: iconPath }).catch(() => {});
+        }
       }
     })();
-    return () => {
-      cancelled = true;
-      if (savedIconPath) {
-        invoke("delete_file", { path: savedIconPath }).catch(() => {});
-      }
-    };
-  }, [path, inView]);
+  };
 
   // Copy a PUBLIC shareable link for this image. Firebase/upload code is pulled
   // in lazily here (keeps it off the launch critical path) and only on tap, so
@@ -396,15 +400,14 @@ function ThumbnailItem({ path, eager = false, onEdit, onRemove }: ThumbnailItemP
         <img
           src={src}
           alt="Screenshot preview"
+          crossOrigin="anonymous"
           loading="lazy"
           decoding="async"
           className="block h-full w-full object-cover select-none rounded-md cursor-pointer"
           draggable
           onDragStart={(e) => {
             e.preventDefault();
-            startDrag({ item: [path], icon: dragIconPath || path }).catch((err) => {
-              console.error("startDrag failed:", err);
-            });
+            beginDrag(e.currentTarget);
           }}
           onClick={() => {
             exitingRef.current = true;

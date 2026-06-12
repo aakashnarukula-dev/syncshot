@@ -492,6 +492,15 @@ function MainApp() {
         startAutoHide();
         return;
       }
+      // Pointer parked over the column (window) = still browsing — re-arm.
+      // Checked live at fire time (no sticky hover flag, so a missed
+      // mouseleave can't wedge it open: cursor off the window → next poll
+      // collapses). Covers stationary hover and momentum scrolling, which
+      // generate no mousemove to reset the timer.
+      if (document.documentElement.matches(":hover")) {
+        startAutoHide();
+        return;
+      }
       // Play the slide-out animation (same as the manual collapse button)
       // rather than snapping straight to the collapsed pill.
       setCollapseSignal((n) => n + 1);
