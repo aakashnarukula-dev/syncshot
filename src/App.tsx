@@ -20,7 +20,7 @@ import { ScreenshotThumbnail } from "./components/ScreenshotThumbnail";
 // Lazy load heavy components
 const ImageEditor = lazy(() => import("./components/ImageEditor").then(m => ({ default: m.ImageEditor })));
 const PreferencesPage = lazy(() => import("./components/preferences/PreferencesPage").then(m => ({ default: m.PreferencesPage })));
-const PairingView = lazy(() => import("./components/Pairing/PairingView").then(m => ({ default: m.PairingView })));
+const SignInView = lazy(() => import("./components/Pairing/SignInView").then(m => ({ default: m.SignInView })));
 
 type AppMode = "main" | "preferences" | "thumbnail" | "pairing";
 export type ColumnView = "screenshots" | "clipboard";
@@ -181,6 +181,27 @@ async function showThumbnailWindow(count: number, mouseX?: number, mouseY?: numb
 
   await flags;
   await appWindow.show();
+}
+
+// WebKit's :hover can go stale when the shared window is hidden and re-shown
+// (e.g. right after the pairing window closes): no mouse event ever clears it,
+// so the auto-hide poll would re-arm forever. Verify against the real cursor;
+// on any failure err toward "hovering" (the pre-existing behavior).
+async function cursorInsideWindow(): Promise<boolean> {
+  try {
+    const w = getCurrentWindow();
+    const [pos, size, sf, [mx, my]] = await Promise.all([
+      w.outerPosition(),
+      w.outerSize(),
+      w.scaleFactor(),
+      invoke<[number, number]>("get_mouse_position"),
+    ]);
+    const x = pos.x / sf;
+    const y = pos.y / sf;
+    return mx >= x && mx < x + size.width / sf && my >= y && my < y + size.height / sf;
+  } catch {
+    return true;
+  }
 }
 
 async function showCollapsedThumbnail() {
@@ -443,21 +464,49 @@ function MainApp() {
   // Open a small, pairing-only decorated window (reuses the main window, like
   // Preferences). Just the QR + 6-digit code + enter-code field — no Library.
   const openPairing = useCallback(async () => {
-    await showNormalWindow(getCurrentWindow(), 420, 640, {
-      title: "Pair Device",
+    await showNormalWindow(getCurrentWindow(), 420, 300, {
+      title: "Sign in",
       resizable: false,
       alwaysOnTop: false,
     });
     setMode("pairing");
   }, []);
 
-  const closePairing = useCallback(async () => {
+  // Closing a modal-style reuse of the shared window (pairing/preferences)
+  // must hand it back to the column: restore the collapsed edge pill when
+  // there are screenshots, otherwise hide entirely (the old behavior).
+  const restoreColumnAfterModal = useCallback(async () => {
     setMode("main");
     const w = getCurrentWindow();
     await tweak(() => w.setDecorations(false));
     await tweak(() => w.setTitle(""));
-    try { await w.hide(); } catch (e) { console.error("hide failed:", e); }
+    if (thumbsRef.current.length > 0) {
+      isCollapsedRef.current = true;
+      await showCollapsedThumbnail();
+      setIsCollapsed(true);
+      setMode("thumbnail");
+    } else {
+      try { await w.hide(); } catch (e) { console.error("hide failed:", e); }
+    }
   }, []);
+
+  const closePairing = restoreColumnAfterModal;
+
+  // The sign-in window has no in-page Done button — the titlebar close button
+  // hands the shared window back to the column instead of closing the app.
+  useEffect(() => {
+    if (mode !== "pairing") return;
+    let unlisten: (() => void) | null = null;
+    (async () => {
+      try {
+        unlisten = await getCurrentWindow().onCloseRequested((event) => {
+          event.preventDefault();
+          void closePairing();
+        });
+      } catch {}
+    })();
+    return () => { unlisten?.(); };
+  }, [mode, closePairing]);
 
   const updateThumbs = useCallback((updater: (prev: string[]) => string[]) => {
     const next = updater(thumbsRef.current);
@@ -520,7 +569,7 @@ function MainApp() {
       // mouseleave can't wedge it open: cursor off the window → next poll
       // collapses). Covers stationary hover and momentum scrolling, which
       // generate no mousemove to reset the timer.
-      if (document.documentElement.matches(":hover")) {
+      if (document.documentElement.matches(":hover") && (await cursorInsideWindow())) {
         startAutoHide();
         return;
       }
@@ -567,6 +616,52 @@ function MainApp() {
   useEffect(() => {
     settingsRef.current = { saveDir, copyToClipboard, tempDir };
   }, [saveDir, copyToClipboard, tempDir]);
+
+  // Sign-out wipes the local screenshot history: delete the save folder's
+  // screenshots and empty the column. Transition-gated (signedIn -> signedOut)
+  // so a normal signed-out launch never touches local files.
+  const prevAuthStateRef = useRef<string | null>(null);
+  const syncAuthState = useSyncStore((s) => s.authState);
+  useEffect(() => {
+    const prev = prevAuthStateRef.current;
+    prevAuthStateRef.current = syncAuthState;
+    if (prev !== "signedIn" || syncAuthState !== "signedOut") return;
+    (async () => {
+      try {
+        const dir = settingsRef.current.saveDir;
+        if (dir) {
+          const files = await invoke<string[]>("list_screenshots", { dir });
+          await Promise.all(
+            files.map((p) => invoke("delete_file", { path: p }).catch(() => {})),
+          );
+        }
+      } catch (e) {
+        console.error("clear local screenshots on sign-out failed:", e);
+      }
+      updateThumbs(() => []);
+    })();
+  }, [syncAuthState, updateThumbs]);
+
+  // Auto-present the sign-in screen on launch when signed out. ScreenshotX is a
+  // local-first tool and sync is additive, so this gate is DISMISSIBLE: the
+  // pairing window's titlebar close (onCloseRequested -> closePairing) hands the
+  // shared window back to the column / hides it, dropping the user into the
+  // normal app. Re-openable any time via the tray "Sign in" entry (open-library).
+  //
+  // Fires once, on the first auth resolution after launch (loading -> resolved),
+  // and only for signedOut — signedIn launches into the normal hidden column as
+  // before. Gated by a ref so a later in-session sign-out doesn't yank the
+  // pairing window back open. "error" is left alone (auto-presenting a login
+  // that can't reach Firebase would just trap the user behind an error card).
+  const didInitialAuthRouteRef = useRef(false);
+  useEffect(() => {
+    if (didInitialAuthRouteRef.current) return;
+    if (syncAuthState === "loading") return; // wait for auth to resolve
+    didInitialAuthRouteRef.current = true;
+    if (syncAuthState === "signedOut") {
+      void openPairing();
+    }
+  }, [syncAuthState, openPairing]);
 
   // Load settings function
   const loadSettings = useCallback(async () => {
@@ -671,22 +766,8 @@ function MainApp() {
         }
       }
 
-      // Pre-populate thumbnail column with existing screenshots
-      if (effectiveSaveDir) {
-        try {
-          const existing = await invoke<string[]>("list_screenshots", { dir: effectiveSaveDir });
-          if (existing.length > 0) {
-            const next = updateThumbs(() => existing);
-            setMode("thumbnail");
-            isCollapsedRef.current = false;
-            setIsCollapsed(false);
-            await openThumbnailWindow(next.length);
-            startAutoHide();
-          }
-        } catch (err) {
-          console.error("Failed to list existing screenshots:", err);
-        }
-      }
+      // Column hydration from the save dir happens in the signed-in folder
+      // watcher below — signed out, the column starts (and stays) empty.
     };
 
     initializeApp();
@@ -695,17 +776,22 @@ function MainApp() {
     // setMode("editing");
   }, []);
 
-  // Watch save dir for files added/removed outside this app
-  // (e.g. screenshots synced in from another Mac). Refreshes the
-  // thumbnail column without needing to relaunch the app.
+  // Hydrate + watch the save dir — only while signed in. The first pass after
+  // sign-in loads existing files silently (no clipboard copy); later passes
+  // catch files added/removed outside this app (e.g. synced from the phone).
+  // Signed out, this never mounts: the column shows only session captures.
   useEffect(() => {
-    if (!saveDir) return;
+    if (!saveDir || syncAuthState !== "signedIn") return;
     let cancelled = false;
+    let firstPass = true;
 
     const poll = async () => {
       try {
         const disk = await invoke<string[]>("list_screenshots", { dir: saveDir });
         if (cancelled) return;
+
+        const isHydration = firstPass;
+        firstPass = false;
 
         const current = thumbsRef.current;
         const changed =
@@ -726,11 +812,12 @@ function MainApp() {
 
         if (next.length > 0) {
           setMode("thumbnail");
-          // New file arrived (likely synced in) — surface the window.
+          // New file arrived (or first hydration) — surface the window.
           if (hasNew) {
             // Copy the newest synced-in screenshot to this Mac's clipboard,
-            // mirroring local-capture behavior and the user's auto-copy setting.
-            if (settingsRef.current.copyToClipboard) {
+            // mirroring local-capture behavior and the user's auto-copy
+            // setting — but not for pre-existing files on hydration.
+            if (!isHydration && settingsRef.current.copyToClipboard) {
               invoke("copy_to_clipboard", { path: newOnes[0] })
                 .then(() => {
                   toast.success("Screenshot copied to clipboard", { duration: 2000 });
@@ -748,12 +835,13 @@ function MainApp() {
       }
     };
 
+    poll(); // hydrate immediately on sign-in rather than waiting an interval
     const interval = setInterval(poll, 2500);
     return () => {
       cancelled = true;
       clearInterval(interval);
     };
-  }, [saveDir, updateThumbs, startAutoHide]);
+  }, [saveDir, syncAuthState, updateThumbs, startAutoHide]);
 
 
   const handleCapture = useCallback(async (captureMode: CaptureMode = "region") => {
@@ -1023,12 +1111,8 @@ function MainApp() {
   const handleBackFromPreferences = useCallback(async () => {
     await loadSettings();
     setSettingsVersion(v => v + 1);
-    setMode("main");
-    const w = getCurrentWindow();
-    await tweak(() => w.setDecorations(false));
-    await tweak(() => w.setTitle(""));
-    try { await w.hide(); } catch (e) { console.error("hide failed:", e); }
-  }, [loadSettings]);
+    await restoreColumnAfterModal();
+  }, [loadSettings, restoreColumnAfterModal]);
 
   const handleThumbnailItemEdit = useCallback(async (path: string) => {
     if (licenseStatusRef.current?.state === "expired") {
@@ -1150,10 +1234,14 @@ function MainApp() {
   }
 
   if (mode === "pairing") {
+    // The shared native window is transparent (for the column overlay) — the
+    // pairing UI needs its own opaque backdrop or the desktop shows through.
     return (
-      <Suspense fallback={<LoadingFallback />}>
-        <PairingView onClose={closePairing} />
-      </Suspense>
+      <div className="h-dvh w-full overflow-hidden bg-background text-foreground">
+        <Suspense fallback={<LoadingFallback />}>
+          <SignInView />
+        </Suspense>
+      </div>
     );
   }
 
