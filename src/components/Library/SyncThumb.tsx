@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import { Check, ImageOff, Loader2 } from "lucide-react";
-import { loadThumbObjectUrl, saveReceivedScreenshot } from "@/lib/sync/screenshots";
+import { saveReceivedScreenshot, storageDownloadUrl } from "@/lib/sync/screenshots";
 import type { ScreenshotDoc } from "@/lib/sync/types";
 import { cn } from "@/lib/utils";
 
@@ -17,30 +17,28 @@ export function SyncThumb({ item }: SyncThumbProps) {
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
 
+  // Render via the Storage getDownloadURL token URL as a plain <img src>. The
+  // token is a capability (bypasses Storage rules + CORS), so an <img> load
+  // succeeds with no bucket-CORS config — unlike getBytes()/getBlob(), whose
+  // XHR the bucket blocks, which left this tile stuck on "Preview unavailable".
   useEffect(() => {
-    let url: string | null = null;
     let cancelled = false;
     setFailed(false);
+    setSrc(null);
     if (!item.thumbPath) {
       setFailed(true);
       return;
     }
-    loadThumbObjectUrl(item.thumbPath)
+    storageDownloadUrl(item.thumbPath)
       .then((u) => {
-        if (cancelled) {
-          URL.revokeObjectURL(u);
-          return;
-        }
-        url = u;
-        setSrc(u);
+        if (!cancelled) setSrc(u);
       })
       .catch((err) => {
-        console.error("thumb load failed:", err);
+        console.error("thumb url failed:", err);
         if (!cancelled) setFailed(true);
       });
     return () => {
       cancelled = true;
-      if (url) URL.revokeObjectURL(url);
     };
   }, [item.thumbPath]);
 

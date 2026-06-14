@@ -280,9 +280,13 @@ export async function saveReceivedScreenshot(
   });
 }
 
-/** Build a blob-URL preview of a screenshot's WebP thumbnail (CSP-safe). */
-export async function loadThumbObjectUrl(thumbPath: string): Promise<string> {
-  const bytes = await downloadStorageBytes(thumbPath);
-  const blob = new Blob([bytes], { type: "image/webp" });
-  return URL.createObjectURL(blob);
+/**
+ * Resolve a tokenized download URL for a Storage object (thumb or full image).
+ * The `?token=` is a capability that bypasses Storage security rules AND CORS,
+ * so the URL renders directly in an `<img src>` with NO bucket-CORS config —
+ * unlike getBytes()/getBlob(), whose cross-origin XHR the bucket blocks without
+ * CORS. The webview's CSP img-src must allow firebasestorage.googleapis.com.
+ */
+export async function storageDownloadUrl(storagePath: string): Promise<string> {
+  return getDownloadURL(ref(storage, storagePath));
 }
