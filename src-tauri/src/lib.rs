@@ -64,6 +64,75 @@ fn update_tray_menu(app: tauri::AppHandle, signed_in: bool) -> Result<(), String
     Ok(())
 }
 
+/// macOS: make `window` visible on EVERY Space (and able to float over another
+/// app's fullscreen) by setting its NSWindow `collectionBehavior`. This is what
+/// turns the edge "pill" rail into a system-overlay-style window that follows
+/// you between desktops instead of living on the single Space it opened on.
+///
+/// `collectionBehavior` is an NSUInteger bitmask (NSWindowCollectionBehavior):
+///   CanJoinAllSpaces    (1<<0) — show on whichever Space is active
+///   Stationary          (1<<4) — don't shuffle position in Mission Control/Exposé
+///   FullScreenAuxiliary  (1<<8) — allowed to appear over a fullscreen app's Space
+///
+/// `enable = false` restores normal single-Space, managed behavior — used when
+/// the SHARED main window expands into the decorated Library/Preferences view
+/// (same NSWindow, different geometry) so that view behaves like a normal window.
+///
+/// Does NOT touch window level, focus, or activation, so the single-instance
+/// guard and key/main-window handling are unaffected.
+#[cfg(target_os = "macos")]
+fn apply_all_spaces_behavior(window: &tauri::WebviewWindow, enable: bool) -> Result<(), String> {
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
+
+    const CAN_JOIN_ALL_SPACES: usize = 1 << 0;
+    const MANAGED: usize = 1 << 2;
+    const STATIONARY: usize = 1 << 4;
+    const PARTICIPATES_IN_CYCLE: usize = 1 << 5;
+    const FULLSCREEN_AUXILIARY: usize = 1 << 8;
+
+    let ns_window = window
+        .ns_window()
+        .map_err(|e| format!("ns_window handle: {}", e))? as *mut AnyObject;
+    if ns_window.is_null() {
+        return Err("ns_window handle is null".to_string());
+    }
+
+    let behavior: usize = if enable {
+        CAN_JOIN_ALL_SPACES | STATIONARY | FULLSCREEN_AUXILIARY
+    } else {
+        // Default macOS behavior for a normal app window.
+        MANAGED | PARTICIPATES_IN_CYCLE
+    };
+
+    unsafe {
+        let _: () = msg_send![ns_window, setCollectionBehavior: behavior];
+    }
+    Ok(())
+}
+
+/// Toggle whether the main (pill/rail) window appears on all Spaces + over
+/// fullscreen apps. The pill and the Library/Preferences view are the SAME
+/// NSWindow remorphed by the frontend, so the frontend should call this with
+/// `false` when it expands into Library/Preferences and `true` when it collapses
+/// back to the edge pill. No-op on non-macOS.
+#[tauri::command]
+fn set_pill_all_spaces(app: tauri::AppHandle, enable: bool) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        use tauri::Manager;
+        match app.get_webview_window("main") {
+            Some(window) => apply_all_spaces_behavior(&window, enable),
+            None => Err("main window not found".to_string()),
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (app, enable);
+        Ok(())
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let mut builder = tauri::Builder::default();
@@ -138,6 +207,18 @@ pub fn run() {
                 });
             }
 
+            // Make the edge "pill" rail appear on every macOS Space (and over
+            // fullscreen apps) so it acts like a system overlay rather than
+            // living on the single Space it opened on. The pill is the `main`
+            // window; the frontend can later flip this off via the
+            // `set_pill_all_spaces` command when it expands into Library/Prefs.
+            #[cfg(target_os = "macos")]
+            if let Some(window) = app.get_webview_window("main") {
+                if let Err(e) = apply_all_spaces_behavior(&window, true) {
+                    eprintln!("Failed to set all-Spaces behavior on pill window: {}", e);
+                }
+            }
+
             // Start signed-out; the webview calls `update_tray_menu` once auth
             // resolves and on every later change to flip the menu.
             let menu = build_tray_menu(app.handle(), false)?;
@@ -196,7 +277,8 @@ pub fn run() {
             keychain_set,
             keychain_delete,
             browser_auth_listen,
-            update_tray_menu
+            update_tray_menu,
+            set_pill_all_spaces
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
