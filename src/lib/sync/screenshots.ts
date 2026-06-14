@@ -6,8 +6,10 @@
  *   -> upload thumb -> setDoc(status:'thumb') -> upload full.png
  *   -> updateDoc(status:'full', fullPath, bytes)
  *
- * Receive path: subscribe to the newest 100 screenshots; the engine downloads
- * the full image once status flips to 'full' and hands the bytes to Rust.
+ * Receive path: subscribe to the newest 100 screenshots; once status flips to
+ * 'full' the engine resolves the full image's tokenized getDownloadURL and asks
+ * Rust to HTTP-download the bytes (sidesteps webview CORS — see
+ * saveReceivedScreenshot) and save them into the local cache.
  */
 
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
@@ -26,7 +28,7 @@ import {
   Timestamp,
   type DocumentData,
 } from "firebase/firestore";
-import { getBytes, getDownloadURL, ref, uploadBytes } from "firebase/storage";
+import { getDownloadURL, ref, uploadBytes } from "firebase/storage";
 import { db, storage } from "./firebase";
 import { sha256Hex } from "./hash";
 import {
@@ -258,24 +260,26 @@ export async function shareScreenshotLink(
   return getDownloadURL(fullRef);
 }
 
-/** Download Storage bytes at `fullPath` (a `users/.../full.png` path). */
-export async function downloadStorageBytes(fullPath: string): Promise<Uint8Array> {
-  const ab = await getBytes(ref(storage, fullPath));
-  return new Uint8Array(ab);
-}
-
 /**
- * Persist a received full screenshot to disk via Rust (saves into the
- * ScreenshotX folder and copies the image to the clipboard). Returns the saved
+ * Persist a received full screenshot to disk via Rust (saves into the local
+ * screenshot cache and copies the image to the clipboard). Returns the saved
  * file path.
+ *
+ * The raw bytes are fetched in RUST, not the webview: we resolve the full
+ * image's tokenized `getDownloadURL` (a capability that bypasses Storage rules
+ * AND CORS) and hand the URL to the `download_synced_image` command. The
+ * webview's `getBytes()`/`getBlob()` would issue a cross-origin XHR the bucket
+ * blocks without CORS config, so a 2nd device's upload (e.g. Android) could not
+ * be saved here; Rust HTTP is not subject to webview CORS, making cross-device
+ * receive work with zero bucket-CORS setup.
  */
 export async function saveReceivedScreenshot(
   item: ScreenshotDoc,
 ): Promise<string> {
   if (!item.fullPath) throw new Error("Screenshot has no full image yet");
-  const bytes = await downloadStorageBytes(item.fullPath);
-  return invoke<string>("save_synced_image", {
-    bytes: Array.from(bytes),
+  const url = await getDownloadURL(ref(storage, item.fullPath));
+  return invoke<string>("download_synced_image", {
+    url,
     name: `${item.id}.png`,
   });
 }

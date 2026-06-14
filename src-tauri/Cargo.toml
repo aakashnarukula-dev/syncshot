@@ -20,12 +20,18 @@ tauri-build = { version = "2", features = [] }
 base64 = "0.22"
 dirs = "5"
 image = "0.24"
+# Server-side HTTP for the multi-device RECEIVE path: download Firebase Storage
+# bytes from a getDownloadURL token URL in Rust, sidestepping the webview's CORS
+# (getBytes()/XHR is blocked by the bucket without CORS config). native-tls uses
+# macOS Security.framework, so no openssl/system-lib build deps.
+reqwest = { version = "0.12", default-features = false, features = ["native-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri = { version = "2", features = ["macos-private-api", "protocol-asset", "tray-icon", "image-png"] }
 tauri-plugin-autostart = "2"
 tauri-plugin-drag = "2.1.1"
 tauri-plugin-global-shortcut = "2"
+tauri-plugin-localhost = "2.3.2"
 tauri-plugin-opener = "2"
 tauri-plugin-screenshots = "2"
 tauri-plugin-store = "2"

@@ -14,8 +14,8 @@ mod utils;
 
 use commands::{
     capture_all_monitors, capture_once, capture_region, copy_to_clipboard, delete_file,
-    get_desktop_directory, get_desktop_root, get_mouse_position, get_screenshot_thumbnail,
-    get_temp_directory,
+    download_synced_image, get_desktop_directory, get_desktop_root, get_mouse_position,
+    get_screenshot_thumbnail, get_temp_directory,
     list_screenshots, native_capture_fullscreen, native_capture_interactive,
     native_capture_window, open_editor_window, play_screenshot_sound, save_edited_image,
     save_native_screenshot, save_synced_image, set_clipboard_text,
@@ -270,6 +270,7 @@ pub fn run() {
             native_capture_window,
             play_screenshot_sound,
             save_synced_image,
+            download_synced_image,
             set_clipboard_text,
             get_mouse_position,
             get_machine_id,

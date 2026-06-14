@@ -87,9 +87,13 @@ pub async fn save_native_screenshot(
 /// thumbnail column.
 #[tauri::command]
 pub async fn save_synced_image(bytes: Vec<u8>, name: String) -> Result<String, String> {
-    let dir = get_screenshotx_dir()?;
-    // Sanitize the supplied name into a safe filename; fall back to a generated
-    // one if it sanitizes to empty.
+    persist_synced_image(&bytes, &name)
+}
+
+/// Sanitize a supplied name into a safe filename for the local cache; fall back
+/// to a generated one if it sanitizes to empty. Pure (no I/O) so it can be unit
+/// tested without touching the filesystem or clipboard.
+fn safe_synced_filename(name: &str) -> Result<String, String> {
     let safe: String = name
         .chars()
         .map(|c| {
@@ -100,17 +104,90 @@ pub async fn save_synced_image(bytes: Vec<u8>, name: String) -> Result<String, S
             }
         })
         .collect();
-    let filename = if safe.is_empty() {
-        generate_filename("synced", "png")?
+    if safe.is_empty() {
+        generate_filename("synced", "png")
     } else {
-        safe
-    };
+        Ok(safe)
+    }
+}
+
+/// Persist raw image bytes into the local screenshot cache (hidden app-data dir,
+/// NOT the Desktop) and copy them to the clipboard. Returns the saved path.
+/// Shared by `save_synced_image` (bytes over IPC) and `download_synced_image`
+/// (bytes fetched in Rust).
+fn persist_synced_image(bytes: &[u8], name: &str) -> Result<String, String> {
+    let dir = get_screenshotx_dir()?;
+    let filename = safe_synced_filename(name)?;
     let path = PathBuf::from(&dir).join(&filename);
-    fs::write(&path, &bytes).map_err(|e| format!("Failed to save synced image: {}", e))?;
+    fs::write(&path, bytes).map_err(|e| format!("Failed to save synced image: {}", e))?;
     let path_str = path.to_string_lossy().into_owned();
     // Mirror local-capture behavior: place the received image on the clipboard.
     let _ = copy_image_to_clipboard(&path_str);
     Ok(path_str)
+}
+
+/// Download a synced screenshot's bytes over HTTP from a Firebase Storage
+/// download URL and persist it into the local cache (same destination as
+/// `save_synced_image`). Returns the saved path.
+///
+/// The receive path resolves a tokenized `getDownloadURL()` in the webview — a
+/// capability URL that bypasses Storage security rules AND CORS — then hands it
+/// here. Fetching the raw bytes in Rust sidesteps the webview's CORS sandbox:
+/// `getBytes()`/`getBlob()` issue a cross-origin XHR the bucket blocks without
+/// CORS config, but Rust HTTP is not subject to webview CORS, so cross-device
+/// receives (e.g. an Android upload landing on this Mac) work with ZERO
+/// bucket-CORS setup.
+#[tauri::command]
+pub async fn download_synced_image(url: String, name: String) -> Result<String, String> {
+    let resp = reqwest::get(&url)
+        .await
+        .map_err(|e| format!("Failed to fetch synced image: {}", e))?;
+    if !resp.status().is_success() {
+        return Err(format!(
+            "Failed to fetch synced image: HTTP {}",
+            resp.status()
+        ));
+    }
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| format!("Failed to read synced image body: {}", e))?;
+    persist_synced_image(&bytes, &name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn safe_synced_filename_keeps_valid_names() {
+        assert_eq!(safe_synced_filename("abc123.png").unwrap(), "abc123.png");
+        assert_eq!(
+            safe_synced_filename("doc-id_42.png").unwrap(),
+            "doc-id_42.png"
+        );
+    }
+
+    #[test]
+    fn safe_synced_filename_sanitizes_path_and_space_chars() {
+        // A Firestore doc id is alphanumeric, but defend against anything that
+        // could escape the cache dir or break the write. Dots are allowed, but
+        // every path separator becomes '_' so the result can't escape the dir.
+        assert_eq!(
+            safe_synced_filename("../etc/passwd").unwrap(),
+            ".._etc_passwd"
+        );
+        assert!(!safe_synced_filename("../etc/passwd").unwrap().contains('/'));
+        assert_eq!(safe_synced_filename("a b/c.png").unwrap(), "a_b_c.png");
+    }
+
+    #[test]
+    fn safe_synced_filename_falls_back_when_empty() {
+        // Only a truly empty name triggers the generated fallback.
+        let generated = safe_synced_filename("").unwrap();
+        assert!(generated.starts_with("synced_"), "got: {generated}");
+        assert!(generated.ends_with(".png"), "got: {generated}");
+    }
 }
 
 /// Write text to the system clipboard (re-copy a synced ClipboardX entry).
