@@ -243,9 +243,18 @@ export const revokeDevice = onCall(async (request) => {
 
 export const mintDesktopToken = onCall(async (request) => {
   const uid = authedUid(request);
-  const token = await auth.createCustomToken(uid);
-  logger.info("mintDesktopToken", { uid });
-  return { token };
+  try {
+    const token = await auth.createCustomToken(uid);
+    logger.info("mintDesktopToken", { uid });
+    return { token };
+  } catch (err) {
+    // createCustomToken (no embedded key) signs via the IAM signBlob API, which
+    // needs roles/iam.serviceAccountTokenCreator on the runtime SA. Surface the
+    // real reason instead of letting onCall mask it as a bare "INTERNAL".
+    const message = err instanceof Error ? err.message : String(err);
+    logger.error("mintDesktopToken failed", { uid, message });
+    throw new HttpsError("internal", `Could not mint desktop token: ${message}`);
+  }
 });
 
 // ---------------------------------------------------------------------------

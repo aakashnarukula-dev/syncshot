@@ -21,6 +21,7 @@
       h1 { font-size: 18px; margin: 0; }
       p.sub { margin: 0; opacity: 0.65; }
       label { font-size: 13px; opacity: 0.8; }
+      form { margin: 0; }
       .row { display: flex; gap: 8px; align-items: stretch; }
       .prefix {
         display: grid; place-items: center; padding: 0 10px;
@@ -33,6 +34,7 @@
         border-radius: 8px; background: Field; color: FieldText;
       }
       input#code { letter-spacing: 0.3em; font-variant-numeric: tabular-nums; }
+      input:disabled { opacity: 0.6; }
       button {
         padding: 10px 14px; font: inherit; font-weight: 600; cursor: pointer;
         border: 0; border-radius: 8px; background: AccentColor; color: AccentColorText;
@@ -51,24 +53,23 @@
         <p class="sub">We'll text a 6-digit code to your phone.</p>
       </div>
 
-      <div id="phoneStep">
+      <form id="phoneForm" novalidate>
         <label for="phone">Mobile number</label>
         <div class="row" style="margin-top: 6px">
           <span class="prefix">+91</span>
           <input id="phone" type="tel" inputmode="numeric" autocomplete="tel-national"
                  placeholder="98765 43210" maxlength="10" />
-          <button id="send" type="button">Send code</button>
+          <button id="send" type="submit">Send code</button>
         </div>
-      </div>
+      </form>
 
-      <div id="codeStep" class="hidden">
+      <form id="codeForm" class="hidden" novalidate>
         <label for="code">6-digit code</label>
         <div class="row" style="margin-top: 6px">
           <input id="code" type="text" inputmode="numeric" autocomplete="one-time-code"
-                 placeholder="123456" maxlength="6" />
-          <button id="verify" type="button">Verify</button>
+                 placeholder="123456" maxlength="6" aria-label="6-digit verification code" />
         </div>
-      </div>
+      </form>
 
       <p id="msg" class="msg" role="status" aria-live="polite"></p>
       <div id="recaptcha"></div>
@@ -109,22 +110,26 @@
       const digits = (s) => (s || "").replace(/\D/g, "");
 
       if (!cbPort || !state) {
-        $("phoneStep").classList.add("hidden");
+        $("phoneForm").classList.add("hidden");
         setMsg("Open sign-in from the ScreenshotX app.", "err");
         throw new Error("missing callback params");
       }
 
       let confirmation = null;
       let verifier = null;
+      let verifying = false;
 
       $("phone").addEventListener("input", (e) => {
         e.target.value = digits(e.target.value).slice(0, 10);
       });
       $("code").addEventListener("input", (e) => {
-        e.target.value = digits(e.target.value).slice(0, 6);
+        const v = digits(e.target.value).slice(0, 6);
+        e.target.value = v;
+        // Auto-verify the moment 6 digits are present (matches desktop SignInView).
+        if (v.length === 6) verifyCode();
       });
 
-      $("send").addEventListener("click", async () => {
+      async function sendCode() {
         const phone = digits($("phone").value);
         if (phone.length !== 10) {
           setMsg("Enter your 10-digit mobile number.", "err");
@@ -136,37 +141,58 @@
           verifier?.clear();
           verifier = new RecaptchaVerifier(auth, "recaptcha", { size: "invisible" });
           confirmation = await signInWithPhoneNumber(auth, "+91" + phone, verifier);
-          $("codeStep").classList.remove("hidden");
+          $("codeForm").classList.remove("hidden");
           $("send").textContent = "Resend";
           setMsg("Code sent. Enter it below.", "ok");
+          $("code").value = "";
+          $("code").disabled = false;
           $("code").focus();
         } catch (err) {
           setMsg(err?.message || String(err), "err");
         } finally {
           $("send").disabled = false;
         }
-      });
+      }
 
-      $("verify").addEventListener("click", async () => {
+      async function verifyCode() {
+        if (verifying) return;
         const code = digits($("code").value);
         if (code.length !== 6 || !confirmation) {
           setMsg("Enter the 6-digit code.", "err");
           return;
         }
-        $("verify").disabled = true;
+        verifying = true;
+        $("code").disabled = true;
         setMsg("Verifying…");
         try {
           await confirmation.confirm(code);
-          setMsg("Verified. Returning to ScreenshotX…", "ok");
+          // OTP is good; now mint the desktop hand-off token. Only after we hold a
+          // real token do we redirect to the loopback listener.
+          setMsg("Verified. Finishing sign-in…", "ok");
           const { data } = await httpsCallable(functions, "mintDesktopToken")();
+          if (!data || !data.token) {
+            throw new Error("Sign-in succeeded but no token was returned.");
+          }
+          setMsg("Signed in. Returning to ScreenshotX…", "ok");
           const url =
             "http://127.0.0.1:" + cbPort + "/?token=" +
             encodeURIComponent(data.token) + "&state=" + encodeURIComponent(state);
           location.href = url;
         } catch (err) {
           setMsg(err?.message || String(err), "err");
-          $("verify").disabled = false;
+          verifying = false;
+          $("code").disabled = false;
+          $("code").focus();
         }
+      }
+
+      $("phoneForm").addEventListener("submit", (e) => {
+        e.preventDefault();
+        sendCode();
+      });
+      $("codeForm").addEventListener("submit", (e) => {
+        e.preventDefault();
+        verifyCode();
       });
     </script>
   </body>
