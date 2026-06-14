@@ -21,7 +21,7 @@ import {
 } from "@/components/ui/alert-dialog";
 
 interface ClipboardEntryProps {
-  libId: string;
+  uid: string;
   entry: ClipboardDoc;
 }
 
@@ -38,7 +38,7 @@ export function relativeTime(ms: number | null): string {
   return `${day}d ago`;
 }
 
-export function ClipboardEntry({ libId, entry }: ClipboardEntryProps) {
+export function ClipboardEntry({ uid, entry }: ClipboardEntryProps) {
   const [copied, setCopied] = useState(false);
   const [busy, setBusy] = useState(false);
 
@@ -58,7 +58,7 @@ export function ClipboardEntry({ libId, entry }: ClipboardEntryProps) {
     if (busy) return;
     setBusy(true);
     try {
-      await setClipboardPinned(libId, entry.id, !entry.pinned);
+      await setClipboardPinned(uid, entry.id, !entry.pinned);
     } catch (err) {
       toast.error("Couldn't update pin", {
         description: err instanceof Error ? err.message : String(err),
@@ -70,7 +70,7 @@ export function ClipboardEntry({ libId, entry }: ClipboardEntryProps) {
 
   const remove = async () => {
     try {
-      await deleteClipboardEntry(libId, entry.id);
+      await deleteClipboardEntry(uid, entry.id);
     } catch (err) {
       toast.error("Couldn't delete", {
         description: err instanceof Error ? err.message : String(err),

@@ -8,15 +8,18 @@
 
 export type Platform = "mac" | "android";
 
-/** Embedded reference to the device that produced a doc. */
+/** Embedded reference to the device that produced a doc. All devices share one
+ *  auth uid (same account); `deviceId` is the per-install identity used to skip
+ *  a device's own docs on the receive path. */
 export interface DeviceRef {
   uid: string;
+  deviceId: string;
   name: string;
   platform: Platform;
 }
 
 /**
- * `libraries/{libId}/screenshots/{id}`
+ * `users/{uid}/screenshots/{id}`
  * `createdAt` is a Firestore server timestamp on the wire; normalized to
  * milliseconds-since-epoch (or null while the server value resolves) in the
  * client store.
@@ -36,7 +39,7 @@ export interface ScreenshotDoc {
 }
 
 /**
- * `libraries/{libId}/clipboard/{id}`
+ * `users/{uid}/clipboard/{id}`
  */
 export interface ClipboardDoc {
   id: string;

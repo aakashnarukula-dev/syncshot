@@ -1,11 +1,11 @@
 rules_version = '2';
 
-// Screenshot/clipboard blobs are stored under libraries/{libId}/... and gated on
-// the same `libId` custom claim used by Firestore.
+// Screenshot blobs are stored under users/{uid}/... and gated on the caller's
+// auth uid (email-link sign-in; all devices share the account).
 service firebase.storage {
   match /b/{bucket}/o {
-    match /libraries/{libId}/{allPaths=**} {
-      allow read, write: if request.auth.token.libId == libId;
+    match /users/{uid}/{allPaths=**} {
+      allow read, write: if request.auth != null && request.auth.uid == uid;
     }
   }
 }

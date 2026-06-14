@@ -6,7 +6,7 @@ import {
   setClipboardPinned,
   setLocalClipboard,
 } from "@/lib/sync/clipboard";
-import { useClipboardEntries, useLibId } from "@/stores/syncStore";
+import { useClipboardEntries, useUid } from "@/stores/syncStore";
 import type { ClipboardDoc } from "@/lib/sync/types";
 import { cn } from "@/lib/utils";
 import { relativeTime } from "./ClipboardEntry";
@@ -16,14 +16,14 @@ import { relativeTime } from "./ClipboardEntry";
 // the column — never statically from the launch-critical chunk.
 export function ClipboardColumnList() {
   const entries = useClipboardEntries();
-  const libId = useLibId();
+  const uid = useUid();
 
   if (entries.length === 0) {
     return (
       <div className="flex-1 flex flex-col items-center justify-center gap-1 px-4 text-center">
         <p className="text-sm text-white/80">No copied text yet</p>
         <p className="text-xs text-white/50">
-          {libId
+          {uid
             ? "Text you copy on paired devices shows up here."
             : "Pair a device to sync your clipboard."}
         </p>
@@ -44,18 +44,18 @@ export function ClipboardColumnList() {
       }}
     >
       {entries.map((entry) => (
-        <ClipCard key={entry.id} libId={libId} entry={entry} />
+        <ClipCard key={entry.id} uid={uid} entry={entry} />
       ))}
     </ul>
   );
 }
 
 interface ClipCardProps {
-  libId: string | null;
+  uid: string | null;
   entry: ClipboardDoc;
 }
 
-function ClipCard({ libId, entry }: ClipCardProps) {
+function ClipCard({ uid, entry }: ClipCardProps) {
   const [copied, setCopied] = useState(false);
   const [busy, setBusy] = useState(false);
 
@@ -72,10 +72,10 @@ function ClipCard({ libId, entry }: ClipCardProps) {
   };
 
   const togglePin = async () => {
-    if (busy || !libId) return;
+    if (busy || !uid) return;
     setBusy(true);
     try {
-      await setClipboardPinned(libId, entry.id, !entry.pinned);
+      await setClipboardPinned(uid, entry.id, !entry.pinned);
     } catch (err) {
       toast.error("Couldn't update pin", {
         description: err instanceof Error ? err.message : String(err),
@@ -86,9 +86,9 @@ function ClipCard({ libId, entry }: ClipCardProps) {
   };
 
   const remove = async () => {
-    if (!libId) return;
+    if (!uid) return;
     try {
-      await deleteClipboardEntry(libId, entry.id);
+      await deleteClipboardEntry(uid, entry.id);
     } catch (err) {
       toast.error("Couldn't delete", {
         description: err instanceof Error ? err.message : String(err),

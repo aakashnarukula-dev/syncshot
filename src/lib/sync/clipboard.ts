@@ -31,8 +31,8 @@ import {
   type DeviceRef,
 } from "./types";
 
-function clipboardCol(libId: string) {
-  return collection(db, "libraries", libId, "clipboard");
+function clipboardCol(uid: string) {
+  return collection(db, "users", uid, "clipboard");
 }
 
 // Hashes of app-initiated copies (setLocalClipboard) awaiting their
@@ -77,12 +77,12 @@ function mapDoc(id: string, data: DocumentData): ClipboardDoc {
  * Returns an unsubscribe function.
  */
 export function subscribeClipboard(
-  libId: string,
+  uid: string,
   onChange: (items: ClipboardDoc[]) => void,
   onError?: (err: Error) => void,
 ): () => void {
   const q = query(
-    clipboardCol(libId),
+    clipboardCol(uid),
     orderBy("createdAt", "desc"),
     limit(CLIPBOARD_LIMIT),
   );
@@ -99,7 +99,7 @@ export function subscribeClipboard(
  * Returns the new hash on success, or null when skipped.
  */
 export async function writeClipboardEntry(
-  libId: string,
+  uid: string,
   device: DeviceRef,
   text: string,
   recentHash?: string | null,
@@ -115,7 +115,7 @@ export async function writeClipboardEntry(
   if (consumeSelfCopy(hash)) return null;
   if (recentHash && hash === recentHash) return null;
 
-  await addDoc(clipboardCol(libId), {
+  await addDoc(clipboardCol(uid), {
     text,
     hash,
     createdAt: serverTimestamp(),
@@ -138,17 +138,17 @@ export async function setLocalClipboard(text: string): Promise<void> {
 
 /** Toggle the pinned flag on a clipboard entry. */
 export async function setClipboardPinned(
-  libId: string,
+  uid: string,
   id: string,
   pinned: boolean,
 ): Promise<void> {
-  await updateDoc(doc(clipboardCol(libId), id), { pinned });
+  await updateDoc(doc(clipboardCol(uid), id), { pinned });
 }
 
 /** Delete a clipboard entry. */
 export async function deleteClipboardEntry(
-  libId: string,
+  uid: string,
   id: string,
 ): Promise<void> {
-  await deleteDoc(doc(clipboardCol(libId), id));
+  await deleteDoc(doc(clipboardCol(uid), id));
 }

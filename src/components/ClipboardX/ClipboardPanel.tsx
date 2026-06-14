@@ -9,11 +9,11 @@ import { ClipboardEntry } from "./ClipboardEntry";
 interface ClipboardPanelProps {
   /** Whether this Mac is paired into a library yet. */
   paired: boolean;
-  libId: string | null;
+  uid: string | null;
   onOpenPairing: () => void;
 }
 
-export function ClipboardPanel({ paired, libId, onOpenPairing }: ClipboardPanelProps) {
+export function ClipboardPanel({ paired, uid, onOpenPairing }: ClipboardPanelProps) {
   const entries = useClipboardEntries();
   const paused = usePaused();
   const [search, setSearch] = useState("");
@@ -79,9 +79,9 @@ export function ClipboardPanel({ paired, libId, onOpenPairing }: ClipboardPanelP
           />
         ) : (
           <ul className="flex flex-col gap-2">
-            {libId &&
+            {uid &&
               filtered.map((entry) => (
-                <ClipboardEntry key={entry.id} libId={libId} entry={entry} />
+                <ClipboardEntry key={entry.id} uid={uid} entry={entry} />
               ))}
           </ul>
         )}

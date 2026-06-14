@@ -1,22 +1,13 @@
 rules_version = '2';
 
 // ScreenshotX / ClipboardX realtime backend.
-// A device's custom claim `libId` is the single authorization key: a signed-in
-// device may read/write everything under its own library and nothing else.
+// Identity = email-link sign-in; every device signs in to the same account.
+// All data lives under users/{uid} and is gated on the caller's auth uid.
 service cloud.firestore {
   match /databases/{database}/documents {
 
-    // All library data (members, screenshots, clipboard, ...) lives under the
-    // library document. Access is gated entirely on the caller's `libId` claim,
-    // which is minted by the Cloud Functions on createLibrary / redeemPairingCode.
-    match /libraries/{libId}/{document=**} {
-      allow read, write: if request.auth.token.libId == libId;
-    }
-
-    // Pairing codes are written/validated only by Cloud Functions (admin SDK,
-    // which bypasses these rules). No client may touch them directly.
-    match /pairingCodes/{code} {
-      allow read, write: if false;
+    match /users/{uid}/{document=**} {
+      allow read, write: if request.auth != null && request.auth.uid == uid;
     }
   }
 }

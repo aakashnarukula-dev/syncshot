@@ -1,13 +1,14 @@
 /**
- * Local persistence of sync prefs (libId, device name, paused flag) via the
- * Tauri store. The Firebase SDK already persists the anonymous uid + claims;
- * we only need the libId to rebuild collection paths on cold start.
+ * Local persistence of sync prefs (device identity, device name, paused
+ * flag) via the Tauri store. The Firebase SDK persists the
+ * signed-in session itself; deviceId is the per-install identity used to tell
+ * this device's docs apart now that every device shares one auth uid.
  */
 
 import { Store } from "@tauri-apps/plugin-store";
 
 const FILE = "settings.json";
-const KEY_LIB_ID = "syncLibId";
+const KEY_DEVICE_ID = "syncDeviceId";
 const KEY_DEVICE_NAME = "syncDeviceName";
 const KEY_PAUSED = "syncPaused";
 
@@ -16,7 +17,7 @@ async function store(): Promise<Store> {
 }
 
 export interface SyncPrefs {
-  libId: string | null;
+  deviceId: string | null;
   deviceName: string | null;
   paused: boolean;
 }
@@ -24,19 +25,19 @@ export interface SyncPrefs {
 export async function loadSyncPrefs(): Promise<SyncPrefs> {
   try {
     const s = await store();
-    const libId = (await s.get<string>(KEY_LIB_ID)) ?? null;
+    const deviceId = (await s.get<string>(KEY_DEVICE_ID)) ?? null;
     const deviceName = (await s.get<string>(KEY_DEVICE_NAME)) ?? null;
     const paused = (await s.get<boolean>(KEY_PAUSED)) ?? false;
-    return { libId, deviceName, paused };
+    return { deviceId, deviceName, paused };
   } catch {
-    return { libId: null, deviceName: null, paused: false };
+    return { deviceId: null, deviceName: null, paused: false };
   }
 }
 
-export async function saveLibId(libId: string): Promise<void> {
+export async function saveDeviceId(deviceId: string): Promise<void> {
   try {
     const s = await store();
-    await s.set(KEY_LIB_ID, libId);
+    await s.set(KEY_DEVICE_ID, deviceId);
     await s.save();
   } catch {
     /* best-effort */

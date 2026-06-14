@@ -1,10 +1,10 @@
 import { useState } from "react";
 import { ClipboardList, ImageIcon, Link2, X } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { useAuthState, useLibId } from "@/stores/syncStore";
+import { useAuthState, useUid } from "@/stores/syncStore";
 import { ScreenshotGrid } from "./ScreenshotGrid";
 import { ClipboardPanel } from "@/components/ClipboardX/ClipboardPanel";
-import { PairingView } from "@/components/Pairing/PairingView";
+import { SignInView } from "@/components/Pairing/SignInView";
 
 type Section = "screenshots" | "clipboard" | "pairing";
 
@@ -26,9 +26,9 @@ interface LibraryViewProps {
 
 export function LibraryView({ onClose }: LibraryViewProps) {
   const [section, setSection] = useState<Section>("screenshots");
-  const libId = useLibId();
+  const uid = useUid();
   const authState = useAuthState();
-  const paired = libId != null;
+  const paired = uid != null;
 
   return (
     <div className="flex h-dvh w-dvw overflow-hidden bg-background text-foreground">
@@ -46,7 +46,11 @@ export function LibraryView({ onClose }: LibraryViewProps) {
               )}
               aria-hidden="true"
             />
-            {authState === "anon" ? (paired ? "Synced" : "Not paired") : "Connecting…"}
+            {authState === "signedIn"
+              ? "Synced"
+              : authState === "signedOut"
+                ? "Signed out"
+                : "Connecting…"}
           </p>
         </div>
 
@@ -92,11 +96,11 @@ export function LibraryView({ onClose }: LibraryViewProps) {
           {section === "clipboard" && (
             <ClipboardPanel
               paired={paired}
-              libId={libId}
+              uid={uid}
               onOpenPairing={() => setSection("pairing")}
             />
           )}
-          {section === "pairing" && <PairingView />}
+          {section === "pairing" && <SignInView />}
         </div>
       </main>
     </div>

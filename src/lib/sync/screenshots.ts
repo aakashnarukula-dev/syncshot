@@ -37,8 +37,8 @@ import {
   type ScreenshotDoc,
 } from "./types";
 
-function screenshotsCol(libId: string) {
-  return collection(db, "libraries", libId, "screenshots");
+function screenshotsCol(uid: string) {
+  return collection(db, "users", uid, "screenshots");
 }
 
 function tsToMillis(value: unknown): number | null {
@@ -66,12 +66,12 @@ function mapDoc(id: string, data: DocumentData): ScreenshotDoc {
  * unsubscribe function.
  */
 export function subscribeScreenshots(
-  libId: string,
+  uid: string,
   onChange: (items: ScreenshotDoc[]) => void,
   onError?: (err: Error) => void,
 ): () => void {
   const q = query(
-    screenshotsCol(libId),
+    screenshotsCol(uid),
     orderBy("createdAt", "desc"),
     limit(SCREENSHOTS_LIMIT),
   );
@@ -130,7 +130,7 @@ async function makeThumb(
  * No-op (returns false) if an identical image (same sha256) already exists.
  */
 export async function publishScreenshot(
-  libId: string,
+  uid: string,
   device: DeviceRef,
   path: string,
 ): Promise<boolean> {
@@ -141,17 +141,17 @@ export async function publishScreenshot(
 
   // Content-addressed dedup — skip if this exact image is already synced.
   const dupes = await getDocs(
-    query(screenshotsCol(libId), where("sha256", "==", sha256), limit(1)),
+    query(screenshotsCol(uid), where("sha256", "==", sha256), limit(1)),
   );
   if (!dupes.empty) return false;
 
   const { width, height, thumb } = await makeThumb(blob);
 
   // Allocate the doc id up front so the Storage path can use it.
-  const docRef = doc(screenshotsCol(libId));
+  const docRef = doc(screenshotsCol(uid));
   const id = docRef.id;
 
-  const thumbRef = ref(storage, `libraries/${libId}/screenshots/${id}/thumb.webp`);
+  const thumbRef = ref(storage, `users/${uid}/screenshots/${id}/thumb.webp`);
   await uploadBytes(thumbRef, thumb, { contentType: "image/webp" });
 
   await setDoc(docRef, {
@@ -167,7 +167,7 @@ export async function publishScreenshot(
     status: "thumb",
   });
 
-  const fullRef = ref(storage, `libraries/${libId}/screenshots/${id}/full.png`);
+  const fullRef = ref(storage, `users/${uid}/screenshots/${id}/full.png`);
   await uploadBytes(fullRef, blob, { contentType: "image/png" });
 
   await updateDoc(docRef, {
@@ -190,7 +190,7 @@ export async function publishScreenshot(
  * long-lived download token that anyone can open (capability, not rule-gated).
  */
 export async function shareScreenshotLink(
-  libId: string,
+  uid: string,
   device: DeviceRef,
   path: string,
 ): Promise<string> {
@@ -200,7 +200,7 @@ export async function shareScreenshotLink(
   const sha256 = await sha256Hex(buf);
 
   const dupes = await getDocs(
-    query(screenshotsCol(libId), where("sha256", "==", sha256), limit(1)),
+    query(screenshotsCol(uid), where("sha256", "==", sha256), limit(1)),
   );
 
   // Already synced: reuse the existing object, finishing the full upload if the
@@ -213,7 +213,7 @@ export async function shareScreenshotLink(
     }
     const fullRef = ref(
       storage,
-      `libraries/${libId}/screenshots/${existing.id}/full.png`,
+      `users/${uid}/screenshots/${existing.id}/full.png`,
     );
     await uploadBytes(fullRef, blob, { contentType: "image/png" });
     await updateDoc(existing.ref, {
@@ -227,10 +227,10 @@ export async function shareScreenshotLink(
   // Not synced yet: full publish (mirrors publishScreenshot's thumb-first path).
   const { width, height, thumb } = await makeThumb(blob);
 
-  const docRef = doc(screenshotsCol(libId));
+  const docRef = doc(screenshotsCol(uid));
   const id = docRef.id;
 
-  const thumbRef = ref(storage, `libraries/${libId}/screenshots/${id}/thumb.webp`);
+  const thumbRef = ref(storage, `users/${uid}/screenshots/${id}/thumb.webp`);
   await uploadBytes(thumbRef, thumb, { contentType: "image/webp" });
 
   await setDoc(docRef, {
@@ -246,7 +246,7 @@ export async function shareScreenshotLink(
     status: "thumb",
   });
 
-  const fullRef = ref(storage, `libraries/${libId}/screenshots/${id}/full.png`);
+  const fullRef = ref(storage, `users/${uid}/screenshots/${id}/full.png`);
   await uploadBytes(fullRef, blob, { contentType: "image/png" });
 
   await updateDoc(docRef, {
@@ -258,7 +258,7 @@ export async function shareScreenshotLink(
   return getDownloadURL(fullRef);
 }
 
-/** Download Storage bytes at `fullPath` (a `libraries/.../full.png` path). */
+/** Download Storage bytes at `fullPath` (a `users/.../full.png` path). */
 export async function downloadStorageBytes(fullPath: string): Promise<Uint8Array> {
   const ab = await getBytes(ref(storage, fullPath));
   return new Uint8Array(ab);
