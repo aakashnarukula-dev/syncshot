@@ -4,6 +4,7 @@
 //! and saving screenshots with various features like region selection
 //! and background customization.
 
+mod auth;
 mod clipboard;
 mod commands;
 mod image;
@@ -19,7 +20,11 @@ use commands::{
     native_capture_window, open_editor_window, play_screenshot_sound, save_edited_image,
     save_native_screenshot, save_synced_image, set_clipboard_text,
 };
+use auth::browser_auth_listen;
 use license::{get_machine_id, keychain_delete, keychain_get, keychain_set};
+
+/// Port for the release-mode localhost server (see tauri_plugin_localhost below).
+const LOCALHOST_PORT: u16 = 38217;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -50,9 +55,24 @@ pub fn run() {
         .plugin(tauri_plugin_screenshots::init())
         .plugin(tauri_plugin_store::Builder::default().build())
         .plugin(tauri_plugin_drag::init())
+        // Serve the bundled frontend over real localhost HTTP in release.
+        // Firebase phone-auth's reCAPTCHA rejects tokens minted on the custom
+        // tauri:// origin; http://localhost is an authorized domain.
+        .plugin(tauri_plugin_localhost::Builder::new(LOCALHOST_PORT).build())
         .setup(|app| {
             use tauri::Manager;
             use tauri_plugin_autostart::ManagerExt;
+
+            // Release only: dev keeps the Vite devUrl (already http://localhost:1420).
+            #[cfg(not(debug_assertions))]
+            if let Some(window) = app.get_webview_window("main") {
+                let url = format!("http://localhost:{LOCALHOST_PORT}")
+                    .parse()
+                    .expect("valid localhost url");
+                if let Err(e) = window.navigate(url) {
+                    eprintln!("Failed to navigate main window to localhost: {}", e);
+                }
+            }
 
             // Regular (not Accessory) so the app shows a Dock icon with the
             // running indicator dot; clicking it re-surfaces the column.
@@ -83,7 +103,7 @@ pub fn run() {
             use tauri::menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem};
 
             let library_item =
-                MenuItemBuilder::with_id("library", "Pair").build(app)?;
+                MenuItemBuilder::with_id("library", "Sign in & Sync").build(app)?;
 
             let preferences_item =
                 MenuItemBuilder::with_id("preferences", "Preferences…").build(app)?;
@@ -150,7 +170,8 @@ pub fn run() {
             get_machine_id,
             keychain_get,
             keychain_set,
-            keychain_delete
+            keychain_delete,
+            browser_auth_listen
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

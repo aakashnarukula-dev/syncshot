@@ -5,13 +5,24 @@
  * engine. Firestore is created with IndexedDB-backed offline persistence so
  * the screenshot/clipboard lists render instantly on cold start and writes are
  * queued while offline.
+ *
+ * Identity = phone sign-in. Phone + reCAPTCHA + OTP can't run inside the Tauri
+ * webview: its `tauri://localhost` origin fails Firebase phone-auth's
+ * reCAPTCHA app-credential check (`auth/invalid-app-credential`). So that step
+ * runs on a hosted https page in the user's default browser, which mints a
+ * Firebase custom token handed back over a one-shot loopback listener (Rust
+ * `browser_auth_listen`); the app finishes with `signInWithCustomToken`. Every
+ * device signs in to the same account; data lives under users/{uid}. Per-device
+ * identity is a locally-persisted deviceId, NOT the auth uid.
  */
 
+import { invoke } from "@tauri-apps/api/core";
 import { initializeApp, type FirebaseApp } from "firebase/app";
 import {
   getAuth,
-  signInAnonymously,
   onAuthStateChanged,
+  signInWithCustomToken,
+  signOut,
   type Auth,
   type User,
 } from "firebase/auth";
@@ -22,8 +33,7 @@ import {
   type Firestore,
 } from "firebase/firestore";
 import { getStorage, type FirebaseStorage } from "firebase/storage";
-import { getFunctions, type Functions } from "firebase/functions";
-import { firebaseConfig, FUNCTIONS_REGION } from "./firebaseConfig";
+import { firebaseConfig } from "./firebaseConfig";
 
 export const app: FirebaseApp = initializeApp(firebaseConfig);
 
@@ -40,49 +50,44 @@ export const db: Firestore = initializeFirestore(app, {
 
 export const storage: FirebaseStorage = getStorage(app);
 
-export const functions: Functions = getFunctions(app, FUNCTIONS_REGION);
-
-let anonReady: Promise<User> | null = null;
-
 /**
- * Ensure the device has a stable anonymous Firebase identity. Idempotent —
- * resolves with the persisted `User` on subsequent calls. The returned uid is
- * the device identity used throughout the sync engine.
+ * Sign in via the system browser.
+ *
+ * Opens the hosted phone-auth page in the default browser (Rust side) and
+ * blocks until it redirects back a Firebase custom token over loopback, then
+ * exchanges it for a session. A leftover anonymous session (pre-OTP builds) is
+ * discarded first. `onAuthStateChanged` fires on success, which starts the
+ * sync engine.
  */
-export function ensureAnonAuth(): Promise<User> {
-  if (anonReady) return anonReady;
-  anonReady = new Promise<User>((resolve, reject) => {
-    const unsub = onAuthStateChanged(
-      auth,
-      (user) => {
-        if (user) {
-          unsub();
-          resolve(user);
-        }
-      },
-      (err) => {
-        unsub();
-        reject(err);
-      },
-    );
-    // If no persisted session, kick off anonymous sign-in. onAuthStateChanged
-    // above fires once it completes.
-    if (!auth.currentUser) {
-      signInAnonymously(auth).catch((err) => {
-        unsub();
-        reject(err);
-      });
-    }
-  });
-  return anonReady;
+export async function startBrowserSignIn(): Promise<User> {
+  const token = await invoke<string>("browser_auth_listen");
+  if (auth.currentUser?.isAnonymous) await signOut(auth);
+  const cred = await signInWithCustomToken(auth, token);
+  return cred.user;
+}
+
+/** Sign this device out. */
+export async function logout(): Promise<void> {
+  await signOut(auth);
 }
 
 /**
- * Force an ID-token refresh so a freshly-set `libId` custom claim is picked up
- * by the client (claims only load into the SDK on token refresh).
+ * Subscribe to auth state. Fires with the signed-in (non-anonymous) user or
+ * null. A persisted anonymous session from pre-OTP builds is purged.
  */
-export async function refreshIdToken(): Promise<void> {
-  if (auth.currentUser) {
-    await auth.currentUser.getIdToken(true);
-  }
+export function watchAuth(
+  onUser: (user: User | null) => void,
+  onError?: (err: Error) => void,
+): () => void {
+  return onAuthStateChanged(
+    auth,
+    (user) => {
+      if (user?.isAnonymous) {
+        void signOut(auth); // fires this watcher again with null
+        return;
+      }
+      onUser(user);
+    },
+    (err) => onError?.(err as Error),
+  );
 }

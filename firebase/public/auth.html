@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Sign in · ScreenshotX</title>
+    <style>
+      :root { color-scheme: light dark; }
+      * { box-sizing: border-box; }
+      body {
+        font: 15px/1.5 system-ui, -apple-system, sans-serif;
+        margin: 0; min-height: 100dvh;
+        display: grid; place-items: center;
+        background: Canvas; color: CanvasText;
+      }
+      .card {
+        width: min(92vw, 360px);
+        display: flex; flex-direction: column; gap: 14px;
+        padding: 28px;
+      }
+      h1 { font-size: 18px; margin: 0; }
+      p.sub { margin: 0; opacity: 0.65; }
+      label { font-size: 13px; opacity: 0.8; }
+      .row { display: flex; gap: 8px; align-items: stretch; }
+      .prefix {
+        display: grid; place-items: center; padding: 0 10px;
+        border: 1px solid color-mix(in srgb, CanvasText 25%, transparent);
+        border-radius: 8px; font-variant-numeric: tabular-nums; opacity: 0.7;
+      }
+      input {
+        flex: 1; width: 100%; padding: 10px 12px; font: inherit;
+        border: 1px solid color-mix(in srgb, CanvasText 25%, transparent);
+        border-radius: 8px; background: Field; color: FieldText;
+      }
+      input#code { letter-spacing: 0.3em; font-variant-numeric: tabular-nums; }
+      button {
+        padding: 10px 14px; font: inherit; font-weight: 600; cursor: pointer;
+        border: 0; border-radius: 8px; background: AccentColor; color: AccentColorText;
+      }
+      button:disabled { opacity: 0.5; cursor: default; }
+      .msg { font-size: 13px; min-height: 1.2em; }
+      .msg.err { color: #d33; }
+      .msg.ok { color: #2a8; }
+      .hidden { display: none; }
+    </style>
+  </head>
+  <body>
+    <main class="card">
+      <div>
+        <h1>Sign in to ScreenshotX</h1>
+        <p class="sub">We'll text a 6-digit code to your phone.</p>
+      </div>
+
+      <div id="phoneStep">
+        <label for="phone">Mobile number</label>
+        <div class="row" style="margin-top: 6px">
+          <span class="prefix">+91</span>
+          <input id="phone" type="tel" inputmode="numeric" autocomplete="tel-national"
+                 placeholder="98765 43210" maxlength="10" />
+          <button id="send" type="button">Send code</button>
+        </div>
+      </div>
+
+      <div id="codeStep" class="hidden">
+        <label for="code">6-digit code</label>
+        <div class="row" style="margin-top: 6px">
+          <input id="code" type="text" inputmode="numeric" autocomplete="one-time-code"
+                 placeholder="123456" maxlength="6" />
+          <button id="verify" type="button">Verify</button>
+        </div>
+      </div>
+
+      <p id="msg" class="msg" role="status" aria-live="polite"></p>
+      <div id="recaptcha"></div>
+    </main>
+
+    <script type="module">
+      import { initializeApp } from "https://www.gstatic.com/firebasejs/12.0.0/firebase-app.js";
+      import {
+        getAuth, RecaptchaVerifier, signInWithPhoneNumber,
+      } from "https://www.gstatic.com/firebasejs/12.0.0/firebase-auth.js";
+      import {
+        getFunctions, httpsCallable,
+      } from "https://www.gstatic.com/firebasejs/12.0.0/firebase-functions.js";
+
+      // Public web-app config for screenshot-x-v1 (mirrors src/lib/sync/firebaseConfig.ts).
+      const app = initializeApp({
+        apiKey: "AIzaSyDM8WuSfhIkQg4NkDLXLoN_KCMKROUbnvM",
+        authDomain: "screenshot-x-v1.firebaseapp.com",
+        projectId: "screenshot-x-v1",
+        storageBucket: "screenshot-x-v1.firebasestorage.app",
+        messagingSenderId: "428592678377",
+        appId: "1:428592678377:web:9e202fb9f86ecd9710b778",
+      });
+      const auth = getAuth(app);
+      auth.useDeviceLanguage();
+      const functions = getFunctions(app, "us-central1");
+
+      const params = new URLSearchParams(location.search);
+      const cbPort = params.get("cb_port");
+      const state = params.get("state");
+
+      const $ = (id) => document.getElementById(id);
+      const msg = $("msg");
+      const setMsg = (text, kind = "") => {
+        msg.textContent = text;
+        msg.className = "msg" + (kind ? " " + kind : "");
+      };
+      const digits = (s) => (s || "").replace(/\D/g, "");
+
+      if (!cbPort || !state) {
+        $("phoneStep").classList.add("hidden");
+        setMsg("Open sign-in from the ScreenshotX app.", "err");
+        throw new Error("missing callback params");
+      }
+
+      let confirmation = null;
+      let verifier = null;
+
+      $("phone").addEventListener("input", (e) => {
+        e.target.value = digits(e.target.value).slice(0, 10);
+      });
+      $("code").addEventListener("input", (e) => {
+        e.target.value = digits(e.target.value).slice(0, 6);
+      });
+
+      $("send").addEventListener("click", async () => {
+        const phone = digits($("phone").value);
+        if (phone.length !== 10) {
+          setMsg("Enter your 10-digit mobile number.", "err");
+          return;
+        }
+        $("send").disabled = true;
+        setMsg("Sending code…");
+        try {
+          verifier?.clear();
+          verifier = new RecaptchaVerifier(auth, "recaptcha", { size: "invisible" });
+          confirmation = await signInWithPhoneNumber(auth, "+91" + phone, verifier);
+          $("codeStep").classList.remove("hidden");
+          $("send").textContent = "Resend";
+          setMsg("Code sent. Enter it below.", "ok");
+          $("code").focus();
+        } catch (err) {
+          setMsg(err?.message || String(err), "err");
+        } finally {
+          $("send").disabled = false;
+        }
+      });
+
+      $("verify").addEventListener("click", async () => {
+        const code = digits($("code").value);
+        if (code.length !== 6 || !confirmation) {
+          setMsg("Enter the 6-digit code.", "err");
+          return;
+        }
+        $("verify").disabled = true;
+        setMsg("Verifying…");
+        try {
+          await confirmation.confirm(code);
+          setMsg("Verified. Returning to ScreenshotX…", "ok");
+          const { data } = await httpsCallable(functions, "mintDesktopToken")();
+          const url =
+            "http://127.0.0.1:" + cbPort + "/?token=" +
+            encodeURIComponent(data.token) + "&state=" + encodeURIComponent(state);
+          location.href = url;
+        } catch (err) {
+          setMsg(err?.message || String(err), "err");
+          $("verify").disabled = false;
+        }
+      });
+    </script>
+  </body>
+</html>

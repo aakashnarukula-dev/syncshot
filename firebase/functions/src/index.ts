@@ -231,6 +231,24 @@ export const revokeDevice = onCall(async (request) => {
 });
 
 // ---------------------------------------------------------------------------
+// mintDesktopToken — bridge a system-browser phone sign-in into the desktop app.
+//
+// The Mac app's Tauri webview (`tauri://localhost`) can't pass Firebase
+// phone-auth's reCAPTCHA app-credential check, so the phone + OTP step runs on
+// the hosted page in the user's real browser. Once that page is signed in it
+// calls this with its idToken; we mint a custom token the desktop app exchanges
+// via signInWithCustomToken. The user's persisted `libId` claim (if any) is
+// loaded automatically on that sign-in, so pairing state survives the hop.
+// ---------------------------------------------------------------------------
+
+export const mintDesktopToken = onCall(async (request) => {
+  const uid = authedUid(request);
+  const token = await auth.createCustomToken(uid);
+  logger.info("mintDesktopToken", { uid });
+  return { token };
+});
+
+// ---------------------------------------------------------------------------
 // cleanupExpiredCodes — scheduled GC of stale pairing codes.
 // ---------------------------------------------------------------------------
 
