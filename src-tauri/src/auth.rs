@@ -17,9 +17,13 @@ const AUTH_PAGE_URL: &str = "https://screenshot-x-v1.web.app/auth.html";
 /// How long to wait for the browser round-trip before giving up.
 const AUTH_TIMEOUT: Duration = Duration::from_secs(300);
 
+// Best-effort self-close on success: window.close() only works for
+// script-opened windows, so it's a no-op for a tab the user's browser opened
+// via `open <url>` — the friendly text stays as the fallback in that case.
 const SUCCESS_HTML: &str = "<!doctype html><meta charset=utf-8><title>Signed in</title>\
 <body style=\"font:16px system-ui;display:grid;place-items:center;height:100vh;margin:0\">\
-<p>✅ Signed in. You can close this tab and return to ScreenshotX.</p>";
+<p>✅ Signed in. You can close this tab and return to ScreenshotX.</p>\
+<script>window.close()</script>";
 
 const ERROR_HTML: &str = "<!doctype html><meta charset=utf-8><title>Sign-in failed</title>\
 <body style=\"font:16px system-ui;display:grid;place-items:center;height:100vh;margin:0\">\

@@ -1,16 +1,16 @@
 import { useState } from "react";
-import { AlertTriangle, Check, Loader2, LogOut, Smartphone } from "lucide-react";
+import { AlertTriangle, Loader2, Smartphone } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { hasRealFirebaseConfig } from "@/lib/sync/firebaseConfig";
 import { startBrowserSignIn } from "@/lib/sync/firebase";
-import { signOutDevice } from "@/lib/sync/engine";
-import { useAccountEmail, useAuthState, useSyncStore } from "@/stores/syncStore";
+import { useAuthState, useSyncStore } from "@/stores/syncStore";
 
+// Phone sign-in CTA only. Once signed in, App.tsx dismisses this window and
+// lands on the screenshots column — the account identity + Log Out now live at
+// the bottom of Preferences, not here.
 export function SignInView() {
   const authState = useAuthState();
   const authError = useSyncStore((s) => s.authError);
-  const account = useAccountEmail();
-  const uid = useSyncStore((s) => s.uid);
 
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -22,18 +22,6 @@ export function SignInView() {
     setError(null);
     try {
       await startBrowserSignIn();
-    } catch (e) {
-      setError(errMsg(e));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const signOut = async () => {
-    setBusy(true);
-    setError(null);
-    try {
-      await signOutDevice();
     } catch (e) {
       setError(errMsg(e));
     } finally {
@@ -71,45 +59,20 @@ export function SignInView() {
         </p>
       )}
 
-      {authState === "signedIn" ? (
-        <div className="flex items-center justify-between gap-2 rounded-lg border border-border bg-accent/40 px-4 py-2 text-sm">
-          <span className="flex items-center gap-2">
-            <Check className="size-4 text-primary" aria-hidden="true" />
-            <span className="font-medium">{account ?? `…${uid?.slice(-6) ?? ""}`}</span>
-          </span>
-          <Button
-            variant="ghost"
-            size="sm"
-            className="text-destructive hover:text-destructive"
-            onClick={signOut}
-            disabled={busy}
-          >
-            {busy ? (
-              <Loader2 className="size-4 animate-spin" aria-hidden="true" />
-            ) : (
-              <LogOut className="size-4" aria-hidden="true" />
-            )}
-            Sign out
-          </Button>
-        </div>
-      ) : (
-        <>
-          <div>
-            <h2 className="text-base font-semibold">Sign in with your phone</h2>
-            <p className="mt-0.5 text-sm text-muted-foreground">
-              We'll open your browser to verify your number, then bring you back here.
-            </p>
-          </div>
-          <Button onClick={signIn} disabled={busy} className="w-full">
-            {busy ? (
-              <Loader2 className="size-4 animate-spin" aria-hidden="true" />
-            ) : (
-              <Smartphone className="size-4" aria-hidden="true" />
-            )}
-            {busy ? "Waiting for browser…" : "Sign in with phone"}
-          </Button>
-        </>
-      )}
+      <div>
+        <h2 className="text-base font-semibold">Sign in with your phone</h2>
+        <p className="mt-0.5 text-sm text-muted-foreground">
+          We'll open your browser to verify your number, then bring you back here.
+        </p>
+      </div>
+      <Button onClick={signIn} disabled={busy} className="w-full">
+        {busy ? (
+          <Loader2 className="size-4 animate-spin" aria-hidden="true" />
+        ) : (
+          <Smartphone className="size-4" aria-hidden="true" />
+        )}
+        {busy ? "Waiting for browser…" : "Sign in with phone"}
+      </Button>
     </div>
   );
 }

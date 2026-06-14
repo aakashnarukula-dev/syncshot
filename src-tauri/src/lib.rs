@@ -26,6 +26,44 @@ use license::{get_machine_id, keychain_delete, keychain_get, keychain_set};
 /// Port for the release-mode localhost server (see tauri_plugin_localhost below).
 const LOCALHOST_PORT: u16 = 38217;
 
+/// Build the tray menu for the given auth state.
+/// - signed IN  → Preferences, Log Out, Quit  (no "Sign in & Sync")
+/// - signed OUT → Sign in & Sync, Preferences, Quit
+fn build_tray_menu<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    signed_in: bool,
+) -> tauri::Result<tauri::menu::Menu<R>> {
+    use tauri::menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem};
+    let preferences_item = MenuItemBuilder::with_id("preferences", "Preferences…").build(app)?;
+    let quit_item = MenuItemBuilder::with_id("quit", "Quit")
+        .accelerator("CommandOrControl+Q")
+        .build(app)?;
+    let sep = PredefinedMenuItem::separator(app)?;
+    if signed_in {
+        let logout_item = MenuItemBuilder::with_id("logout", "Log Out").build(app)?;
+        MenuBuilder::new(app)
+            .items(&[&preferences_item, &logout_item, &sep, &quit_item])
+            .build()
+    } else {
+        let library_item = MenuItemBuilder::with_id("library", "Sign in & Sync").build(app)?;
+        MenuBuilder::new(app)
+            .items(&[&library_item, &preferences_item, &sep, &quit_item])
+            .build()
+    }
+}
+
+/// Bridge: the webview calls this whenever auth state resolves/changes so the
+/// tray menu reflects signed-in vs signed-out (see build_tray_menu).
+#[tauri::command]
+fn update_tray_menu(app: tauri::AppHandle, signed_in: bool) -> Result<(), String> {
+    use tauri::Manager;
+    let menu = build_tray_menu(&app, signed_in).map_err(|e| e.to_string())?;
+    if let Some(tray) = app.tray_by_id("main") {
+        tray.set_menu(Some(menu)).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let mut builder = tauri::Builder::default();
@@ -100,29 +138,12 @@ pub fn run() {
                 });
             }
 
-            use tauri::menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem};
-
-            let library_item =
-                MenuItemBuilder::with_id("library", "Sign in & Sync").build(app)?;
-
-            let preferences_item =
-                MenuItemBuilder::with_id("preferences", "Preferences…").build(app)?;
-
-            let quit_item = MenuItemBuilder::with_id("quit", "Quit")
-                .accelerator("CommandOrControl+Q")
-                .build(app)?;
-
-            let menu = MenuBuilder::new(app)
-                .items(&[
-                    &library_item,
-                    &preferences_item,
-                    &PredefinedMenuItem::separator(app)?,
-                    &quit_item,
-                ])
-                .build()?;
+            // Start signed-out; the webview calls `update_tray_menu` once auth
+            // resolves and on every later change to flip the menu.
+            let menu = build_tray_menu(app.handle(), false)?;
 
             let tray_icon = tauri::image::Image::from_bytes(include_bytes!("../icons/tray.png"))?;
-            let _tray = tauri::tray::TrayIconBuilder::new()
+            let _tray = tauri::tray::TrayIconBuilder::with_id("main")
                 .menu(&menu)
                 .icon(tray_icon)
                 .icon_as_template(true)
@@ -135,6 +156,9 @@ pub fn run() {
                         }
                         "preferences" => {
                             let _ = app.emit("open-preferences", ());
+                        }
+                        "logout" => {
+                            let _ = app.emit("tray-logout", ());
                         }
                         "quit" => {
                             app.exit(0);
@@ -171,7 +195,8 @@ pub fn run() {
             keychain_get,
             keychain_set,
             keychain_delete,
-            browser_auth_listen
+            browser_auth_listen,
+            update_tray_menu
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

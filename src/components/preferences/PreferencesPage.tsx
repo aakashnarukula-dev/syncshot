@@ -1,28 +1,46 @@
 import { useState, useEffect, useCallback } from "react";
 import { Store } from "@tauri-apps/plugin-store";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { Folder } from "lucide-react";
+import { Loader2, LogOut } from "lucide-react";
 import { toast } from "sonner";
 import { Switch } from "@/components/ui/switch";
 import { KeyboardShortcutManager } from "./KeyboardShortcutManager";
 import type { KeyboardShortcut } from "./KeyboardShortcutManager";
+import { signOutDevice } from "@/lib/sync/engine";
+import { useAccountEmail, useAuthState } from "@/stores/syncStore";
 
 interface PreferencesPageProps {
   onBack: () => void;
   onSettingsChange?: () => void;
+  // Called after a successful logout so the app can route back to sign-in.
+  onLoggedOut?: () => void;
 }
 
 interface GeneralSettings {
-  saveDir: string;
   copyToClipboard: boolean;
 }
 
-export function PreferencesPage({ onBack, onSettingsChange }: PreferencesPageProps) {
+export function PreferencesPage({ onBack, onSettingsChange, onLoggedOut }: PreferencesPageProps) {
   const [settings, setSettings] = useState<GeneralSettings>({
-    saveDir: "",
     copyToClipboard: true,
   });
   const [isLoading, setIsLoading] = useState(true);
+  const authState = useAuthState();
+  const account = useAccountEmail();
+  const [loggingOut, setLoggingOut] = useState(false);
+
+  const handleLogout = useCallback(async () => {
+    setLoggingOut(true);
+    try {
+      await signOutDevice();
+      onLoggedOut?.();
+    } catch (err) {
+      console.error("logout failed:", err);
+      toast.error("Failed to log out");
+    } finally {
+      setLoggingOut(false);
+    }
+  }, [onLoggedOut]);
 
   useEffect(() => {
     const w = getCurrentWindow();
@@ -43,9 +61,7 @@ export function PreferencesPage({ onBack, onSettingsChange }: PreferencesPagePro
       try {
         const store = await Store.load("settings.json");
         const copyToClip = await store.get<boolean>("copyToClipboard");
-        const saveDir = await store.get<string>("saveDir");
         setSettings({
-          saveDir: saveDir || "",
           copyToClipboard: copyToClip ?? true,
         });
       } catch (err) {
@@ -94,18 +110,6 @@ export function PreferencesPage({ onBack, onSettingsChange }: PreferencesPagePro
         </header>
 
         <Section label="general">
-          <Field label="save directory" icon={<Folder className="size-3.5" />}>
-            <input
-              id="save-dir"
-              type="text"
-              value={settings.saveDir}
-              onChange={(e) => updateSetting("saveDir", e.target.value)}
-              placeholder="~/Desktop/ScreenshotX"
-              className="w-full px-3 py-2 bg-white/[0.03] border border-white/10 rounded-md text-zinc-200 placeholder-zinc-600 focus:outline-none focus:border-emerald-500/40 focus:bg-white/[0.05] transition-colors font-mono text-xs"
-            />
-            <Hint>where screenshots get saved.</Hint>
-          </Field>
-
           <Row
             label="copy to clipboard"
             hint="auto-copy every capture so you can paste anywhere."
@@ -120,6 +124,28 @@ export function PreferencesPage({ onBack, onSettingsChange }: PreferencesPagePro
         <Section label="shortcuts">
           <KeyboardShortcutManager onShortcutsChange={handleShortcutsChange} />
         </Section>
+
+        {authState === "signedIn" && (
+          <Section label="account">
+            <Row
+              label={account ?? "signed in"}
+              hint="this device is linked to your phone account. screenshots & clipboard sync across your devices."
+            >
+              <button
+                onClick={handleLogout}
+                disabled={loggingOut}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md border border-white/10 text-zinc-300 hover:text-white hover:border-white/20 focus:outline-none focus:border-emerald-500/40 disabled:opacity-50 transition-colors text-xs"
+              >
+                {loggingOut ? (
+                  <Loader2 className="size-3.5 animate-spin" aria-hidden="true" />
+                ) : (
+                  <LogOut className="size-3.5" aria-hidden="true" />
+                )}
+                log out
+              </button>
+            </Row>
+          </Section>
+        )}
       </div>
     </main>
   );
@@ -131,26 +157,6 @@ function Section({ label, children }: { label: string; children: React.ReactNode
       <h2 className="text-[10px] tracking-[0.18em] uppercase text-zinc-500">{label}</h2>
       <div className="space-y-5 border-t border-white/5 pt-4">{children}</div>
     </section>
-  );
-}
-
-function Field({
-  label,
-  icon,
-  children,
-}: {
-  label: string;
-  icon?: React.ReactNode;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className="space-y-1.5">
-      <label className="text-xs text-zinc-400 flex items-center gap-2">
-        {icon}
-        {label}
-      </label>
-      {children}
-    </div>
   );
 }
 

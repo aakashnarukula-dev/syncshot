@@ -663,6 +663,26 @@ function MainApp() {
     }
   }, [syncAuthState, openPairing]);
 
+  // Sign-in completed while the sign-in window is up (auto-presented on launch
+  // or opened from the tray) — dismiss it and hand the shared window back to the
+  // screenshots column instead of stranding the user on an account screen. The
+  // signed-in folder watcher then hydrates and surfaces the column.
+  useEffect(() => {
+    if (mode === "pairing" && syncAuthState === "signedIn") {
+      void closePairing();
+    }
+  }, [mode, syncAuthState, closePairing]);
+
+  // Keep the tray menu in sync with auth: signed in → Preferences/Log Out/Quit,
+  // signed out → Sign in & Sync/Preferences/Quit. Skip the transient
+  // loading/error states (no menu flip until auth actually resolves).
+  useEffect(() => {
+    if (syncAuthState !== "signedIn" && syncAuthState !== "signedOut") return;
+    invoke("update_tray_menu", { signedIn: syncAuthState === "signedIn" }).catch((e) =>
+      console.error("update_tray_menu failed:", e),
+    );
+  }, [syncAuthState]);
+
   // Load settings function
   const loadSettings = useCallback(async () => {
     try {
@@ -1086,8 +1106,16 @@ function MainApp() {
       });
       // Tray "Pair" opens the small pairing-only window.
       const unlisten9 = await listen("open-library", () => { openPairing(); });
+      // Tray "Log Out" signs this device out (engine is code-split off the
+      // critical path, so pull it in lazily). authState → signedOut then flips
+      // the tray menu back via the bridge effect above.
+      const unlisten10 = await listen("tray-logout", () => {
+        import("@/lib/sync/engine")
+          .then((m) => m.signOutDevice())
+          .catch((e) => console.error("tray logout failed:", e));
+      });
       const prevCleanup = unlisten6;
-      unlisten6 = () => { prevCleanup(); unlisten7(); unlisten8(); unlisten9(); };
+      unlisten6 = () => { prevCleanup(); unlisten7(); unlisten8(); unlisten9(); unlisten10(); };
     };
 
     setupListeners();
@@ -1251,6 +1279,7 @@ function MainApp() {
         <PreferencesPage
           onBack={handleBackFromPreferences}
           onSettingsChange={handleSettingsChange}
+          onLoggedOut={openPairing}
         />
       </Suspense>
     );
