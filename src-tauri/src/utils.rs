@@ -13,10 +13,18 @@ pub fn get_desktop_path() -> AppResult<String> {
     Ok(desktop.to_string_lossy().into_owned())
 }
 
-/// Get the ScreenshotX save folder inside the user's Desktop. Created if missing.
+/// Get the ScreenshotX local screenshot directory. Created if missing.
+///
+/// Firebase Storage is the source of truth for synced screenshots; this is a
+/// hidden, app-private cache (NOT a user-visible Desktop folder) under
+/// ~/Library/Application Support so the pill column, the editor and
+/// clipboard-paste have fast local access to recently captured/synced bytes.
+/// Falls back to a temp-dir subfolder if the data dir can't be resolved.
 pub fn get_screenshotx_dir() -> AppResult<String> {
-    let desktop = dirs::desktop_dir().ok_or("Failed to get Desktop directory")?;
-    let dir = desktop.join("ScreenshotX");
+    let base = dirs::data_dir().unwrap_or_else(std::env::temp_dir);
+    let dir = base
+        .join("com.aakashnarukula.screenshotx")
+        .join("Screenshots");
     ensure_dir(&dir)?;
     Ok(dir.to_string_lossy().into_owned())
 }
@@ -87,6 +95,15 @@ mod tests {
 
         // Filenames should be different due to timestamp
         assert_ne!(filename1, filename2);
+    }
+
+    #[test]
+    fn test_screenshotx_dir_is_hidden_cache_not_desktop() {
+        let dir = get_screenshotx_dir().expect("screenshotx dir");
+        // Source of truth is Firebase Storage; the local dir must be a hidden
+        // app cache, never the user-visible Desktop.
+        assert!(dir.ends_with("Screenshots"), "got: {dir}");
+        assert!(!dir.contains("Desktop"), "must not live on Desktop: {dir}");
     }
 
     #[test]

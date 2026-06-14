@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
-import { Check, Loader2 } from "lucide-react";
+import { Check, ImageOff, Loader2 } from "lucide-react";
 import { loadThumbObjectUrl, saveReceivedScreenshot } from "@/lib/sync/screenshots";
 import type { ScreenshotDoc } from "@/lib/sync/types";
 import { cn } from "@/lib/utils";
@@ -13,13 +13,18 @@ interface SyncThumbProps {
  *  click to download the full image + copy it to this Mac's clipboard. */
 export function SyncThumb({ item }: SyncThumbProps) {
   const [src, setSrc] = useState<string | null>(null);
+  const [failed, setFailed] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
 
   useEffect(() => {
     let url: string | null = null;
     let cancelled = false;
-    if (!item.thumbPath) return;
+    setFailed(false);
+    if (!item.thumbPath) {
+      setFailed(true);
+      return;
+    }
     loadThumbObjectUrl(item.thumbPath)
       .then((u) => {
         if (cancelled) {
@@ -29,7 +34,10 @@ export function SyncThumb({ item }: SyncThumbProps) {
         url = u;
         setSrc(u);
       })
-      .catch((err) => console.error("thumb load failed:", err));
+      .catch((err) => {
+        console.error("thumb load failed:", err);
+        if (!cancelled) setFailed(true);
+      });
     return () => {
       cancelled = true;
       if (url) URL.revokeObjectURL(url);
@@ -73,13 +81,22 @@ export function SyncThumb({ item }: SyncThumbProps) {
         (uploading || saving) && "cursor-default",
       )}
     >
-      {src ? (
+      {src && !failed ? (
         <img
           src={src}
           alt="Synced screenshot"
           className="size-full object-cover"
           draggable={false}
+          onError={() => setFailed(true)}
         />
+      ) : failed ? (
+        <div
+          className="flex size-full flex-col items-center justify-center gap-1 bg-muted text-muted-foreground"
+          aria-label="Preview unavailable"
+        >
+          <ImageOff className="size-5" aria-hidden="true" />
+          <span className="text-[10px]">Preview unavailable</span>
+        </div>
       ) : (
         <div className="size-full animate-pulse bg-muted" aria-hidden="true" />
       )}

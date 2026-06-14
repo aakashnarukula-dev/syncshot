@@ -81,9 +81,10 @@ pub async fn save_native_screenshot(
     Ok(saved_path)
 }
 
-/// Save a screenshot received via Firebase sync into the ScreenshotX folder and
-/// copy it to the clipboard. Returns the saved file path. The existing save-dir
-/// poll then surfaces it in the thumbnail column.
+/// Save a screenshot received via Firebase sync into the local screenshot cache
+/// (hidden app-data dir, NOT the Desktop) and copy it to the clipboard. Returns
+/// the saved file path. The existing save-dir poll then surfaces it in the
+/// thumbnail column.
 #[tauri::command]
 pub async fn save_synced_image(bytes: Vec<u8>, name: String) -> Result<String, String> {
     let dir = get_screenshotx_dir()?;
@@ -178,7 +179,10 @@ pub async fn save_edited_image(
     Ok(saved_path)
 }
 
-/// Get default save directory (~/Desktop/ScreenshotX), created if missing.
+/// Get the default screenshot directory: a hidden app-data cache (NOT the
+/// Desktop). Firebase Storage is the source of truth; this dir is the local
+/// cache that backs the pill column / editor / clipboard-paste. Created if
+/// missing. (Command name kept for IPC compatibility with the frontend.)
 #[tauri::command]
 pub async fn get_desktop_directory() -> Result<String, String> {
     get_screenshotx_dir()

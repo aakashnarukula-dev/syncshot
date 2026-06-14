@@ -321,6 +321,11 @@ function ThumbnailItem({ path, eager = false, onEdit, onRemove }: ThumbnailItemP
     let cancelled = false;
     const show = (url: string) => {
       const pre = new Image();
+      // Match the displayed <img crossOrigin="anonymous"> so the preloaded
+      // response is cached in CORS mode — a mismatch (no-cors preload vs
+      // cors <img>) makes WKWebView reject the cached opaque response and
+      // paint a broken-image "?" instead of the screenshot.
+      pre.crossOrigin = "anonymous";
       pre.src = url;
       const swap = () => {
         if (cancelled) return;
@@ -392,8 +397,8 @@ function ThumbnailItem({ path, eager = false, onEdit, onRemove }: ThumbnailItemP
   // the publisher's dedup+upload path — no Firebase re-init or duplicate upload.
   const copyShareLink = async () => {
     if (isSharing) return;
-    const libId = useSyncStore.getState().libId;
-    if (!libId) {
+    const uid = useSyncStore.getState().uid;
+    if (!uid) {
       toast.error("Pair a device first to share links", { duration: 4000 });
       return;
     }
@@ -408,7 +413,7 @@ function ThumbnailItem({ path, eager = false, onEdit, onRemove }: ThumbnailItemP
         toast.error("Pair a device first to share links", { duration: 4000 });
         return;
       }
-      const url = await shareScreenshotLink(libId, device, path);
+      const url = await shareScreenshotLink(uid, device, path);
       const { setLocalClipboard } = await import("@/lib/sync/clipboard");
       await setLocalClipboard(url);
       toast.success("Link copied", { description: url, duration: 2500 });
@@ -483,6 +488,18 @@ function ThumbnailItem({ path, eager = false, onEdit, onRemove }: ThumbnailItemP
           onDragStart={(e) => {
             e.preventDefault();
             beginDrag(e.currentTarget);
+          }}
+          onError={() => {
+            // Cached thumbnail failed to decode/load — fall back to the
+            // original full-res file once. If that also fails, hold the
+            // shimmer rather than flashing a broken-image icon.
+            const original = convertFileSrc(path);
+            if (src !== original) {
+              setSrc(original);
+              setReady(true);
+            } else {
+              setReady(false);
+            }
           }}
           onClick={() => {
             exitingRef.current = true;

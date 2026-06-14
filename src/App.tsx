@@ -722,8 +722,10 @@ function MainApp() {
     const initializeApp = async () => {
       // These three are independent — fetch them concurrently instead of three
       // serial IPC round-trips on the critical path to showing the window.
-      // defaultDir = ~/Desktop/ScreenshotX (created if missing); desktopRoot =
-      // legacy plain Desktop, used to migrate old prefs; temp = canonicalized.
+      // defaultDir = hidden app-data screenshot cache (Firebase Storage is the
+      // source of truth — captures sync to the cloud, this dir just backs fast
+      // local display/edit/paste, never a Desktop folder). desktopRoot = legacy
+      // plain Desktop, used to migrate old prefs; temp = canonicalized.
       const [desktopRes, rootRes, tempRes] = await Promise.allSettled([
         invoke<string>("get_desktop_directory"),
         invoke<string>("get_desktop_root"),
@@ -764,7 +766,16 @@ function MainApp() {
 
         const savedSaveDir = await store.get<string>("saveDir");
         const trimmed = savedSaveDir?.trim() ?? "";
-        const isLegacyDesktop = !!desktopRoot && (trimmed === desktopRoot || trimmed === `${desktopRoot}/`);
+        // Migrate users off any legacy Desktop save location — the plain
+        // Desktop root AND the old ~/Desktop/ScreenshotX folder — onto the
+        // hidden app-data cache default. Screenshots live in Firebase now.
+        const legacyShotsDir = desktopRoot ? `${desktopRoot}/ScreenshotX` : "";
+        const isLegacyDesktop =
+          !!desktopRoot &&
+          (trimmed === desktopRoot ||
+            trimmed === `${desktopRoot}/` ||
+            trimmed === legacyShotsDir ||
+            trimmed === `${legacyShotsDir}/`);
         if (trimmed !== "" && !isLegacyDesktop) {
           effectiveSaveDir = trimmed;
         } else if (defaultDir) {
