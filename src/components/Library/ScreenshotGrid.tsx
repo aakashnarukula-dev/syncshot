@@ -1,5 +1,10 @@
-import { ImageIcon } from "lucide-react";
-import { useScreenshots } from "@/stores/syncStore";
+import { useEffect, useRef } from "react";
+import { ImageIcon, Loader2 } from "lucide-react";
+import {
+  loadMoreScreenshots,
+  useScreenshots,
+  useScreenshotsHasMore,
+} from "@/stores/syncStore";
 import { SyncThumb } from "./SyncThumb";
 
 interface ScreenshotGridProps {
@@ -11,6 +16,28 @@ interface ScreenshotGridProps {
 
 export function ScreenshotGrid({ paired, onOpenPairing }: ScreenshotGridProps) {
   const screenshots = useScreenshots();
+  const hasMore = useScreenshotsHasMore();
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const sentinelRef = useRef<HTMLDivElement>(null);
+
+  // Lazy paging: when the sentinel below the grid scrolls within ~600px of the
+  // viewport, pull the next older page. The engine GROWS the live Firestore
+  // window (subscribeScreenshots) so we never fetch all 100+ shots up front.
+  // Re-running on screenshots.length lets a page that lands still inside the
+  // prefetch margin immediately trigger the next one.
+  useEffect(() => {
+    const sentinel = sentinelRef.current;
+    const root = scrollRef.current;
+    if (!sentinel || !root || !hasMore) return;
+    const io = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((e) => e.isIntersecting)) loadMoreScreenshots();
+      },
+      { root, rootMargin: "600px 0px" },
+    );
+    io.observe(sentinel);
+    return () => io.disconnect();
+  }, [hasMore, screenshots.length]);
 
   if (!paired) {
     return (
@@ -33,12 +60,21 @@ export function ScreenshotGrid({ paired, onOpenPairing }: ScreenshotGridProps) {
   }
 
   return (
-    <div className="h-full overflow-y-auto p-6">
+    <div ref={scrollRef} className="h-full overflow-y-auto p-6">
       <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-4">
         {screenshots.map((item) => (
           <SyncThumb key={item.id} item={item} />
         ))}
       </div>
+      {hasMore && (
+        <div
+          ref={sentinelRef}
+          className="flex items-center justify-center py-6 text-muted-foreground"
+          aria-hidden="true"
+        >
+          <Loader2 className="size-4 animate-spin" />
+        </div>
+      )}
     </div>
   );
 }

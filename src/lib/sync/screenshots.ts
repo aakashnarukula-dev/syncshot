@@ -33,7 +33,7 @@ import { deleteObject, getDownloadURL, ref, uploadBytes } from "firebase/storage
 import { db, storage } from "./firebase";
 import { sha256Hex } from "./hash";
 import {
-  SCREENSHOTS_LIMIT,
+  SCREENSHOTS_PAGE_SIZE,
   THUMB_MAX_EDGE,
   THUMB_WEBP_QUALITY,
   type DeviceRef,
@@ -64,25 +64,87 @@ function mapDoc(id: string, data: DocumentData): ScreenshotDoc {
   };
 }
 
+/** Handle to a live, growing screenshot subscription. */
+export interface ScreenshotsSubscription {
+  /** Stop the realtime listener. */
+  unsubscribe: () => void;
+  /**
+   * Grow the live window by one page (reveals older shots). No-op while a grow
+   * is already in flight, or once the end of the collection has been reached.
+   */
+  loadMore: () => void;
+}
+
 /**
- * Subscribe to the newest screenshots (createdAt desc, limit 100). Returns an
- * unsubscribe function.
+ * A live, GROWING subscription to the newest screenshots (createdAt desc).
+ *
+ * Instead of fetching every shot up front — the old fixed limit(100), which
+ * made the user wait while 100+ docs + images loaded — we subscribe to a small
+ * first window (SCREENSHOTS_PAGE_SIZE, enough to fill the viewport plus
+ * overscan) and grow that window by one page each time `loadMore()` is called
+ * (the grid calls it as the user scrolls near the bottom).
+ *
+ * We grow the `limit` of a SINGLE realtime query rather than stitching together
+ * per-page startAfter() cursors: one onSnapshot keeps the WHOLE loaded window
+ * live, so a brand-new capture still streams to the TOP and edits/deletes
+ * inside the window stay realtime — with none of the manual merge/dedup or
+ * page-boundary drift that multiple independent page listeners would incur.
+ * Firestore serves the unchanged overlap from its local cache on each grow, so
+ * only the newly-revealed older docs cost reads.
+ *
+ * `onChange` is called with the current window and `hasMore` — true when the
+ * window came back full (older shots probably exist beyond it). Once a grow
+ * returns fewer docs than requested we've hit the end and `loadMore()` no-ops.
  */
 export function subscribeScreenshots(
   uid: string,
-  onChange: (items: ScreenshotDoc[]) => void,
+  onChange: (items: ScreenshotDoc[], hasMore: boolean) => void,
   onError?: (err: Error) => void,
-): () => void {
-  const q = query(
-    screenshotsCol(uid),
-    orderBy("createdAt", "desc"),
-    limit(SCREENSHOTS_LIMIT),
-  );
-  return onSnapshot(
-    q,
-    (snap) => onChange(snap.docs.map((d) => mapDoc(d.id, d.data()))),
-    (err) => onError?.(err),
-  );
+): ScreenshotsSubscription {
+  let windowSize = SCREENSHOTS_PAGE_SIZE;
+  let lastSize = 0;
+  let growing = false;
+  let unsub: (() => void) | null = null;
+
+  const subscribe = () => {
+    unsub?.();
+    const q = query(
+      screenshotsCol(uid),
+      orderBy("createdAt", "desc"),
+      limit(windowSize),
+    );
+    unsub = onSnapshot(
+      q,
+      (snap) => {
+        lastSize = snap.size;
+        growing = false;
+        // A full window implies more (older) docs may exist beyond it.
+        const hasMore = snap.size >= windowSize;
+        onChange(snap.docs.map((d) => mapDoc(d.id, d.data())), hasMore);
+      },
+      (err) => {
+        growing = false;
+        onError?.(err);
+      },
+    );
+  };
+
+  subscribe();
+
+  return {
+    unsubscribe: () => {
+      unsub?.();
+      unsub = null;
+    },
+    loadMore: () => {
+      // Nothing left to fetch if the last window wasn't even full (we already
+      // have everything), or a grow is already pending.
+      if (growing || lastSize < windowSize) return;
+      growing = true;
+      windowSize += SCREENSHOTS_PAGE_SIZE;
+      subscribe();
+    },
+  };
 }
 
 function blobToImage(blob: Blob): Promise<HTMLImageElement> {

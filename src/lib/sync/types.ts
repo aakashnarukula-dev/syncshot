@@ -54,8 +54,16 @@ export interface ClipboardDoc {
 /** Max clipboard text size synced (spec: 100 KB cap to stay well under 1 MB). */
 export const CLIPBOARD_MAX_BYTES = 100 * 1024;
 
-/** Listener page sizes (spec). */
-export const SCREENSHOTS_LIMIT = 100;
+/**
+ * Screenshot listener paging. The Library grid lazy-loads: it subscribes to a
+ * small FIRST window (enough to fill the viewport + a little overscan — the Mac
+ * grid shows ~5–12 tiles) and GROWS the live window by one page each time the
+ * user scrolls near the bottom (see subscribeScreenshots / its loadMore). This
+ * replaces the old fixed limit(100) that fetched + rendered every shot up front
+ * and made the user wait.
+ */
+export const SCREENSHOTS_PAGE_SIZE = 16;
+/** Clipboard listener page size (spec). */
 export const CLIPBOARD_LIMIT = 200;
 
 /** Thumbnail encode params (spec: 320px max edge, WebP q≈0.70). */

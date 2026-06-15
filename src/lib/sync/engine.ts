@@ -13,7 +13,7 @@
  */
 
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { useSyncStore } from "@/stores/syncStore";
+import { registerScreenshotLoadMore, useSyncStore } from "@/stores/syncStore";
 import { logout, watchAuth } from "./firebase";
 import { loadSyncPrefs, saveDeviceId, saveDeviceName, savePaused } from "./persistence";
 import { publishScreenshot, saveReceivedScreenshot, subscribeScreenshots } from "./screenshots";
@@ -40,8 +40,8 @@ function store() {
   return useSyncStore.getState();
 }
 
-function handleScreenshots(items: ScreenshotDoc[]): void {
-  store().setScreenshots(items);
+function handleScreenshots(items: ScreenshotDoc[], hasMore: boolean): void {
+  store().setScreenshots(items, hasMore);
   for (const item of items) {
     if (
       item.status === "full" &&
@@ -66,15 +66,20 @@ function handleClipboard(items: ClipboardDoc[]): void {
 function stopListeners(): void {
   unsubScreenshots?.();
   unsubScreenshots = null;
+  registerScreenshotLoadMore(null);
   unsubClipboard?.();
   unsubClipboard = null;
 }
 
 function startListeners(uid: string): void {
   stopListeners();
-  unsubScreenshots = subscribeScreenshots(uid, handleScreenshots, (err) =>
+  const screenshots = subscribeScreenshots(uid, handleScreenshots, (err) =>
     console.error("screenshots listener error:", err),
   );
+  unsubScreenshots = screenshots.unsubscribe;
+  // Expose the page-grower to the Library grid (via the store) so scrolling near
+  // the bottom pulls in older shots instead of fetching all 100+ up front.
+  registerScreenshotLoadMore(screenshots.loadMore);
   unsubClipboard = subscribeClipboard(uid, handleClipboard, (err) =>
     console.error("clipboard listener error:", err),
   );

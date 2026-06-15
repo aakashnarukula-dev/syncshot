@@ -322,6 +322,13 @@ function ThumbnailItem({ path, eager = false, onEdit, onRemove }: ThumbnailItemP
   const [inView, setInView] = useState(eager);
   const rootRef = useRef<HTMLDivElement>(null);
   const exitingRef = useRef(false);
+  // True once the deterministic cascade has COMMITTED a probed-good source.
+  // Distinguishes a real on-DOM failure of a vetted src (terminal) from the
+  // optimistic eager src (the raw local file shown pre-probe) 404-ing because a
+  // synced shot's local copy hasn't downloaded yet — the latter must stay on
+  // the shimmer while the cascade resolves the remote URL, NOT flash
+  // "Unavailable". Reset at the top of each cascade run.
+  const committedByCascadeRef = useRef(false);
 
   // Resolve a Firebase Storage token URL for this tile when its local cache
   // file is missing or won't decode — a synced (remote) shot whose Rust
@@ -388,6 +395,9 @@ function ThumbnailItem({ path, eager = false, onEdit, onRemove }: ThumbnailItemP
   // paths are content-keyed (path+mtime+size), so they cache across cycles
   // and change when the file does.
   useEffect(() => {
+    // A fresh cascade run owns the terminal failure decision; clear the flag so
+    // the optimistic eager src isn't mistaken for a committed one.
+    committedByCascadeRef.current = false;
     if (!inView) {
       setSrc("");
       setReady(false);
@@ -398,6 +408,7 @@ function ThumbnailItem({ path, eager = false, onEdit, onRemove }: ThumbnailItemP
 
     const commit = (url: string) => {
       if (cancelled) return;
+      committedByCascadeRef.current = true;
       setSrc(url);
       setReady(true);
       setFailed(false);
@@ -412,20 +423,21 @@ function ThumbnailItem({ path, eager = false, onEdit, onRemove }: ThumbnailItemP
     (async () => {
       const local = convertFileSrc(path);
 
-      // 1. Cheap cached thumbnail (native downscale). Throws if no local file.
-      try {
-        const thumbPath = await invoke<string>("get_screenshot_thumbnail", {
-          path,
-          maxPx: THUMB_MAX_PX,
-        });
-        if (cancelled) return;
+      // 1. Cheap cached thumbnail (native downscale). TIME-BOUNDED: a hung Rust
+      //    call (or a missing local file → reject) returns null instead of
+      //    stranding the tile on the shimmer forever — we fall through to the
+      //    local file, then the remote URL, and ultimately the terminal state.
+      const thumbPath = await withTimeout(
+        invoke<string>("get_screenshot_thumbnail", { path, maxPx: THUMB_MAX_PX }),
+        REMOTE_TIMEOUT_MS,
+      );
+      if (cancelled) return;
+      if (thumbPath) {
         const thumbUrl = convertFileSrc(thumbPath);
         if (await probeImage(thumbUrl)) {
           commit(thumbUrl);
           return;
         }
-      } catch {
-        /* no local cache file (or it won't decode) — fall through */
       }
       if (cancelled) return;
 
@@ -628,13 +640,17 @@ function ThumbnailItem({ path, eager = false, onEdit, onRemove }: ThumbnailItemP
             beginDrag(e.currentTarget);
           }}
           onError={() => {
-            // The committed source was probed-good but failed on-DOM (e.g. cache
-            // eviction). Drop straight to the terminal state — never loop back to
-            // another src or the shimmer. The cascade effect owns fallback order;
-            // re-running it here would risk the local↔remote ping-pong this fix
-            // removes.
+            // Two very different on-DOM failures:
+            //  • A cascade-COMMITTED src (already probed-good off-DOM) failing —
+            //    e.g. cache eviction between probe and paint. Terminal: looping
+            //    back through the cascade would risk a local↔remote ping-pong.
+            //  • The OPTIMISTIC eager src (the raw local file shown pre-probe so
+            //    a fresh own-capture appears instantly) 404-ing because a SYNCED
+            //    shot's local copy hasn't downloaded yet. The cascade is still in
+            //    flight resolving the thumbnail/local/remote source, so stay on
+            //    the SHIMMER and let it finish — do NOT flash "Unavailable".
             setReady(false);
-            setFailed(true);
+            if (committedByCascadeRef.current) setFailed(true);
           }}
           onClick={() => {
             exitingRef.current = true;

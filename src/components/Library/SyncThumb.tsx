@@ -23,12 +23,36 @@ export function SyncThumb({ item }: SyncThumbProps) {
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  const [inView, setInView] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+
+  // Render windowing: resolve this tile's Storage token URL (a network
+  // getDownloadURL) and decode its thumbnail only once it scrolls near the
+  // viewport. Paired with the grid's lazy paging, this stops a large library
+  // from firing 100+ getDownloadURL requests up front — off-screen tiles stay
+  // idle on the shimmer. Once loaded a tile stays loaded (the window is paged,
+  // so the count is bounded — no need to unload + refetch on scroll-back).
+  useEffect(() => {
+    const el = rootRef.current;
+    if (!el || inView) return;
+    const io = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((e) => e.isIntersecting)) setInView(true);
+      },
+      { rootMargin: "400px 0px" },
+    );
+    io.observe(el);
+    return () => io.disconnect();
+  }, [inView]);
 
   // Render via the Storage getDownloadURL token URL as a plain <img src>. The
   // token is a capability (bypasses Storage rules + CORS), so an <img> load
   // succeeds with no bucket-CORS config — unlike getBytes()/getBlob(), whose
   // XHR the bucket blocks, which left this tile stuck on "Preview unavailable".
+  // Gated on inView so an off-screen tile shows the shimmer (no fetch) until it
+  // nears the viewport.
   useEffect(() => {
+    if (!inView) return;
     let cancelled = false;
     setFailed(false);
     setSrc(null);
@@ -47,7 +71,7 @@ export function SyncThumb({ item }: SyncThumbProps) {
     return () => {
       cancelled = true;
     };
-  }, [item.thumbPath]);
+  }, [item.thumbPath, inView]);
 
   const savedTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => () => {
@@ -96,6 +120,7 @@ export function SyncThumb({ item }: SyncThumbProps) {
 
   return (
     <div
+      ref={rootRef}
       className={cn(
         "group relative block aspect-[4/3] w-full overflow-hidden rounded-lg border border-border bg-muted",
         "transition-all focus-within:border-ring hover:border-ring",
