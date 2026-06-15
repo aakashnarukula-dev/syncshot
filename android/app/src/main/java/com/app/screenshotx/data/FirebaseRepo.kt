@@ -15,6 +15,7 @@ import com.google.firebase.firestore.MetadataChanges
 import com.google.firebase.firestore.Query
 import com.google.firebase.firestore.SetOptions
 import com.google.firebase.firestore.firestore
+import com.google.firebase.storage.StorageMetadata
 import com.google.firebase.storage.StorageReference
 import com.google.firebase.storage.storage
 import kotlinx.coroutines.channels.awaitClose
@@ -36,6 +37,9 @@ object FirebaseRepo {
     private val storage get() = Firebase.storage
 
     val uid: String? get() = auth.currentUser?.uid
+
+    /** Phone number of the signed-in account (E.164), for the Profile screen. */
+    val phoneNumber: String? get() = auth.currentUser?.phoneNumber
 
     /** Signed in with a real (non-anonymous) account. */
     val signedIn: Boolean get() = auth.currentUser?.isAnonymous == false
@@ -129,21 +133,56 @@ object FirebaseRepo {
 
     // --- ScreenshotX ----------------------------------------------------------
 
+    /** Cache a screenshot's full bytes on disk under received/<sha>.png — the same
+     *  path Receiver uses — so the capturing device's own new shot renders from the
+     *  local file immediately instead of waiting on a Storage round-trip (the
+     *  grey-tile fix), and the viewer opens it without re-downloading. */
+    private fun cacheFullLocally(ctx: Context, sha: String, full: ByteArray) {
+        runCatching {
+            val f = java.io.File(java.io.File(ctx.filesDir, "received").apply { mkdirs() }, "$sha.png")
+            if (!f.exists() || f.length() == 0L) f.writeBytes(full)
+        }
+    }
+
+    /** Real image type sniffed from the bytes' magic numbers — phone screenshots are
+     *  often JPEG (e.g. Samsung), not PNG, so we must not blindly label them .png /
+     *  image/png. Falls back to PNG only when nothing matches. */
+    private data class ImageType(val ext: String, val mime: String)
+
+    private fun detectImageType(b: ByteArray): ImageType {
+        fun u(i: Int) = if (i < b.size) b[i].toInt() and 0xFF else -1
+        return when {
+            u(0) == 0xFF && u(1) == 0xD8 && u(2) == 0xFF -> ImageType("jpg", "image/jpeg")
+            u(0) == 0x89 && u(1) == 0x50 && u(2) == 0x4E && u(3) == 0x47 -> ImageType("png", "image/png")
+            u(0) == 0x47 && u(1) == 0x49 && u(2) == 0x46 -> ImageType("gif", "image/gif")
+            u(0) == 0x52 && u(1) == 0x49 && u(2) == 0x46 && u(3) == 0x46 &&
+                u(8) == 0x57 && u(9) == 0x45 && u(10) == 0x42 && u(11) == 0x50 ->
+                ImageType("webp", "image/webp")
+            // ISO-BMFF "ftyp" box at offset 4 → HEIC/HEIF.
+            u(4) == 0x66 && u(5) == 0x74 && u(6) == 0x79 && u(7) == 0x70 -> ImageType("heic", "image/heic")
+            else -> ImageType("png", "image/png")
+        }
+    }
+
     /** Publish a screenshot: dedupe by sha256, thumbnail-first, then full. */
     suspend fun publishScreenshot(ctx: Context, full: ByteArray) {
         val uid = requireUid()
         val sha = Hashing.sha256(full)
+        cacheFullLocally(ctx, sha, full)
 
         val existing = col("screenshots").whereEqualTo("sha256", sha).limit(1).get().await()
         if (!existing.isEmpty) return
 
         val thumb = Thumbs.make(full) ?: return
+        val type = detectImageType(full)
         val docRef = col("screenshots").document()
         val id = docRef.id
         val thumbPath = "users/$uid/screenshots/$id/thumb.webp"
-        val fullPath = "users/$uid/screenshots/$id/full.png"
+        val fullPath = "users/$uid/screenshots/$id/full.${type.ext}"
 
-        storage.getReference(thumbPath).putBytes(thumb.bytes).await()
+        storage.getReference(thumbPath)
+            .putBytes(thumb.bytes, StorageMetadata.Builder().setContentType("image/webp").build())
+            .await()
         docRef.set(
             mapOf(
                 "sha256" to sha,
@@ -151,13 +190,15 @@ object FirebaseRepo {
                 "device" to deviceMap(ctx),
                 "width" to thumb.width,
                 "height" to thumb.height,
-                "mime" to "image/png",
+                "mime" to type.mime,
                 "thumbPath" to thumbPath,
                 "status" to "thumb",
             )
         ).await()
 
-        storage.getReference(fullPath).putBytes(full).await()
+        storage.getReference(fullPath)
+            .putBytes(full, StorageMetadata.Builder().setContentType(type.mime).build())
+            .await()
         docRef.update(
             mapOf(
                 "status" to "full",
@@ -187,14 +228,50 @@ object FirebaseRepo {
         col("screenshots").document(id).delete().await()
     }
 
-    /** Realtime screenshot snapshots (most recent 100). Includes optimistic local writes. */
-    fun screenshotSnapshots(): Flow<List<ScreenshotDoc>> = callbackFlow {
+    /** Realtime screenshot snapshots, newest first, capped at [limit]. The cap is
+     *  paged: the grid grows it (SyncService re-subscribes) as the user scrolls,
+     *  instead of pulling the whole history up front. Always includes the newest
+     *  `limit` docs, so fresh captures still stream in at the top. Includes
+     *  optimistic local writes (pending serverTimestamps estimate to ~now → top). */
+    fun screenshotSnapshots(limit: Long): Flow<List<ScreenshotDoc>> = callbackFlow {
         val reg = col("screenshots")
             .orderBy("createdAt", Query.Direction.DESCENDING)
-            .limit(100)
+            .limit(limit)
             .addSnapshotListener(MetadataChanges.INCLUDE) { snap, _ ->
                 if (snap != null) trySend(snap.documents.mapNotNull { ScreenshotDoc.from(it) })
             }
+        awaitClose { reg.remove() }
+    }
+
+    // --- Devices (Profile / per-device revocation) ----------------------------
+
+    /** All registered devices for this account, newest-seen first, revoked ones
+     *  filtered out. Backs the Profile "other devices" list. */
+    fun deviceSnapshots(): Flow<List<DeviceDoc>> = callbackFlow {
+        val reg = col("devices").addSnapshotListener { snap, _ ->
+            if (snap != null) trySend(
+                snap.documents.mapNotNull { DeviceDoc.from(it) }
+                    .filter { !it.revoked }
+                    .sortedByDescending { it.lastSeenAt }
+            )
+        }
+        awaitClose { reg.remove() }
+    }
+
+    /** Remotely log a device out: mark its doc revoked and drop its FCM token, so it
+     *  stops receiving wake-pings and signs itself out when it next sees the doc
+     *  (SyncService watches its own device doc via [deviceRevokedFlow]). */
+    suspend fun revokeDevice(deviceId: String) {
+        col("devices").document(deviceId)
+            .set(mapOf("revoked" to true, "fcmToken" to FieldValue.delete()), SetOptions.merge())
+            .await()
+    }
+
+    /** Emits true once this device's own doc is marked revoked elsewhere. */
+    fun deviceRevokedFlow(deviceId: String): Flow<Boolean> = callbackFlow {
+        val reg = col("devices").document(deviceId).addSnapshotListener { snap, _ ->
+            trySend(snap?.getBoolean("revoked") == true)
+        }
         awaitClose { reg.remove() }
     }
 

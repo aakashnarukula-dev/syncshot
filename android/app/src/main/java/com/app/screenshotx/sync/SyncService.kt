@@ -13,6 +13,7 @@ import android.os.Looper
 import android.provider.MediaStore
 import com.app.screenshotx.data.FirebaseRepo
 import com.app.screenshotx.data.Prefs
+import com.app.screenshotx.data.ScreenshotPaging
 import com.app.screenshotx.data.db.AppDb
 import com.app.screenshotx.data.db.ScreenshotEntity
 import kotlinx.coroutines.CoroutineScope
@@ -51,24 +52,47 @@ class SyncService : Service() {
         scope.launch {
             if (!FirebaseRepo.signedIn) { stopSelf(); return@launch }
             Fcm.registerToken(this@SyncService)
+            watchOwnRevocation()
             val dao = AppDb.get(this@SyncService).screenshots()
             // All devices share one auth uid — our own docs are identified by
             // the per-install deviceId, not the uid.
             val myDeviceId = Prefs(this@SyncService).deviceId
-            FirebaseRepo.screenshotSnapshots().collectLatest { docs ->
-                dao.upsertAll(docs.map { ScreenshotEntity.of(it) })
-                // Propagate deletes from other devices: any local row inside the
-                // snapshot's time window that the snapshot no longer carries was
-                // deleted elsewhere. Bounded to the window so paged history past
-                // the 100-doc listener is never wiped; skipped on an empty
-                // snapshot to avoid clearing on a transient.
-                if (docs.isNotEmpty()) {
-                    dao.pruneWithinWindow(docs.map { it.id }, docs.minOf { it.createdAt })
-                }
-                docs.forEach { doc ->
-                    if (doc.deviceId != myDeviceId && doc.status == "full") {
-                        scope.launch { Receiver.receive(this@SyncService, doc) }
+            // The grid grows ScreenshotPaging.limit as the user scrolls; each new
+            // value re-subscribes the listener at the larger page size (collectLatest
+            // cancels the prior listener). The newest `limit` docs are always
+            // included, so live captures still arrive at the top.
+            ScreenshotPaging.limit.collectLatest { limit ->
+                FirebaseRepo.screenshotSnapshots(limit).collectLatest { docs ->
+                    dao.upsertAll(docs.map { ScreenshotEntity.of(it) })
+                    // Propagate deletes from other devices: any local row inside the
+                    // snapshot's time window that the snapshot no longer carries was
+                    // deleted elsewhere. Bounded to the window so paged history past
+                    // the current page is never wiped; skipped on an empty snapshot
+                    // to avoid clearing on a transient.
+                    if (docs.isNotEmpty()) {
+                        dao.pruneWithinWindow(docs.map { it.id }, docs.minOf { it.createdAt })
                     }
+                    docs.forEach { doc ->
+                        if (doc.deviceId != myDeviceId && doc.status == "full") {
+                            scope.launch { Receiver.receive(this@SyncService, doc) }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /** Remote per-device logout: if another device marks this device's doc revoked,
+     *  sign out locally and stop syncing. MainActivity's auth listener then routes
+     *  back to sign-in. */
+    private fun watchOwnRevocation() {
+        scope.launch {
+            val myDeviceId = Prefs(this@SyncService).deviceId
+            FirebaseRepo.deviceRevokedFlow(myDeviceId).collectLatest { revoked ->
+                if (revoked) {
+                    runCatching { AppDb.get(this@SyncService).clearAllTables() }
+                    runCatching { FirebaseRepo.signOutLocal(this@SyncService) }
+                    stopSelf()
                 }
             }
         }

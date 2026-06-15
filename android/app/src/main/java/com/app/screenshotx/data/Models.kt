@@ -49,6 +49,32 @@ data class ScreenshotDoc(
     }
 }
 
+/** A registered device under users/{uid}/devices/{deviceId}. Written by each
+ *  device's heartbeat (FirebaseRepo.updateDevice). `revoked` is set remotely by
+ *  another device's "log out this device" action; the target device watches its
+ *  own doc and signs itself out when it flips true. */
+data class DeviceDoc(
+    val id: String,
+    val name: String,
+    val platform: String,
+    val lastSeenAt: Long,
+    val revoked: Boolean,
+) {
+    companion object {
+        fun from(doc: DocumentSnapshot): DeviceDoc? {
+            if (!doc.exists()) return null
+            val created = doc.getDate("lastSeenAt", DocumentSnapshot.ServerTimestampBehavior.ESTIMATE)
+            return DeviceDoc(
+                id = doc.id,
+                name = doc.getString("name") ?: "Device",
+                platform = doc.getString("platform") ?: "",
+                lastSeenAt = created?.time ?: 0L,
+                revoked = doc.getBoolean("revoked") ?: false,
+            )
+        }
+    }
+}
+
 /** A clipboard document under users/{uid}/clipboard/{id}. */
 data class ClipItem(
     val id: String,

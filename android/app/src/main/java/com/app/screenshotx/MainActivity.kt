@@ -10,6 +10,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -18,6 +19,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import com.app.screenshotx.data.FirebaseRepo
+import com.google.firebase.Firebase
+import com.google.firebase.auth.auth
 import com.app.screenshotx.sync.SyncService
 import com.app.screenshotx.ui.LoginScreen
 import com.app.screenshotx.ui.RootScreen
@@ -33,6 +36,17 @@ class MainActivity : ComponentActivity() {
                     // Auth state is read synchronously from the persisted session;
                     // pre-OTP anonymous sessions are discarded.
                     var signedIn by remember { mutableStateOf(FirebaseRepo.purgeAnonymousAndCheck()) }
+
+                    // React to sign-out from anywhere — the Profile "sign out" and
+                    // remote per-device revocation (SyncService) both clear auth, and
+                    // this routes the UI back to sign-in.
+                    DisposableEffect(Unit) {
+                        val listener = com.google.firebase.auth.FirebaseAuth.AuthStateListener { fa ->
+                            signedIn = fa.currentUser?.isAnonymous == false
+                        }
+                        Firebase.auth.addAuthStateListener(listener)
+                        onDispose { Firebase.auth.removeAuthStateListener(listener) }
+                    }
 
                     LaunchedEffect(signedIn) { if (signedIn) SyncService.start(ctx) }
 

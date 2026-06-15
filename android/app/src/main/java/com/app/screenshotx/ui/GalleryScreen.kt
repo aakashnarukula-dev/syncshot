@@ -1,5 +1,7 @@
 package com.app.screenshotx.ui
 
+import android.app.Activity
+import android.content.ContextWrapper
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -11,7 +13,6 @@ import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.togetherWith
-import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.awaitEachGesture
@@ -32,26 +33,32 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.GridItemSpan
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.automirrored.filled.Logout
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -61,6 +68,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.scale
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
@@ -68,37 +76,72 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChanged
 import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.draw.scale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.unit.dp
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.snapshotFlow
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import androidx.paging.Pager
 import androidx.paging.PagingConfig
 import androidx.paging.compose.collectAsLazyPagingItems
 import androidx.paging.compose.itemKey
 import coil.compose.AsyncImage
+import coil.compose.AsyncImagePainter
 import coil.request.ImageRequest
+import android.content.Context
 import android.content.Intent
 import com.app.screenshotx.data.FirebaseRepo
+import com.app.screenshotx.data.ScreenshotPaging
 import com.app.screenshotx.data.db.AppDb
 import com.app.screenshotx.data.db.ScreenshotEntity
 import com.app.screenshotx.sync.SyncService
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.File
 import kotlin.math.abs
 
-private fun storageModel(ctx: android.content.Context, path: String?, cacheKey: String): ImageRequest? {
-    if (path.isNullOrBlank()) return null
-    return ImageRequest.Builder(ctx)
-        .data(FirebaseRepo.storageRef(path))
-        .memoryCacheKey(cacheKey)
-        .diskCacheKey(cacheKey)
-        .crossfade(true)
-        .build()
+/** A real on-disk copy of this shot, if one exists — the received/<sha>.png that
+ *  the capturing device cached or another device's full download, or the viewer's
+ *  shared cache. Lets a brand-new shot render instantly instead of waiting on a
+ *  Storage round-trip (which leaves the tile a grey placeholder). */
+private fun localFile(ctx: Context, sha: String): File? {
+    val recv = File(File(ctx.filesDir, "received"), "$sha.png")
+    if (recv.exists() && recv.length() > 0L) return recv
+    val shared = File(File(ctx.cacheDir, "shared"), "$sha.png")
+    if (shared.exists() && shared.length() > 0L) return shared
+    return null
 }
 
+/** Best available source for a tile/viewer: local file first, then the Storage
+ *  thumb, then the full. Returns null only while the upload still lags (no thumb,
+ *  no full, no local) — the tile shows a spinner and re-binds when the doc flips
+ *  to status "thumb"/"full" (Room upsert → Paging invalidation → recompose). */
+private fun imageModel(ctx: Context, item: ScreenshotEntity, preferFull: Boolean): ImageRequest? {
+    val b = ImageRequest.Builder(ctx).crossfade(true)
+    localFile(ctx, item.sha256)?.let {
+        return b.data(it).memoryCacheKey("${item.sha256}:l").diskCacheKey("${item.sha256}:l").build()
+    }
+    val first = if (preferFull) item.fullPath else item.thumbPath
+    val second = if (preferFull) item.thumbPath else item.fullPath
+    val suffix = if (preferFull) ":f" else ":t"
+    if (!first.isNullOrBlank())
+        return b.data(FirebaseRepo.storageRef(first)).memoryCacheKey("${item.sha256}$suffix")
+            .diskCacheKey("${item.sha256}$suffix").build()
+    if (!second.isNullOrBlank())
+        return b.data(FirebaseRepo.storageRef(second)).memoryCacheKey("${item.sha256}:any")
+            .diskCacheKey("${item.sha256}:any").build()
+    return null
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun GalleryScreen(onSignedOut: () -> Unit) {
+fun GalleryScreen(onViewerOpenChange: (Boolean) -> Unit) {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
     val pager = remember {
@@ -108,7 +151,23 @@ fun GalleryScreen(onSignedOut: () -> Unit) {
     }
     val shots = pager.flow.collectAsLazyPagingItems()
     var selected by remember { mutableStateOf<ScreenshotEntity?>(null) }
-    var showSignOut by remember { mutableStateOf(false) }
+    val gridState = rememberLazyGridState()
+    var refreshing by remember { mutableStateOf(false) }
+
+    // Keep the host (RootScreen) in sync so it can hide the bottom nav while the
+    // image viewer is open.
+    LaunchedEffect(selected) { onViewerOpenChange(selected != null) }
+
+    // Lazy-load: each time the user scrolls into the last rows, pull the next
+    // Firestore page (SyncService grows the listener; Room/Paging picks it up).
+    LaunchedEffect(gridState) {
+        snapshotFlow {
+            val info = gridState.layoutInfo
+            val total = info.totalItemsCount
+            val last = info.visibleItemsInfo.lastOrNull()?.index ?: 0
+            total > 0 && last >= total - 8
+        }.distinctUntilChanged().collect { nearEnd -> if (nearEnd) ScreenshotPaging.loadMore() }
+    }
 
     val pickMedia = rememberLauncherForActivityResult(
         ActivityResultContracts.PickMultipleVisualMedia()
@@ -133,80 +192,59 @@ fun GalleryScreen(onSignedOut: () -> Unit) {
         }
     }
 
-    if (showSignOut) AlertDialog(
-        onDismissRequest = { showSignOut = false },
-        title = { Text("Sign out?") },
-        text = { Text("Stops syncing on this device. Sign back in anytime with the same email.") },
-        confirmButton = {
-            TextButton(onClick = {
-                showSignOut = false
-                scope.launch {
-                    withContext(Dispatchers.IO) {
-                        runCatching { FirebaseRepo.signOutLocal(ctx) }
-                        runCatching { AppDb.get(ctx).clearAllTables() }
-                    }
-                    runCatching { ctx.stopService(Intent(ctx, SyncService::class.java)) }
-                    onSignedOut()
-                }
-            }) { Text("Sign out", color = MaterialTheme.colorScheme.error) }
-        },
-        dismissButton = { TextButton(onClick = { showSignOut = false }) { Text("Cancel") } },
-    )
-
     AnimatedContent(
         targetState = selected,
         transitionSpec = { fadeIn(tween(220)) togetherWith fadeOut(tween(220)) },
         label = "viewer",
     ) { sel ->
         if (sel == null) {
-            Box(Modifier.fillMaxSize().statusBarsPadding()) {
+            Column(Modifier.fillMaxSize().statusBarsPadding()) {
                 Row(
                     Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Text("ScreenshotX", style = MaterialTheme.typography.titleLarge)
-                    Row {
-                        IconButton(onClick = { showSignOut = true }) {
-                            Icon(Icons.AutoMirrored.Filled.Logout, "Sign out")
-                        }
-                        IconButton(onClick = {
-                            pickMedia.launch(
-                                PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
-                            )
-                        }) { Icon(Icons.Filled.Add, "Add image") }
-                    }
+                    IconButton(onClick = {
+                        pickMedia.launch(
+                            PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                        )
+                    }) { Icon(Icons.Filled.Add, "Add image") }
                 }
 
-                if (shots.itemCount == 0) {
-                    Text(
-                        "No screenshots yet.\nTake one on any paired device.",
-                        Modifier.align(Alignment.Center).padding(24.dp),
-                        textAlign = androidx.compose.ui.text.style.TextAlign.Center,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                } else {
+                PullToRefreshBox(
+                    isRefreshing = refreshing,
+                    onRefresh = {
+                        refreshing = true
+                        ScreenshotPaging.reset()
+                        shots.refresh()
+                        scope.launch { delay(700); refreshing = false }
+                    },
+                    modifier = Modifier.fillMaxSize(),
+                ) {
                     LazyVerticalGrid(
+                        state = gridState,
                         columns = GridCells.Adaptive(110.dp),
-                        contentPadding = PaddingValues(start = 10.dp, end = 10.dp, top = 56.dp, bottom = 10.dp),
+                        modifier = Modifier.fillMaxSize(),
+                        contentPadding = PaddingValues(10.dp),
                     ) {
-                        items(count = shots.itemCount, key = shots.itemKey { it.id }) { index ->
-                            val item = shots[index] ?: return@items
-                            val model = storageModel(ctx, item.thumbPath, "${item.sha256}:t")
-                            Box(
-                                Modifier
-                                    .padding(4.dp)
-                                    .aspectRatio(1f)
-                                    .clip(RoundedCornerShape(12.dp))
-                                    .background(MaterialTheme.colorScheme.surfaceVariant)
-                                    .clickable { selected = item },
-                            ) {
-                                AsyncImage(
-                                    model = model,
-                                    contentDescription = item.sha256,
-                                    contentScale = ContentScale.Crop,
-                                    modifier = Modifier.fillMaxSize(),
-                                )
+                        if (shots.itemCount == 0) {
+                            item(span = { GridItemSpan(maxLineSpan) }) {
+                                Box(
+                                    Modifier.fillMaxWidth().padding(top = 80.dp),
+                                    contentAlignment = Alignment.Center,
+                                ) {
+                                    Text(
+                                        "No screenshots yet.\nTake one on any paired device.",
+                                        textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                }
+                            }
+                        } else {
+                            items(count = shots.itemCount, key = shots.itemKey { it.id }) { index ->
+                                val item = shots[index] ?: return@items
+                                GalleryTile(ctx = ctx, item = item, onClick = { selected = item })
                             }
                         }
                     }
@@ -222,6 +260,39 @@ fun GalleryScreen(onSignedOut: () -> Unit) {
     }
 }
 
+/** One grid tile. Shows a brief loading spinner over the surface until the image
+ *  resolves, so a just-captured shot never sits as a dead grey placeholder. */
+@Composable
+private fun GalleryTile(ctx: Context, item: ScreenshotEntity, onClick: () -> Unit) {
+    val model = remember(item.id, item.thumbPath, item.fullPath) {
+        imageModel(ctx, item, preferFull = false)
+    }
+    var loaded by remember(item.id, item.thumbPath, item.fullPath) { mutableStateOf(false) }
+    Box(
+        Modifier
+            .padding(4.dp)
+            .aspectRatio(1f)
+            .clip(RoundedCornerShape(12.dp))
+            .background(MaterialTheme.colorScheme.surfaceVariant)
+            .clickable(onClick = onClick),
+    ) {
+        AsyncImage(
+            model = model,
+            contentDescription = item.sha256,
+            contentScale = ContentScale.Crop,
+            modifier = Modifier.fillMaxSize(),
+            onState = { state -> loaded = state is AsyncImagePainter.State.Success },
+        )
+        if (!loaded) {
+            CircularProgressIndicator(
+                modifier = Modifier.align(Alignment.Center).size(22.dp),
+                strokeWidth = 2.dp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
 @Composable
 private fun FullScreenViewer(
     items: List<ScreenshotEntity>,
@@ -229,6 +300,7 @@ private fun FullScreenViewer(
     onClose: () -> Unit,
 ) {
     val ctx = LocalContext.current
+    val view = LocalView.current
     val scope = rememberCoroutineScope()
     if (items.isEmpty()) { onClose(); return }
     val pagerState = rememberPagerState(initialPage = startIndex.coerceIn(0, items.size - 1)) { items.size }
@@ -239,6 +311,17 @@ private fun FullScreenViewer(
     var confirmDelete by remember { mutableStateOf(false) }
 
     BackHandler { onClose() }
+
+    // Immersive: hide the system status/navigation bars while viewing; restore on close.
+    DisposableEffect(Unit) {
+        val window = (ctx.findActivity())?.window
+        val controller = window?.let { WindowCompat.getInsetsController(it, view) }
+        controller?.let {
+            it.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            it.hide(WindowInsetsCompat.Type.systemBars())
+        }
+        onDispose { controller?.show(WindowInsetsCompat.Type.systemBars()) }
+    }
 
     if (confirmDelete) AlertDialog(
         onDismissRequest = { confirmDelete = false },
@@ -274,7 +357,9 @@ private fun FullScreenViewer(
             var scale by remember(item.id) { mutableFloatStateOf(1f) }
             var pan by remember(item.id) { mutableStateOf(Offset.Zero) }
             val isCurrent = page == pagerState.currentPage
-            val model = storageModel(ctx, item.fullPath ?: item.thumbPath, "${item.sha256}:f")
+            val model = remember(item.id, item.thumbPath, item.fullPath) {
+                imageModel(ctx, item, preferFull = true)
+            }
             AsyncImage(
                 model = model,
                 contentDescription = item.sha256,
@@ -364,6 +449,15 @@ private fun FullScreenViewer(
             }
         }
     }
+}
+
+private fun Context.findActivity(): Activity? {
+    var c: Context? = this
+    while (c is ContextWrapper) {
+        if (c is Activity) return c
+        c = c.baseContext
+    }
+    return null
 }
 
 @Composable

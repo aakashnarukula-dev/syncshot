@@ -24,19 +24,23 @@ import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.PushPin
 import androidx.compose.material.icons.outlined.PushPin
 import androidx.compose.material3.Card
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import kotlinx.coroutines.delay
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
@@ -50,6 +54,7 @@ import com.app.screenshotx.data.FirebaseRepo
 import com.app.screenshotx.sync.ClipboardCaptureService
 import kotlinx.coroutines.launch
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ClipboardScreen() {
     val ctx = LocalContext.current
@@ -67,7 +72,9 @@ fun ClipboardScreen() {
         onDispose { lifecycleOwner.lifecycle.removeObserver(obs) }
     }
 
-    val clips by produceState(initialValue = emptyList<ClipItem>(), Unit) {
+    var refreshKey by remember { mutableIntStateOf(0) }
+    var refreshing by remember { mutableStateOf(false) }
+    val clips by produceState(initialValue = emptyList<ClipItem>(), refreshKey) {
         if (!FirebaseRepo.signedIn) return@produceState
         FirebaseRepo.clipboardSnapshots().collect { value = it }
     }
@@ -96,26 +103,41 @@ fun ClipboardScreen() {
             }
         }
 
-        if (sorted.isEmpty()) {
-            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                Text(
-                    "Copied text from your devices shows up here.",
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
-        } else {
+        PullToRefreshBox(
+            isRefreshing = refreshing,
+            onRefresh = {
+                refreshing = true
+                refreshKey++
+                scope.launch { delay(700); refreshing = false }
+            },
+            modifier = Modifier.fillMaxSize(),
+        ) {
             LazyColumn(
                 Modifier.fillMaxSize(),
                 contentPadding = androidx.compose.foundation.layout.PaddingValues(12.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                items(sorted, key = { it.id }) { item ->
-                    ClipRow(
-                        item = item,
-                        onCopy = { recopy(item) },
-                        onPin = { scope.launch { runCatching { FirebaseRepo.setClipPinned(item.id, !item.pinned) } } },
-                        onDelete = { scope.launch { runCatching { FirebaseRepo.deleteClip(item.id) } } },
-                    )
+                if (sorted.isEmpty()) {
+                    item {
+                        Box(
+                            Modifier.fillMaxWidth().padding(top = 80.dp),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Text(
+                                "Copied text from your devices shows up here.",
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                } else {
+                    items(sorted, key = { it.id }) { item ->
+                        ClipRow(
+                            item = item,
+                            onCopy = { recopy(item) },
+                            onPin = { scope.launch { runCatching { FirebaseRepo.setClipPinned(item.id, !item.pinned) } } },
+                            onDelete = { scope.launch { runCatching { FirebaseRepo.deleteClip(item.id) } } },
+                        )
+                    }
                 }
             }
         }
