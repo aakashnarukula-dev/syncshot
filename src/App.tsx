@@ -1196,14 +1196,25 @@ function MainApp() {
     try {
       openEditorsRef.current += 1;
       pauseAutoHide();
+      // Make sure a local file is actually present before opening. Own-device
+      // captures normally have their local capture file, but if it's been
+      // evicted (the same gap that strands the tile on "Unavailable") this
+      // re-downloads the cloud copy so the editor always has bytes to open.
+      let openPath = path;
+      try {
+        const { ensureLocalScreenshot } = await import("@/lib/sync/screenshots");
+        openPath = await ensureLocalScreenshot(path);
+      } catch (e) {
+        console.error("ensure local screenshot failed:", e);
+      }
       // Copy the screenshot to the clipboard on open (fire-and-forget so it
       // never delays the editor window).
-      invoke("copy_to_clipboard", { path })
+      invoke("copy_to_clipboard", { path: openPath })
         .then(() => toast.success("Copied to clipboard", { duration: 1500 }))
         .catch((e) => console.error("copy on open failed:", e));
       await invoke("open_editor_window", {
         label,
-        imagePath: path,
+        imagePath: openPath,
       });
     } catch (err) {
       openEditorsRef.current = Math.max(0, openEditorsRef.current - 1);

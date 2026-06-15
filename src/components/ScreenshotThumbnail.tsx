@@ -332,17 +332,18 @@ function ThumbnailItem({ path, eager = false, onEdit, onRemove }: ThumbnailItemP
 
   // Resolve a Firebase Storage token URL for this tile when its local cache
   // file is missing or won't decode — a synced (remote) shot whose Rust
-  // download hasn't landed yet, or an orphaned doc. Firebase is dynamically
-  // imported so it never enters the startup-critical column chunk (same reason
-  // the clipboard list is lazy); the import only fires once a local load fails.
-  // The cache filename of a received shot is `{docId}.png`, so the matching
-  // synced doc (and its CSP-allowed token URL) is recoverable from the path.
+  // download hasn't landed yet, an OWN-DEVICE capture whose local file was
+  // evicted, or an orphaned doc. Firebase is dynamically imported so it never
+  // enters the startup-critical column chunk (same reason the clipboard list is
+  // lazy); the import only fires once a local load fails. `findDocForCachePath`
+  // resolves the backing doc for BOTH kinds of cache file — a received shot's
+  // `{docId}.png` filename AND an own capture's `shot_{ts}.png` (via the
+  // publish-time path→docId map) — so own captures get the same cloud fallback
+  // synced shots already had instead of stranding on "Unavailable".
   const resolveFallbackUrl = async (): Promise<string | null> => {
     try {
-      const { cacheDocId, storageDownloadUrl } = await import("@/lib/sync/screenshots");
-      const id = cacheDocId(path);
-      if (!id) return null;
-      const match = useSyncStore.getState().screenshots.find((s) => s.id === id);
+      const { findDocForCachePath, storageDownloadUrl } = await import("@/lib/sync/screenshots");
+      const match = findDocForCachePath(path);
       const storagePath = match?.thumbPath || match?.fullPath;
       if (!storagePath) return null;
       return await storageDownloadUrl(storagePath);

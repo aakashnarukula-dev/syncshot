@@ -21,6 +21,19 @@ interface SyncState {
   /** The live subscription window came back full — older shots can be paged in
    *  (drives the grid's load-more sentinel). */
   screenshotsHasMore: boolean;
+  /**
+   * Local CAPTURE path → its allocated Firestore doc id, recorded by the
+   * publisher (see lib/sync/screenshots `publishScreenshot`/`shareScreenshotLink`).
+   *
+   * A RECEIVED shot is cached as `{docId}.png`, so its doc (and thus a cloud
+   * thumb/full fallback URL) is recoverable straight from the filename. An
+   * OWN-DEVICE capture is cached under a generated `shot_{ts}.png` name with no
+   * embedded id, so without this map it had NO way to reach its cloud copy —
+   * the moment its local file failed to load it fell straight to "Unavailable"
+   * (and tap couldn't open it), while synced shots rendered fine. This map gives
+   * own captures the SAME cloud fallback without writing a duplicate cache file.
+   */
+  localCaptureDocIds: Record<string, string>;
   clipboard: ClipboardDoc[];
   paused: boolean;
 }
@@ -31,6 +44,9 @@ interface SyncActions {
   setAuthError: (message: string) => void;
   setDeviceName: (name: string) => void;
   setScreenshots: (items: ScreenshotDoc[], hasMore: boolean) => void;
+  /** Record the doc id a captured screenshot at `path` was published under, so
+   *  the tile/open-handler can resolve a cloud fallback for own-device shots. */
+  mapLocalCapture: (path: string, docId: string) => void;
   setClipboard: (items: ClipboardDoc[]) => void;
   setPaused: (paused: boolean) => void;
   reset: () => void;
@@ -46,6 +62,7 @@ const INITIAL_STATE: SyncState = {
   deviceName: "Mac",
   screenshots: [],
   screenshotsHasMore: false,
+  localCaptureDocIds: {},
   clipboard: [],
   paused: false,
 };
@@ -69,6 +86,7 @@ export const useSyncStore = create<SyncStore>()(
         state.authState = "signedOut";
         state.screenshots = [];
         state.screenshotsHasMore = false;
+        state.localCaptureDocIds = {};
         state.clipboard = [];
       }),
 
@@ -87,6 +105,11 @@ export const useSyncStore = create<SyncStore>()(
       set((state) => {
         state.screenshots = items;
         state.screenshotsHasMore = hasMore;
+      }),
+
+    mapLocalCapture: (path, docId) =>
+      set((state) => {
+        state.localCaptureDocIds[path] = docId;
       }),
 
     setClipboard: (items) =>

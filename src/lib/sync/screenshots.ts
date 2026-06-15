@@ -30,6 +30,7 @@ import {
   type DocumentData,
 } from "firebase/firestore";
 import { deleteObject, getDownloadURL, ref, uploadBytes } from "firebase/storage";
+import { useSyncStore } from "@/stores/syncStore";
 import { db, storage } from "./firebase";
 import { sha256Hex } from "./hash";
 import {
@@ -208,13 +209,22 @@ export async function publishScreenshot(
   const dupes = await getDocs(
     query(screenshotsCol(uid), where("sha256", "==", sha256), limit(1)),
   );
-  if (!dupes.empty) return false;
+  if (!dupes.empty) {
+    // Already synced (e.g. backfill re-run): still remember this capture's doc id
+    // so the tile/open-handler can reach its cloud copy if the local file fails.
+    useSyncStore.getState().mapLocalCapture(path, dupes.docs[0].id);
+    return false;
+  }
 
   const { width, height, thumb } = await makeThumb(blob);
 
   // Allocate the doc id up front so the Storage path can use it.
   const docRef = doc(screenshotsCol(uid));
   const id = docRef.id;
+  // Remember capture-path → doc id so an own-device shot whose local file won't
+  // load can fall back to its cloud thumb/full (own captures are cached as
+  // `shot_{ts}.png` with no embedded id — see syncStore.localCaptureDocIds).
+  useSyncStore.getState().mapLocalCapture(path, id);
 
   const thumbRef = ref(storage, `users/${uid}/screenshots/${id}/thumb.webp`);
   await uploadBytes(thumbRef, thumb, { contentType: "image/webp" });
@@ -272,6 +282,7 @@ export async function shareScreenshotLink(
   // earlier publish only got as far as the thumbnail.
   if (!dupes.empty) {
     const existing = dupes.docs[0];
+    useSyncStore.getState().mapLocalCapture(path, existing.id);
     const data = existing.data();
     if (data.fullPath) {
       return getDownloadURL(ref(storage, data.fullPath as string));
@@ -294,6 +305,7 @@ export async function shareScreenshotLink(
 
   const docRef = doc(screenshotsCol(uid));
   const id = docRef.id;
+  useSyncStore.getState().mapLocalCapture(path, id);
 
   const thumbRef = ref(storage, `users/${uid}/screenshots/${id}/thumb.webp`);
   await uploadBytes(thumbRef, thumb, { contentType: "image/webp" });
@@ -371,6 +383,59 @@ export function cacheDocId(path: string): string | null {
   const dot = base.lastIndexOf(".");
   const id = dot > 0 ? base.slice(0, dot) : base;
   return id || null;
+}
+
+/**
+ * Resolve the Firestore screenshot doc backing a local cache PATH, for either
+ * kind of cached shot:
+ *   • RECEIVED — cached as `{docId}.png`, so the id is in the filename.
+ *   • OWN-DEVICE CAPTURE — cached as `shot_{ts}.png` (no embedded id); its doc id
+ *     was recorded at publish time in `syncStore.localCaptureDocIds`.
+ *
+ * Returns the matching loaded `ScreenshotDoc`, or null if neither lookup hits a
+ * doc in the current subscription window. This is what lets an own-device shot
+ * fall back to its cloud thumb/full (render) and be re-materialized on open —
+ * the same safety net synced shots already had — so it never strands on
+ * "Unavailable".
+ */
+export function findDocForCachePath(path: string): ScreenshotDoc | null {
+  const { screenshots, localCaptureDocIds } = useSyncStore.getState();
+  const byName = cacheDocId(path);
+  if (byName) {
+    const match = screenshots.find((s) => s.id === byName);
+    if (match) return match;
+  }
+  const mappedId = localCaptureDocIds[path];
+  if (mappedId) {
+    const match = screenshots.find((s) => s.id === mappedId);
+    if (match) return match;
+  }
+  return null;
+}
+
+/**
+ * Return a LOCAL path whose file is present for the screenshot at `path`, so the
+ * editor/preview always has bytes to open. The captured/cached file is used
+ * as-is when it exists; if it's gone (e.g. an own-device shot whose local copy
+ * was evicted) we re-download the cloud full image into the cache and open that.
+ * Falls back to the original path when no cloud doc can be resolved.
+ */
+export async function ensureLocalScreenshot(path: string): Promise<string> {
+  try {
+    const resp = await fetch(convertFileSrc(path));
+    if (resp.ok) return path;
+  } catch {
+    /* asset fetch failed → local file missing, try the cloud copy below */
+  }
+  const docMatch = findDocForCachePath(path);
+  if (docMatch?.fullPath) {
+    try {
+      return await saveReceivedScreenshot(docMatch);
+    } catch {
+      /* download failed — fall through to the original path */
+    }
+  }
+  return path;
 }
 
 /**
