@@ -241,10 +241,16 @@ describe("backfillScreenshots", () => {
   });
 
   it("publishes each path, skipping already-synced (sha256 dupe) shots", async () => {
-    globalThis.fetch = vi.fn(() =>
-      Promise.resolve({
-        blob: () => Promise.resolve({ size: 4, arrayBuffer: () => Promise.resolve(new ArrayBuffer(4)) }),
-      } as unknown as Response),
+    // publishScreenshot reads the capture bytes over IPC (read_image_bytes),
+    // NOT fetch(convertFileSrc) — the asset:// fetch is CORS-rejected from the
+    // release localhost origin. rename_screenshot_to_doc_id echoes the path back
+    // (no-op rename) on the dedup path.
+    invokeMock.mockImplementation((cmd: string, args?: { path?: string }) =>
+      cmd === "read_image_bytes"
+        ? Promise.resolve(new ArrayBuffer(4))
+        : cmd === "rename_screenshot_to_doc_id"
+          ? Promise.resolve(args?.path)
+          : Promise.resolve(undefined),
     );
     sha256Hex.mockResolvedValue("dupe-sha");
     // Every dedup query returns a hit, so publishScreenshot short-circuits to
