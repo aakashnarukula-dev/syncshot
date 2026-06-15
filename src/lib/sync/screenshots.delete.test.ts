@@ -45,6 +45,7 @@ import {
   deleteLocalCacheById,
   deleteScreenshotByPath,
   deleteScreenshotDoc,
+  reconcileLocalCache,
 } from "./screenshots";
 
 const UID = "u1";
@@ -173,6 +174,64 @@ describe("deleteLocalCacheById", () => {
   it("swallows a missing cache dir without throwing", async () => {
     invokeMock.mockRejectedValue(new Error("no dir"));
     await expect(deleteLocalCacheById("d1")).resolves.toBeUndefined();
+  });
+});
+
+describe("reconcileLocalCache", () => {
+  // 20-char Firestore-style auto ids (received-shot cache filenames).
+  const KEEP_ID = "AbcdefghijklmnopqrST";
+  const GONE_ID = "ZyxwvutsrqponmlkjiHG";
+
+  function mockDir(files: string[]) {
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "get_desktop_directory") return Promise.resolve("/cache");
+      if (cmd === "list_screenshots") return Promise.resolve(files);
+      return Promise.resolve(undefined);
+    });
+  }
+
+  function deletedPaths() {
+    return invokeMock.mock.calls
+      .filter((c) => c[0] === "delete_file")
+      .map((c) => (c[1] as { path: string }).path);
+  }
+
+  it("deletes received-shot cache files whose doc id is gone from the server set", async () => {
+    mockDir([`/cache/${KEEP_ID}.png`, `/cache/${GONE_ID}.jpg`]);
+
+    await reconcileLocalCache(new Set([KEEP_ID]));
+
+    const deleted = deletedPaths();
+    expect(deleted).toEqual([`/cache/${GONE_ID}.jpg`]);
+  });
+
+  it("clears EVERY received-shot file on an empty server set (bulk delete)", async () => {
+    mockDir([`/cache/${KEEP_ID}.png`, `/cache/${GONE_ID}.webp`]);
+
+    await reconcileLocalCache(new Set());
+
+    expect(deletedPaths().sort()).toEqual(
+      [`/cache/${GONE_ID}.webp`, `/cache/${KEEP_ID}.png`].sort(),
+    );
+  });
+
+  it("never deletes own-device captures (shot_/screenshot_/region_ names have an underscore)", async () => {
+    mockDir([
+      `/cache/shot_1700000000.png`,
+      `/cache/screenshot_1700000001.png`,
+      `/cache/region_1700000002.png`,
+      `/cache/${GONE_ID}.png`,
+    ]);
+
+    await reconcileLocalCache(new Set());
+
+    // Only the received-shot file is swept; local captures are untouched.
+    expect(deletedPaths()).toEqual([`/cache/${GONE_ID}.png`]);
+  });
+
+  it("swallows a missing cache dir without throwing", async () => {
+    invokeMock.mockRejectedValue(new Error("no dir"));
+    await expect(reconcileLocalCache(new Set())).resolves.toBeUndefined();
   });
 });
 

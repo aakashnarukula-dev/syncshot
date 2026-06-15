@@ -78,6 +78,34 @@ describe("saveReceivedScreenshot", () => {
     expect(saved).toBe("/cache/doc123.png");
   });
 
+  it("saves a phone JPEG under a .jpg name (real mime), not a hardcoded .png", async () => {
+    getDownloadURL.mockResolvedValue("https://firebasestorage.googleapis.com/full.jpg?token=t");
+    invokeMock.mockResolvedValue("/cache/doc123.jpg");
+
+    await saveReceivedScreenshot(
+      makeDoc({ mime: "image/jpeg", fullPath: "users/u1/screenshots/doc123/full.jpg" }),
+    );
+
+    expect(invokeMock).toHaveBeenCalledWith("download_synced_image", {
+      url: "https://firebasestorage.googleapis.com/full.jpg?token=t",
+      name: "doc123.jpg",
+    });
+  });
+
+  it("derives the extension from the Storage object when mime is missing/unknown", async () => {
+    getDownloadURL.mockResolvedValue("https://firebasestorage.googleapis.com/full.webp?token=t");
+    invokeMock.mockResolvedValue("/cache/doc123.webp");
+
+    await saveReceivedScreenshot(
+      makeDoc({ mime: "", fullPath: "users/u1/screenshots/doc123/full.webp" }),
+    );
+
+    expect(invokeMock).toHaveBeenCalledWith("download_synced_image", {
+      url: "https://firebasestorage.googleapis.com/full.webp?token=t",
+      name: "doc123.webp",
+    });
+  });
+
   it("throws before any network call when the full image is not uploaded yet", async () => {
     await expect(
       saveReceivedScreenshot(makeDoc({ fullPath: null, status: "thumb" })),

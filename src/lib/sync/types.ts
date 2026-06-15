@@ -32,7 +32,11 @@ export interface ScreenshotDoc {
   width: number;
   height: number;
   bytes: number;
-  mime: "image/png";
+  /** Real image MIME from the uploader (e.g. a phone JPEG is "image/jpeg", not
+   *  the "image/png" the Mac always captures). Drives the on-disk extension on
+   *  the save/paste/download path so a synced shot gets a Finder/QuickLook
+   *  preview — never assume PNG. */
+  mime: string;
   thumbPath: string;
   fullPath: string | null;
   status: "thumb" | "full";

@@ -58,7 +58,10 @@ function mapDoc(id: string, data: DocumentData): ScreenshotDoc {
     width: data.width ?? 0,
     height: data.height ?? 0,
     bytes: data.bytes ?? 0,
-    mime: "image/png",
+    // Honor the uploader's REAL type — a phone (e.g. Samsung) screenshot is
+    // JPEG (mime "image/jpeg", full.jpg). Forcing "image/png" here is what made
+    // the save/paste/download path write `.png` over JPEG bytes → no preview.
+    mime: typeof data.mime === "string" && data.mime ? data.mime : "image/png",
     thumbPath: data.thumbPath ?? "",
     fullPath: data.fullPath ?? null,
     status: data.status === "full" ? "full" : "thumb",
@@ -93,13 +96,17 @@ export interface ScreenshotsSubscription {
  * Firestore serves the unchanged overlap from its local cache on each grow, so
  * only the newly-revealed older docs cost reads.
  *
- * `onChange` is called with the current window and `hasMore` — true when the
- * window came back full (older shots probably exist beyond it). Once a grow
- * returns fewer docs than requested we've hit the end and `loadMore()` no-ops.
+ * `onChange` is called with the current window, `hasMore` — true when the
+ * window came back full (older shots probably exist beyond it; once a grow
+ * returns fewer docs than requested we've hit the end and `loadMore()` no-ops) —
+ * and `fromCache` (Firestore served this snapshot from its LOCAL cache, not the
+ * server). The full-set delete-reconcile must trust ONLY authoritative server
+ * snapshots: a from-cache snapshot can momentarily replay a stale/empty set and
+ * would wrongly purge still-present shots.
  */
 export function subscribeScreenshots(
   uid: string,
-  onChange: (items: ScreenshotDoc[], hasMore: boolean) => void,
+  onChange: (items: ScreenshotDoc[], hasMore: boolean, fromCache: boolean) => void,
   onError?: (err: Error) => void,
 ): ScreenshotsSubscription {
   let windowSize = SCREENSHOTS_PAGE_SIZE;
@@ -121,7 +128,11 @@ export function subscribeScreenshots(
         growing = false;
         // A full window implies more (older) docs may exist beyond it.
         const hasMore = snap.size >= windowSize;
-        onChange(snap.docs.map((d) => mapDoc(d.id, d.data())), hasMore);
+        onChange(
+          snap.docs.map((d) => mapDoc(d.id, d.data())),
+          hasMore,
+          snap.metadata.fromCache,
+        );
       },
       (err) => {
         growing = false;
@@ -335,6 +346,50 @@ export async function shareScreenshotLink(
   return getDownloadURL(fullRef);
 }
 
+/** Image extensions the cache / save / paste path recognizes (lowercase, no
+ *  dot). `jpeg` normalizes to `jpg`. Mirrors the Rust sniff set. */
+const KNOWN_IMAGE_EXTS: Record<string, string> = {
+  png: "png",
+  jpg: "jpg",
+  jpeg: "jpg",
+  gif: "gif",
+  webp: "webp",
+  heic: "heic",
+  heif: "heic",
+};
+
+/** Map an image MIME type to its file extension, or null if unrecognized. */
+function extFromMime(mime?: string | null): string | null {
+  if (!mime) return null;
+  const sub = mime.toLowerCase().replace(/^image\//, "");
+  return KNOWN_IMAGE_EXTS[sub] ?? null;
+}
+
+/** Extract a known image extension from a Storage object path (e.g. the
+ *  uploader's `…/full.jpg`), or null if absent/unrecognized. */
+function extFromStoragePath(path?: string | null): string | null {
+  if (!path) return null;
+  const base = path.split(/[\\/]/).pop() ?? "";
+  const dot = base.lastIndexOf(".");
+  if (dot < 0) return null;
+  return KNOWN_IMAGE_EXTS[base.slice(dot + 1).toLowerCase()] ?? null;
+}
+
+/**
+ * The on-disk cache filename a received shot should be saved under, deriving the
+ * extension from the screenshot's REAL type rather than hardcoding `.png`:
+ * `doc.mime` first (the uploader's content type), then the Storage object's own
+ * extension (`full.jpg`), falling back to `png`. Rust still re-sniffs the bytes
+ * and corrects the extension if needed (see `synced_filename_for`), but starting
+ * from the true type means a valid format Rust's magic-byte sniff doesn't cover
+ * still lands with a sensible extension — never a JPEG written as `.png` (which
+ * is what stripped the Finder/QuickLook preview on phone screenshots).
+ */
+export function receivedCacheName(item: ScreenshotDoc): string {
+  const ext = extFromMime(item.mime) ?? extFromStoragePath(item.fullPath) ?? "png";
+  return `${item.id}.${ext}`;
+}
+
 /**
  * Persist a received full screenshot to disk via Rust (saves into the local
  * screenshot cache and copies the image to the clipboard). Returns the saved
@@ -355,7 +410,7 @@ export async function saveReceivedScreenshot(
   const url = await getDownloadURL(ref(storage, item.fullPath));
   return invoke<string>("download_synced_image", {
     url,
-    name: `${item.id}.png`,
+    name: receivedCacheName(item),
   });
 }
 
@@ -520,6 +575,47 @@ export async function deleteLocalCacheById(id: string): Promise<void> {
     );
   } catch {
     /* best-effort: no cache copy or dir unavailable */
+  }
+}
+
+/**
+ * A RECEIVED shot's cache file is named `{firestoreDocId}.<ext>`, and a Firestore
+ * auto id is exactly 20 chars of [A-Za-z0-9] — no separators. Own-device captures
+ * (and every other locally-generated file: `shot_…`, `screenshot_…`, `region_…`,
+ * `screenshotx_…`, `synced_…`) always carry an underscore, so this pattern
+ * matches ONLY received-shot cache files and never a local capture. The full-set
+ * reconcile uses it to avoid ever deleting a local-origin file.
+ */
+const RECEIVED_CACHE_ID = /^[A-Za-z0-9]{20}$/;
+
+/**
+ * FULL-SET cache reconcile against the authoritative server doc set.
+ *
+ * The per-snapshot reconcile only knew the ids it had SEEN in this session, so a
+ * bulk cloud delete left ghost tiles for received shots cached in a PRIOR session
+ * (or that had never paged into the live window). This sweeps the actual cache
+ * directory: every received-shot file (`{docId}.<ext>`) whose doc id is absent
+ * from `keepIds` is gone from the server and its local copy is deleted, so the
+ * edge rail (which polls the cache dir) drops it. Only received-shot files are
+ * touched (see RECEIVED_CACHE_ID) — local captures are never removed.
+ *
+ * MUST be called only with the set from an AUTHORITATIVE, COMPLETE server
+ * snapshot (not Firestore's local cache, and not a capped/`hasMore` window), or
+ * a still-present shot would be wrongly purged.
+ */
+export async function reconcileLocalCache(keepIds: Set<string>): Promise<void> {
+  try {
+    const dir = await invoke<string>("get_desktop_directory");
+    const files = await invoke<string[]>("list_screenshots", { dir });
+    const stale = files.filter((p) => {
+      const id = cacheDocId(p);
+      return id !== null && RECEIVED_CACHE_ID.test(id) && !keepIds.has(id);
+    });
+    await Promise.all(
+      stale.map((p) => invoke("delete_file", { path: p }).catch(() => {})),
+    );
+  } catch {
+    /* best-effort: cache dir unavailable or list failed */
   }
 }
 
