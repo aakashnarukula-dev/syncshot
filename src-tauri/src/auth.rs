@@ -17,13 +17,21 @@ const AUTH_PAGE_URL: &str = "https://screenshot-x-v1.web.app/auth.html";
 /// How long to wait for the browser round-trip before giving up.
 const AUTH_TIMEOUT: Duration = Duration::from_secs(300);
 
-// Best-effort self-close on success: window.close() only works for
-// script-opened windows, so it's a no-op for a tab the user's browser opened
-// via `open <url>` — the friendly text stays as the fallback in that case.
+// Best-effort self-close on success. Chrome blocks a bare `window.close()` on a
+// tab it didn't script-open ("Scripts may close only the windows that were
+// opened by them") — and our tab is opened via the system `open` + a top-level
+// redirect, so plain close() is refused. The `window.open('','_self')` trick
+// re-marks the current tab as script-opened, which lets close() through in most
+// Chrome setups; we also retry after a tick. The friendly text stays as the
+// final fallback for any browser that still refuses, and the Rust side raises
+// the app window regardless (see `focus_app`).
 const SUCCESS_HTML: &str = "<!doctype html><meta charset=utf-8><title>Signed in</title>\
 <body style=\"font:16px system-ui;display:grid;place-items:center;height:100vh;margin:0\">\
 <p>✅ Signed in. You can close this tab and return to ScreenshotX.</p>\
-<script>window.close()</script>";
+<script>\
+try { window.open('', '_self'); window.close(); } catch (e) {}\
+setTimeout(function(){ try { window.open('','_self'); window.close(); } catch(e){} }, 50);\
+</script>";
 
 const ERROR_HTML: &str = "<!doctype html><meta charset=utf-8><title>Sign-in failed</title>\
 <body style=\"font:16px system-ui;display:grid;place-items:center;height:100vh;margin:0\">\
@@ -127,10 +135,37 @@ fn accept_token(listener: &TcpListener, expected_state: &str) -> Result<String, 
     }
 }
 
+/// Raise the ScreenshotX app (and its main window) back to the foreground after
+/// a successful sign-in. The callback tab may not auto-close (a known Chrome
+/// limitation for tabs it didn't script-open), so this guarantees the user lands
+/// back in the app regardless of what the browser does with the tab.
+fn focus_app(app: &tauri::AppHandle) {
+    use tauri::Manager;
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+
+    // `set_focus` alone doesn't reliably pull a *background* app to the front on
+    // macOS; explicitly activate the NSApplication. Same objc2 msg_send idiom as
+    // the rest of the macOS native paths (clipboard.rs, lib.rs).
+    #[cfg(target_os = "macos")]
+    unsafe {
+        use objc2::msg_send;
+        use objc2::runtime::AnyObject;
+        if let Some(cls) = objc2::runtime::AnyClass::get("NSApplication") {
+            let ns_app: *mut AnyObject = msg_send![cls, sharedApplication];
+            if !ns_app.is_null() {
+                let _: () = msg_send![ns_app, activateIgnoringOtherApps: true];
+            }
+        }
+    }
+}
+
 /// Open the hosted sign-in page in the user's default browser, then wait for the
 /// page to redirect back the minted Firebase custom token over loopback.
 #[tauri::command]
-pub async fn browser_auth_listen() -> Result<String, String> {
+pub async fn browser_auth_listen(app: tauri::AppHandle) -> Result<String, String> {
     let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
     let port = listener.local_addr().map_err(|e| e.to_string())?.port();
     listener.set_nonblocking(true).map_err(|e| e.to_string())?;
@@ -144,9 +179,17 @@ pub async fn browser_auth_listen() -> Result<String, String> {
         .spawn()
         .map_err(|e| format!("failed to open browser: {e}"))?;
 
-    tauri::async_runtime::spawn_blocking(move || accept_token(&listener, &state))
+    let result = tauri::async_runtime::spawn_blocking(move || accept_token(&listener, &state))
         .await
-        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
+
+    // On a verified token, return the user to the app even if the browser keeps
+    // the "Signed in" tab open.
+    if result.is_ok() {
+        focus_app(&app);
+    }
+
+    result
 }
 
 #[cfg(test)]
