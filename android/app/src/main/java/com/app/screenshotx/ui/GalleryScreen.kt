@@ -267,7 +267,9 @@ private fun GalleryTile(ctx: Context, item: ScreenshotEntity, onClick: () -> Uni
     val model = remember(item.id, item.thumbPath, item.fullPath) {
         imageModel(ctx, item, preferFull = false)
     }
-    var loaded by remember(item.id, item.thumbPath, item.fullPath) { mutableStateOf(false) }
+    // Spinner only while actively loading. Error (e.g. a 404 from a blob deleted on
+    // the cloud) settles to the grey surface instead of spinning forever.
+    var loading by remember(item.id, item.thumbPath, item.fullPath) { mutableStateOf(model != null) }
     Box(
         Modifier
             .padding(4.dp)
@@ -281,9 +283,12 @@ private fun GalleryTile(ctx: Context, item: ScreenshotEntity, onClick: () -> Uni
             contentDescription = item.sha256,
             contentScale = ContentScale.Crop,
             modifier = Modifier.fillMaxSize(),
-            onState = { state -> loaded = state is AsyncImagePainter.State.Success },
+            onState = { state ->
+                loading = state is AsyncImagePainter.State.Loading ||
+                    state is AsyncImagePainter.State.Empty && model != null
+            },
         )
-        if (!loaded) {
+        if (loading) {
             CircularProgressIndicator(
                 modifier = Modifier.align(Alignment.Center).size(22.dp),
                 strokeWidth = 2.dp,
