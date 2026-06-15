@@ -237,6 +237,28 @@ async function adoptDocIdFilename(path: string, docId: string): Promise<string> 
 }
 
 /**
+ * Read a local cache file's bytes via Rust IPC instead of
+ * `fetch(convertFileSrc(path))`.
+ *
+ * In the RELEASE build the webview is served from `http://localhost:38217`
+ * (tauri_plugin_localhost — Firebase phone-auth's reCAPTCHA only trusts an
+ * authorized http origin). From that origin a `fetch()` of the `asset://` URL is
+ * a cross-origin request the asset protocol rejects (it returns no CORS headers
+ * for the localhost origin), so reading capture bytes in the webview FAILED.
+ * That broke the whole own-capture cloud binding: `publishScreenshot` threw
+ * before it could create the Firestore doc, so an own capture never got a synced
+ * doc — and the moment its local asset:// tile also failed to load (same CORS
+ * wall) it fell straight to "Unavailable", while a phone shot rendered from its
+ * synced doc's download URL. It also made copy-link upload nothing. Reading the
+ * bytes over IPC — which keeps full access on the localhost origin via the
+ * default capability's `remote.urls` — sidesteps the asset-protocol CORS wall.
+ */
+async function readLocalImage(path: string): Promise<{ buf: ArrayBuffer; blob: Blob }> {
+  const buf = await invoke<ArrayBuffer>("read_image_bytes", { path });
+  return { buf, blob: new Blob([buf]) };
+}
+
+/**
  * Publish a locally-captured screenshot file at `path` to the library.
  * No-op (returns false) if an identical image (same sha256) already exists.
  */
@@ -245,9 +267,7 @@ export async function publishScreenshot(
   device: DeviceRef,
   path: string,
 ): Promise<boolean> {
-  const resp = await fetch(convertFileSrc(path));
-  const blob = await resp.blob();
-  const buf = await blob.arrayBuffer();
+  const { buf, blob } = await readLocalImage(path);
   const sha256 = await sha256Hex(buf);
 
   // Content-addressed dedup — skip if this exact image is already synced.
@@ -325,9 +345,10 @@ export async function shareScreenshotLink(
   device: DeviceRef,
   path: string,
 ): Promise<string> {
-  const resp = await fetch(convertFileSrc(path));
-  const blob = await resp.blob();
-  const buf = await blob.arrayBuffer();
+  // Read the bytes over IPC, NOT fetch(convertFileSrc) — see readLocalImage: in
+  // the release localhost origin the asset:// fetch is CORS-rejected, which is
+  // exactly why copy-link on an own capture copied nothing.
+  const { buf, blob } = await readLocalImage(path);
   const sha256 = await sha256Hex(buf);
 
   const dupes = await getDocs(
