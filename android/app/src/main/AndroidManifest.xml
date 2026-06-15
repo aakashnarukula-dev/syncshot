@@ -19,6 +19,15 @@
         android:name="android.hardware.camera"
         android:required="false" />
 
+    <!-- Lets us detect/launch the Truecaller app for "Login with Truecaller"
+         (web_verify deeplink) under Android 11+ package visibility. -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:scheme="truecallersdk" />
+        </intent>
+    </queries>
+
     <application
         android:name=".SsxApp"
         android:allowBackup="true"
@@ -27,6 +36,15 @@
         android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
         android:theme="@style/Theme.ScreenshotX">
+
+        <!-- Truecaller partner key (pluggable via the TRUECALLER_PARTNER_KEY
+             gradle property). Empty until the partner app is registered. The
+             web_verify deeplink flow reads the key from the server /init, but
+             this meta-data is the conventional Truecaller location and is wired
+             so a future native-SDK path needs no further manifest change. -->
+        <meta-data
+            android:name="com.truecaller.android.sdk.PartnerKey"
+            android:value="${truecallerPartnerKey}" />
 
         <activity
             android:name=".MainActivity"

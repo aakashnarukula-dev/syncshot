@@ -22,11 +22,15 @@ import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.lazy.grid.GridCells
@@ -36,14 +40,16 @@ import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.Logout
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Download
-import androidx.compose.material.icons.filled.PersonAdd
 import androidx.compose.material.icons.filled.Share
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
@@ -70,9 +76,11 @@ import androidx.paging.compose.collectAsLazyPagingItems
 import androidx.paging.compose.itemKey
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
+import android.content.Intent
 import com.app.screenshotx.data.FirebaseRepo
 import com.app.screenshotx.data.db.AppDb
 import com.app.screenshotx.data.db.ScreenshotEntity
+import com.app.screenshotx.sync.SyncService
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -89,7 +97,7 @@ private fun storageModel(ctx: android.content.Context, path: String?, cacheKey: 
 }
 
 @Composable
-fun GalleryScreen() {
+fun GalleryScreen(onSignedOut: () -> Unit) {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
     val pager = remember {
@@ -99,7 +107,7 @@ fun GalleryScreen() {
     }
     val shots = pager.flow.collectAsLazyPagingItems()
     var selected by remember { mutableStateOf<ScreenshotEntity?>(null) }
-    var showAddDevice by remember { mutableStateOf(false) }
+    var showSignOut by remember { mutableStateOf(false) }
 
     val pickMedia = rememberLauncherForActivityResult(
         ActivityResultContracts.PickMultipleVisualMedia()
@@ -124,7 +132,25 @@ fun GalleryScreen() {
         }
     }
 
-    if (showAddDevice) AddDeviceDialog(onDismiss = { showAddDevice = false })
+    if (showSignOut) AlertDialog(
+        onDismissRequest = { showSignOut = false },
+        title = { Text("Sign out?") },
+        text = { Text("Stops syncing on this device. Sign back in anytime with the same email.") },
+        confirmButton = {
+            TextButton(onClick = {
+                showSignOut = false
+                scope.launch {
+                    withContext(Dispatchers.IO) {
+                        runCatching { FirebaseRepo.signOutLocal(ctx) }
+                        runCatching { AppDb.get(ctx).clearAllTables() }
+                    }
+                    runCatching { ctx.stopService(Intent(ctx, SyncService::class.java)) }
+                    onSignedOut()
+                }
+            }) { Text("Sign out", color = MaterialTheme.colorScheme.error) }
+        },
+        dismissButton = { TextButton(onClick = { showSignOut = false }) { Text("Cancel") } },
+    )
 
     AnimatedContent(
         targetState = selected,
@@ -140,8 +166,8 @@ fun GalleryScreen() {
                 ) {
                     Text("ScreenshotX", style = MaterialTheme.typography.titleLarge)
                     Row {
-                        IconButton(onClick = { showAddDevice = true }) {
-                            Icon(Icons.Filled.PersonAdd, "Add device")
+                        IconButton(onClick = { showSignOut = true }) {
+                            Icon(Icons.AutoMirrored.Filled.Logout, "Sign out")
                         }
                         IconButton(onClick = {
                             pickMedia.launch(
@@ -266,39 +292,64 @@ private fun FullScreenViewer(
 
         Row(
             Modifier.fillMaxWidth().align(Alignment.TopStart).statusBarsPadding().padding(8.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
         ) {
             PressIcon(Icons.AutoMirrored.Filled.ArrowBack, "Back", onClose)
-            Row {
-                PressIcon(Icons.Filled.Share, "Share") {
-                    val item = current ?: return@PressIcon
-                    val path = item.fullPath ?: return@PressIcon
-                    scope.launch {
-                        val f = withContext(Dispatchers.IO) {
-                            runCatching { ImageActions.ensureFile(ctx, item.sha256, path) }.getOrNull()
-                        }
-                        if (f != null) ImageActions.share(ctx, f)
-                        else Toast.makeText(ctx, "Couldn't load image", Toast.LENGTH_SHORT).show()
+        }
+
+        // Google-Photos-style bottom action bar; fades out with the
+        // swipe-to-dismiss backdrop.
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .align(Alignment.BottomCenter)
+                .graphicsLayer { alpha = bgAlpha }
+                .navigationBarsPadding()
+                .padding(bottom = 12.dp),
+            horizontalArrangement = Arrangement.SpaceEvenly,
+        ) {
+            BottomAction(Icons.Filled.Share, "Share") {
+                val item = current ?: return@BottomAction
+                val path = item.fullPath ?: return@BottomAction
+                scope.launch {
+                    val f = withContext(Dispatchers.IO) {
+                        runCatching { ImageActions.ensureFile(ctx, item.sha256, path) }.getOrNull()
                     }
+                    if (f != null) ImageActions.share(ctx, f)
+                    else Toast.makeText(ctx, "Couldn't load image", Toast.LENGTH_SHORT).show()
                 }
-                PressIcon(Icons.Filled.Download, "Download") {
-                    val item = current ?: return@PressIcon
-                    val path = item.fullPath ?: return@PressIcon
-                    scope.launch {
-                        val ok = withContext(Dispatchers.IO) {
-                            runCatching {
-                                ImageActions.saveToGallery(ctx, ImageActions.ensureFile(ctx, item.sha256, path))
-                            }.getOrDefault(false)
-                        }
-                        Toast.makeText(
-                            ctx,
-                            if (ok) "Saved to Pictures/ScreenshotX" else "Save failed",
-                            Toast.LENGTH_SHORT,
-                        ).show()
+            }
+            BottomAction(Icons.Filled.Download, "Save") {
+                val item = current ?: return@BottomAction
+                val path = item.fullPath ?: return@BottomAction
+                scope.launch {
+                    val ok = withContext(Dispatchers.IO) {
+                        runCatching {
+                            ImageActions.saveToGallery(ctx, ImageActions.ensureFile(ctx, item.sha256, path))
+                        }.getOrDefault(false)
                     }
+                    Toast.makeText(
+                        ctx,
+                        if (ok) "Saved to Pictures/ScreenshotX" else "Save failed",
+                        Toast.LENGTH_SHORT,
+                    ).show()
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun BottomAction(icon: ImageVector, label: String, onClick: () -> Unit) {
+    Column(
+        horizontalAlignment = Alignment.CenterHorizontally,
+        modifier = Modifier
+            .clip(RoundedCornerShape(12.dp))
+            .clickable(onClick = onClick)
+            .padding(horizontal = 24.dp, vertical = 8.dp),
+    ) {
+        Icon(icon, label, tint = Color.White)
+        Spacer(Modifier.height(4.dp))
+        Text(label, color = Color.White, style = MaterialTheme.typography.labelSmall)
     }
 }
 

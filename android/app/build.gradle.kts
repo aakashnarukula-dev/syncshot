@@ -11,6 +11,17 @@ if (file("google-services.json").exists()) {
     apply(plugin = "com.google.gms.google-services")
 }
 
+// Truecaller partner key is pluggable: set it via a gradle property
+// (-PTRUECALLER_PARTNER_KEY=..., gradle.properties, or the
+// ORG_GRADLE_PROJECT_TRUECALLER_PARTNER_KEY / TRUECALLER_PARTNER_KEY env var).
+// It arrives after the partner app for com.app.screenshotx is registered; until
+// then it stays empty and the Truecaller button greys out (server /init also
+// returns an empty partnerKey, which the app treats the same way).
+val truecallerPartnerKey: String =
+    (project.findProperty("TRUECALLER_PARTNER_KEY") as String?)
+        ?: System.getenv("TRUECALLER_PARTNER_KEY")
+        ?: ""
+
 android {
     namespace = "com.app.screenshotx"
     compileSdk = 34
@@ -21,6 +32,9 @@ android {
         targetSdk = 34
         versionCode = 2
         versionName = "2.0.0"
+
+        buildConfigField("String", "TRUECALLER_PARTNER_KEY", "\"$truecallerPartnerKey\"")
+        manifestPlaceholders["truecallerPartnerKey"] = truecallerPartnerKey
     }
 
     buildTypes {
@@ -42,6 +56,7 @@ android {
     }
     buildFeatures {
         compose = true
+        buildConfig = true
     }
 }
 

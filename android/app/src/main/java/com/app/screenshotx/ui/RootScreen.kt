@@ -21,7 +21,7 @@ import androidx.compose.ui.Modifier
 
 /** Two-destination bottom nav: ScreenshotX (grid) and ClipboardX (list). */
 @Composable
-fun RootScreen() {
+fun RootScreen(onSignedOut: () -> Unit) {
     var tab by remember { mutableIntStateOf(0) }
     Scaffold(
         contentWindowInsets = WindowInsets(0, 0, 0, 0),
@@ -44,7 +44,7 @@ fun RootScreen() {
     ) { pad ->
         Box(Modifier.fillMaxSize().padding(pad)) {
             when (tab) {
-                0 -> GalleryScreen()
+                0 -> GalleryScreen(onSignedOut = onSignedOut)
                 else -> ClipboardScreen()
             }
         }

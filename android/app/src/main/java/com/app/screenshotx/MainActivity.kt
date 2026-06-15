@@ -7,9 +7,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -17,13 +15,11 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
-import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import com.app.screenshotx.data.FirebaseRepo
-import com.app.screenshotx.data.Prefs
 import com.app.screenshotx.sync.SyncService
-import com.app.screenshotx.ui.PairScreen
+import com.app.screenshotx.ui.LoginScreen
 import com.app.screenshotx.ui.RootScreen
 import com.app.screenshotx.ui.theme.SsxTheme
 
@@ -35,22 +31,16 @@ class MainActivity : ComponentActivity() {
                 Surface(Modifier.fillMaxSize()) {
                     RequestPermissions()
                     val ctx = LocalContext.current
-                    var paired by remember { mutableStateOf(Prefs(ctx).isPaired) }
-                    var resolved by remember { mutableStateOf(false) }
+                    // Auth state is read synchronously from the persisted session;
+                    // pre-OTP anonymous sessions are discarded.
+                    var signedIn by remember { mutableStateOf(FirebaseRepo.purgeAnonymousAndCheck()) }
 
-                    LaunchedEffect(Unit) {
-                        FirebaseRepo.ensureSignedIn()
-                        paired = FirebaseRepo.currentLibId(ctx) != null
-                        resolved = true
-                    }
-                    LaunchedEffect(paired) { if (paired) SyncService.start(ctx) }
+                    LaunchedEffect(signedIn) { if (signedIn) SyncService.start(ctx) }
 
-                    when {
-                        paired -> RootScreen()
-                        !resolved -> Box(Modifier.fillMaxSize()) {
-                            CircularProgressIndicator(Modifier.align(Alignment.Center))
-                        }
-                        else -> PairScreen(onPaired = { paired = true })
+                    if (signedIn) {
+                        RootScreen(onSignedOut = { signedIn = false })
+                    } else {
+                        LoginScreen(onSignedIn = { signedIn = true })
                     }
                 }
             }

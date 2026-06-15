@@ -4,12 +4,13 @@ import com.google.firebase.firestore.DocumentSnapshot
 
 const val PLATFORM_ANDROID = "android"
 
-/** A screenshot document under libraries/{libId}/screenshots/{id}. */
+/** A screenshot document under users/{uid}/screenshots/{id}. */
 data class ScreenshotDoc(
     val id: String,
     val sha256: String,
     val createdAt: Long,
     val deviceUid: String,
+    val deviceId: String,
     val deviceName: String,
     val platform: String,
     val width: Int,
@@ -33,6 +34,7 @@ data class ScreenshotDoc(
                 sha256 = sha,
                 createdAt = created?.time ?: System.currentTimeMillis(),
                 deviceUid = device["uid"] as? String ?: "",
+                deviceId = device["deviceId"] as? String ?: "",
                 deviceName = device["name"] as? String ?: "",
                 platform = device["platform"] as? String ?: "",
                 width = (doc.getLong("width") ?: 0L).toInt(),
@@ -47,7 +49,7 @@ data class ScreenshotDoc(
     }
 }
 
-/** A clipboard document under libraries/{libId}/clipboard/{id}. */
+/** A clipboard document under users/{uid}/clipboard/{id}. */
 data class ClipItem(
     val id: String,
     val text: String,

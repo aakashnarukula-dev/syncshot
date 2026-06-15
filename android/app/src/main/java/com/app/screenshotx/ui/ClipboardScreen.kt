@@ -47,7 +47,6 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.app.screenshotx.data.ClipItem
 import com.app.screenshotx.data.FirebaseRepo
-import com.app.screenshotx.data.Prefs
 import com.app.screenshotx.sync.ClipboardCaptureService
 import kotlinx.coroutines.launch
 
@@ -68,10 +67,9 @@ fun ClipboardScreen() {
         onDispose { lifecycleOwner.lifecycle.removeObserver(obs) }
     }
 
-    val libId = remember { Prefs(ctx).libId }
-    val clips by produceState(initialValue = emptyList<ClipItem>(), libId) {
-        val id = libId ?: return@produceState
-        FirebaseRepo.clipboardSnapshots(id).collect { value = it }
+    val clips by produceState(initialValue = emptyList<ClipItem>(), Unit) {
+        if (!FirebaseRepo.signedIn) return@produceState
+        FirebaseRepo.clipboardSnapshots().collect { value = it }
     }
     // Pinned first, then newest.
     val sorted = remember(clips) { clips.sortedWith(compareByDescending<ClipItem> { it.pinned }.thenByDescending { it.createdAt }) }
@@ -115,8 +113,8 @@ fun ClipboardScreen() {
                     ClipRow(
                         item = item,
                         onCopy = { recopy(item) },
-                        onPin = { scope.launch { runCatching { FirebaseRepo.setClipPinned(ctx, item.id, !item.pinned) } } },
-                        onDelete = { scope.launch { runCatching { FirebaseRepo.deleteClip(ctx, item.id) } } },
+                        onPin = { scope.launch { runCatching { FirebaseRepo.setClipPinned(item.id, !item.pinned) } } },
+                        onDelete = { scope.launch { runCatching { FirebaseRepo.deleteClip(item.id) } } },
                     )
                 }
             }

@@ -12,6 +12,7 @@ import android.os.IBinder
 import android.os.Looper
 import android.provider.MediaStore
 import com.app.screenshotx.data.FirebaseRepo
+import com.app.screenshotx.data.Prefs
 import com.app.screenshotx.data.db.AppDb
 import com.app.screenshotx.data.db.ScreenshotEntity
 import kotlinx.coroutines.CoroutineScope
@@ -48,14 +49,16 @@ class SyncService : Service() {
 
     private fun startMirror() {
         scope.launch {
-            val libId = FirebaseRepo.currentLibId(this@SyncService) ?: run { stopSelf(); return@launch }
+            if (!FirebaseRepo.signedIn) { stopSelf(); return@launch }
             Fcm.registerToken(this@SyncService)
             val dao = AppDb.get(this@SyncService).screenshots()
-            val myUid = FirebaseRepo.uid
-            FirebaseRepo.screenshotSnapshots(libId).collectLatest { docs ->
+            // All devices share one auth uid — our own docs are identified by
+            // the per-install deviceId, not the uid.
+            val myDeviceId = Prefs(this@SyncService).deviceId
+            FirebaseRepo.screenshotSnapshots().collectLatest { docs ->
                 dao.upsertAll(docs.map { ScreenshotEntity.of(it) })
                 docs.forEach { doc ->
-                    if (doc.deviceUid != myUid && doc.status == "full") {
+                    if (doc.deviceId != myDeviceId && doc.status == "full") {
                         scope.launch { Receiver.receive(this@SyncService, doc) }
                     }
                 }
