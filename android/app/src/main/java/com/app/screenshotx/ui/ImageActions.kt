@@ -9,6 +9,8 @@ import android.os.Environment
 import android.provider.MediaStore
 import androidx.core.content.FileProvider
 import com.app.screenshotx.data.FirebaseRepo
+import com.app.screenshotx.data.db.AppDb
+import com.app.screenshotx.data.db.ScreenshotEntity
 import com.app.screenshotx.sync.Receiver
 import java.io.File
 
@@ -40,6 +42,19 @@ object ImageActions {
         ctx.startActivity(
             Intent.createChooser(send, "Share screenshot").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         )
+    }
+
+    /** Delete a screenshot from everywhere: cloud doc + Storage blobs, the local
+     *  Room row (so the grid drops it immediately), and any received/cached file
+     *  copies. Cloud delete runs first so a failure leaves the local mirror intact
+     *  (the tile stays, the caller can report failure). Once the doc is gone the
+     *  Firestore listener won't re-add it on the next snapshot. Call off the main
+     *  thread. */
+    suspend fun deleteEverywhere(ctx: Context, item: ScreenshotEntity) {
+        FirebaseRepo.deleteScreenshot(item.id, item.thumbPath, item.fullPath)
+        AppDb.get(ctx).screenshots().deleteById(item.id)
+        runCatching { Receiver.receivedFile(ctx, item.sha256).delete() }
+        runCatching { File(File(ctx.cacheDir, "shared"), "${item.sha256}.png").delete() }
     }
 
     fun saveToGallery(ctx: Context, file: File): Boolean {

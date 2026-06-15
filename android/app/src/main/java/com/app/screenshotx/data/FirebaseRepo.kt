@@ -170,6 +170,23 @@ object FirebaseRepo {
     suspend fun downloadFull(path: String, maxBytes: Long = 64L * 1024 * 1024): ByteArray =
         storage.getReference(path).getBytes(maxBytes).await()
 
+    /** Delete a screenshot everywhere in the cloud: its Firestore doc AND both
+     *  Storage blobs (thumb + full). Mirrors the Mac delete — the deterministic
+     *  users/{uid}/screenshots/{id}/{thumb.webp,full.png} paths plus whatever the
+     *  doc carried are all swept, and a missing blob is not an error. Removing the
+     *  doc is what stops every device's listener from re-syncing the shot. */
+    suspend fun deleteScreenshot(id: String, thumbPath: String?, fullPath: String?) {
+        val uid = requireUid()
+        val blobs = linkedSetOf(
+            "users/$uid/screenshots/$id/thumb.webp",
+            "users/$uid/screenshots/$id/full.png",
+        )
+        thumbPath?.let(blobs::add)
+        fullPath?.let(blobs::add)
+        blobs.forEach { p -> runCatching { storage.getReference(p).delete().await() } }
+        col("screenshots").document(id).delete().await()
+    }
+
     /** Realtime screenshot snapshots (most recent 100). Includes optimistic local writes. */
     fun screenshotSnapshots(): Flow<List<ScreenshotDoc>> = callbackFlow {
         val reg = col("screenshots")

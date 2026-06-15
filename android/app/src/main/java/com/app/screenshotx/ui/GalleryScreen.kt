@@ -44,6 +44,7 @@ import androidx.compose.material.icons.automirrored.filled.Logout
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Share
+import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -235,8 +236,32 @@ private fun FullScreenViewer(
     var dismissY by remember { mutableFloatStateOf(0f) }
     val bgAlpha = (1f - (abs(dismissY) / 1200f)).coerceIn(0f, 1f)
     val current = items.getOrNull(pagerState.currentPage)
+    var confirmDelete by remember { mutableStateOf(false) }
 
     BackHandler { onClose() }
+
+    if (confirmDelete) AlertDialog(
+        onDismissRequest = { confirmDelete = false },
+        title = { Text("Delete screenshot?") },
+        text = { Text("Removes it from this device and every paired device. This can't be undone.") },
+        confirmButton = {
+            TextButton(onClick = {
+                confirmDelete = false
+                val item = current ?: return@TextButton
+                scope.launch {
+                    val ok = withContext(Dispatchers.IO) {
+                        runCatching { ImageActions.deleteEverywhere(ctx, item) }.isSuccess
+                    }
+                    Toast.makeText(
+                        ctx,
+                        if (ok) "Deleted" else "Delete failed",
+                        Toast.LENGTH_SHORT,
+                    ).show()
+                }
+            }) { Text("Delete", color = MaterialTheme.colorScheme.error) }
+        },
+        dismissButton = { TextButton(onClick = { confirmDelete = false }) { Text("Cancel") } },
+    )
 
     Box(Modifier.fillMaxSize().background(Color.Black.copy(alpha = bgAlpha))) {
         HorizontalPager(
@@ -333,6 +358,9 @@ private fun FullScreenViewer(
                         Toast.LENGTH_SHORT,
                     ).show()
                 }
+            }
+            BottomAction(Icons.Outlined.Delete, "Delete") {
+                if (current != null) confirmDelete = true
             }
         }
     }

@@ -57,6 +57,14 @@ class SyncService : Service() {
             val myDeviceId = Prefs(this@SyncService).deviceId
             FirebaseRepo.screenshotSnapshots().collectLatest { docs ->
                 dao.upsertAll(docs.map { ScreenshotEntity.of(it) })
+                // Propagate deletes from other devices: any local row inside the
+                // snapshot's time window that the snapshot no longer carries was
+                // deleted elsewhere. Bounded to the window so paged history past
+                // the 100-doc listener is never wiped; skipped on an empty
+                // snapshot to avoid clearing on a transient.
+                if (docs.isNotEmpty()) {
+                    dao.pruneWithinWindow(docs.map { it.id }, docs.minOf { it.createdAt })
+                }
                 docs.forEach { doc ->
                     if (doc.deviceId != myDeviceId && doc.status == "full") {
                         scope.launch { Receiver.receive(this@SyncService, doc) }
