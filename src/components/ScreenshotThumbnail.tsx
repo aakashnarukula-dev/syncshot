@@ -2,7 +2,7 @@ import { lazy, Suspense, useEffect, useLayoutEffect, useRef, useState } from "re
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { animate } from "motion";
 import { startDrag } from "@crabnebula/tauri-plugin-drag";
-import { Check, ChevronLeft, ChevronRight, ClipboardList, Copy, Image as ImageIcon, Link2, Loader2, Trash2 } from "lucide-react";
+import { Check, ChevronLeft, ChevronRight, ClipboardList, Copy, Image as ImageIcon, ImageOff, Link2, Loader2, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 import { useSyncStore } from "@/stores/syncStore";
 import type { ColumnView } from "@/App";
@@ -255,12 +255,57 @@ interface ThumbnailItemProps {
 // it stays crisp on Retina while decoding ~50-100x faster than a full shot.
 const THUMB_MAX_PX = 512;
 
+// A synced shot whose Storage blob never downloaded — or an orphaned/corrupted
+// doc with no valid blob at all — must NOT park the tile in a perpetual shimmer.
+// Bound both the Firebase URL resolve and the remote image load so the source
+// cascade ALWAYS reaches a terminal state (rendered or "unavailable").
+const REMOTE_TIMEOUT_MS = 8000;
+
+// Test-load `url` in an off-DOM <img> and resolve true only if it actually
+// decoded (false on error or after `timeoutMs`). The cascade commits a source
+// ONLY after it probes good, so the on-DOM <img> then loads it straight from
+// cache — and we never ping-pong between broken srcs via the <img> onError.
+// crossOrigin must match the displayed <img crossOrigin="anonymous"> so the
+// probed response is cached in CORS mode (a no-cors probe vs cors <img> makes
+// WKWebView reject the cached opaque response and paint a broken "?" instead).
+function probeImage(url: string, timeoutMs?: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.crossOrigin = "anonymous";
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const finish = (ok: boolean) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      resolve(ok);
+    };
+    if (timeoutMs) timer = setTimeout(() => finish(false), timeoutMs);
+    img.onload = () => finish(true);
+    img.onerror = () => finish(false);
+    img.src = url;
+  });
+}
+
+// Resolve `p`, or null if it rejects or doesn't settle within `ms` — so a
+// hung getDownloadURL() can't stall the cascade short of its terminal state.
+function withTimeout<T>(p: Promise<T>, ms: number): Promise<T | null> {
+  return Promise.race([
+    p.catch(() => null),
+    new Promise<null>((resolve) => setTimeout(() => resolve(null), ms)),
+  ]);
+}
+
 function ThumbnailItem({ path, eager = false, onEdit, onRemove }: ThumbnailItemProps) {
   // Eager (newest, top) items show the full-res original IMMEDIATELY so a fresh
   // capture appears with zero delay, then swap to the cached thumbnail once it's
   // decoded (the swap is invisible: same box, pre-decoded bitmap).
   const [src, setSrc] = useState<string>(() => (eager ? convertFileSrc(path) : ""));
   const [ready, setReady] = useState(eager);
+  // Terminal "unavailable" state: every source (thumb, local, remote) was tried
+  // and none rendered. Shows a static placeholder (still deletable) instead of
+  // looping back to the shimmer.
+  const [failed, setFailed] = useState(false);
   const [isExiting, setIsExiting] = useState(false);
   const [isSharing, setIsSharing] = useState(false);
   const [isCopied, setIsCopied] = useState(false);
@@ -337,35 +382,69 @@ function ThumbnailItem({ path, eager = false, onEdit, onRemove }: ThumbnailItemP
     if (!inView) {
       setSrc("");
       setReady(false);
+      setFailed(false);
       return;
     }
     let cancelled = false;
-    const show = (url: string) => {
-      const pre = new Image();
-      // Match the displayed <img crossOrigin="anonymous"> so the preloaded
-      // response is cached in CORS mode — a mismatch (no-cors preload vs
-      // cors <img>) makes WKWebView reject the cached opaque response and
-      // paint a broken-image "?" instead of the screenshot.
-      pre.crossOrigin = "anonymous";
-      pre.src = url;
-      const swap = () => {
-        if (cancelled) return;
-        setSrc(url);
-        setReady(true);
-      };
-      pre.decode().then(swap, swap);
+
+    const commit = (url: string) => {
+      if (cancelled) return;
+      setSrc(url);
+      setReady(true);
+      setFailed(false);
     };
-    invoke<string>("get_screenshot_thumbnail", { path, maxPx: THUMB_MAX_PX })
-      .then((thumbPath) => {
-        if (!cancelled) show(convertFileSrc(thumbPath));
-      })
-      .catch(async () => {
-        // No local cache file (or it won't decode) — a synced shot not yet
-        // pulled to disk, or an orphaned doc. Fall back to the Firebase token
-        // URL before giving up so the tile renders instead of showing "?".
-        const fallback = await resolveFallbackUrl();
-        if (!cancelled) show(fallback ?? convertFileSrc(path));
-      });
+
+    // Deterministic source cascade. Each step PROBES its candidate (off-DOM
+    // load) and only commits one that actually decodes, so an own-device shot
+    // shows instantly from its local file and a synced shot falls back to its
+    // bounded Firebase URL — but a doc with no valid blob anywhere ends in the
+    // terminal "unavailable" state instead of an endless shimmer or an
+    // onError ping-pong between two broken srcs.
+    (async () => {
+      const local = convertFileSrc(path);
+
+      // 1. Cheap cached thumbnail (native downscale). Throws if no local file.
+      try {
+        const thumbPath = await invoke<string>("get_screenshot_thumbnail", {
+          path,
+          maxPx: THUMB_MAX_PX,
+        });
+        if (cancelled) return;
+        const thumbUrl = convertFileSrc(thumbPath);
+        if (await probeImage(thumbUrl)) {
+          commit(thumbUrl);
+          return;
+        }
+      } catch {
+        /* no local cache file (or it won't decode) — fall through */
+      }
+      if (cancelled) return;
+
+      // 2. Original full-res local file. For own captures this is present and
+      //    paints immediately; for eager tiles it's already on-screen.
+      if (await probeImage(local)) {
+        commit(local);
+        return;
+      }
+      if (cancelled) return;
+
+      // 3. Remote Firebase token URL — a synced shot whose bytes never landed.
+      //    Both the resolve and the load are time-bounded.
+      const remote = await withTimeout(resolveFallbackUrl(), REMOTE_TIMEOUT_MS);
+      if (cancelled) return;
+      if (remote && (await probeImage(remote, REMOTE_TIMEOUT_MS))) {
+        commit(remote);
+        return;
+      }
+      if (cancelled) return;
+
+      // 4. Exhausted every source (no local file AND remote failed/timed out) —
+      //    terminal state so the user can SEE + DELETE an orphaned/corrupted doc.
+      setSrc("");
+      setReady(false);
+      setFailed(true);
+    })();
+
     return () => {
       cancelled = true;
     };
@@ -493,14 +572,28 @@ function ThumbnailItem({ path, eager = false, onEdit, onRemove }: ThumbnailItemP
       style={{ aspectRatio: "4 / 3" }}
     >
       {/* Skeleton keeps the slot's fixed size and animates while the thumbnail
-          decodes, so fast scrolling shows a shimmer instead of blank gaps. */}
+          decodes, so fast scrolling shows a shimmer instead of blank gaps.
+          Hidden once the image is ready OR the tile reached its terminal
+          "unavailable" state — it never loops back to the shimmer. */}
       <div
         aria-hidden="true"
         className={`absolute inset-0 rounded-md bs-thumb-shimmer transition-opacity duration-200 ${
-          ready ? "opacity-0 bs-thumb-shimmer-done" : "opacity-100"
+          ready || failed ? "opacity-0 bs-thumb-shimmer-done" : "opacity-100"
         }`}
       />
-      {src ? (
+      {failed ? (
+        // Terminal "unavailable" tile: no valid blob anywhere (orphaned/corrupted
+        // doc, or a synced shot whose bytes never downloaded). Static, not
+        // clickable-to-edit — but the delete + share buttons below stay usable so
+        // the user can SEE it and remove it instead of staring at an endless
+        // shimmer.
+        <div
+          className="relative flex h-full w-full flex-col items-center justify-center gap-1.5 rounded-md border border-neutral-700/40 bg-neutral-900/80 text-neutral-500 select-none"
+        >
+          <ImageOff className="size-6" aria-hidden="true" />
+          <span className="text-[11px] font-medium">Unavailable</span>
+        </div>
+      ) : src ? (
         <img
           src={src}
           alt="Screenshot preview"
@@ -515,24 +608,13 @@ function ThumbnailItem({ path, eager = false, onEdit, onRemove }: ThumbnailItemP
             beginDrag(e.currentTarget);
           }}
           onError={() => {
-            // Current source failed to decode/load. Try in order: the Firebase
-            // token URL (covers a synced shot whose local file is missing), then
-            // the original full-res local file, then hold the shimmer rather
-            // than flashing a broken-image "?". Each branch moves to a DIFFERENT
-            // src or stops, so this can't loop.
-            void (async () => {
-              const original = convertFileSrc(path);
-              const fallback = await resolveFallbackUrl();
-              if (fallback && src !== fallback) {
-                setSrc(fallback);
-                setReady(true);
-              } else if (src !== original) {
-                setSrc(original);
-                setReady(true);
-              } else {
-                setReady(false);
-              }
-            })();
+            // The committed source was probed-good but failed on-DOM (e.g. cache
+            // eviction). Drop straight to the terminal state — never loop back to
+            // another src or the shimmer. The cascade effect owns fallback order;
+            // re-running it here would risk the local↔remote ping-pong this fix
+            // removes.
+            setReady(false);
+            setFailed(true);
           }}
           onClick={() => {
             exitingRef.current = true;
