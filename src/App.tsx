@@ -463,7 +463,12 @@ function MainApp() {
 
   // Open a small, pairing-only decorated window (reuses the main window, like
   // Preferences). Just the QR + 6-digit code + enter-code field — no Library.
-  const openPairing = useCallback(async () => {
+  // `autoStart` (tray "Sign in & Sync") makes SignInView open the browser
+  // immediately instead of showing the "Sign in with phone" button. Launch
+  // auto-present and post-logout reopen leave it off (normal CTA).
+  const [pairingAutoStart, setPairingAutoStart] = useState(false);
+  const openPairing = useCallback(async (autoStart = false) => {
+    setPairingAutoStart(autoStart);
     await showNormalWindow(getCurrentWindow(), 420, 300, {
       title: "Sign in",
       resizable: false,
@@ -1139,8 +1144,9 @@ function MainApp() {
           setIsCollapsed(true);
         }
       });
-      // Tray "Pair" opens the small pairing-only window.
-      const unlisten9 = await listen("open-library", () => { openPairing(); });
+      // Tray "Sign in & Sync" opens the small sign-in window AND immediately
+      // launches the browser sign-in (autoStart) — no intermediate button click.
+      const unlisten9 = await listen("open-library", () => { openPairing(true); });
       // Tray "Log Out" signs this device out (engine is code-split off the
       // critical path, so pull it in lazily). authState → signedOut then flips
       // the tray menu back via the bridge effect above.
@@ -1318,7 +1324,7 @@ function MainApp() {
     return (
       <div className="h-dvh w-full overflow-hidden bg-background text-foreground">
         <Suspense fallback={<LoadingFallback />}>
-          <SignInView />
+          <SignInView autoStart={pairingAutoStart} />
         </Suspense>
       </div>
     );

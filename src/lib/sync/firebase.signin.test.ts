@@ -33,15 +33,24 @@ describe("startBrowserSignIn", () => {
     authStub.currentUser = null;
   });
 
-  it("opens the loopback listener and signs in with the returned token", async () => {
+  it("opens the embedded sign-in window by default and signs in with the returned token", async () => {
     invokeMock.mockResolvedValue("custom-token-123");
     signInWithCustomToken.mockResolvedValue({ user: { uid: "u1" } });
 
     const user = await startBrowserSignIn();
 
-    expect(invokeMock).toHaveBeenCalledWith("browser_auth_listen");
+    expect(invokeMock).toHaveBeenCalledWith("browser_auth_listen", { embed: true });
     expect(signInWithCustomToken).toHaveBeenCalledWith(authStub, "custom-token-123");
     expect(user).toEqual({ uid: "u1" });
+  });
+
+  it("falls back to the system browser when embed is false", async () => {
+    invokeMock.mockResolvedValue("tok");
+    signInWithCustomToken.mockResolvedValue({ user: { uid: "u3" } });
+
+    await startBrowserSignIn(false);
+
+    expect(invokeMock).toHaveBeenCalledWith("browser_auth_listen", { embed: false });
   });
 
   it("discards a leftover anonymous session before signing in", async () => {

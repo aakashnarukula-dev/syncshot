@@ -20,7 +20,7 @@ use commands::{
     native_capture_window, open_editor_window, play_screenshot_sound, save_edited_image,
     save_native_screenshot, save_synced_image, set_clipboard_text,
 };
-use auth::browser_auth_listen;
+use auth::{browser_auth_listen, close_auth_window};
 use license::{get_machine_id, keychain_delete, keychain_get, keychain_set};
 
 /// Port for the release-mode localhost server (see tauri_plugin_localhost below).
@@ -278,6 +278,7 @@ pub fn run() {
             keychain_set,
             keychain_delete,
             browser_auth_listen,
+            close_auth_window,
             update_tray_menu,
             set_pill_all_spaces
         ])
