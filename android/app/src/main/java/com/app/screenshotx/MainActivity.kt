@@ -29,7 +29,6 @@ class MainActivity : ComponentActivity() {
         setContent {
             SsxTheme {
                 Surface(Modifier.fillMaxSize()) {
-                    RequestPermissions()
                     val ctx = LocalContext.current
                     // Auth state is read synchronously from the persisted session;
                     // pre-OTP anonymous sessions are discarded.
@@ -38,6 +37,9 @@ class MainActivity : ComponentActivity() {
                     LaunchedEffect(signedIn) { if (signedIn) SyncService.start(ctx) }
 
                     if (signedIn) {
+                        // Ask for runtime permissions only once the user is in, so
+                        // they don't clutter the sign-in (Truecaller consent) screen.
+                        RequestPermissions()
                         RootScreen(onSignedOut = { signedIn = false })
                     } else {
                         LoginScreen(onSignedIn = { signedIn = true })

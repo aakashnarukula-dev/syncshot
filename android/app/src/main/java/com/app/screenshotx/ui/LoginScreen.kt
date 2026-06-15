@@ -11,6 +11,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -18,11 +19,13 @@ import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -48,10 +51,124 @@ import kotlinx.coroutines.launch
 
 private const val CODE_LENGTH = 6
 
-/** Phone OTP sign-in: enter number -> SMS code -> done. Same number on every
- *  device = same library. */
+private enum class Phase { PROBING, TRUECALLER, OTP }
+
+/**
+ * Truecaller-first sign-in: on open we auto-launch "Login with Truecaller"; if
+ * it isn't available or the user backs out, we fall back to phone-OTP in a
+ * bottom sheet. Either path lands on the same Firebase account (the server maps
+ * phone -> uid), so the library is identical.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun LoginScreen(onSignedIn: () -> Unit) {
+    val ctx = LocalContext.current
+    val scope = rememberCoroutineScope()
+
+    var phase by remember { mutableStateOf(Phase.PROBING) }
+    var tcConfigured by remember { mutableStateOf(false) }
+    var fallbackHint by remember { mutableStateOf<String?>(null) }
+    var sheetOpen by remember { mutableStateOf(false) }
+    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+
+    fun toOtp(hint: String?) {
+        fallbackHint = hint
+        phase = Phase.OTP
+        sheetOpen = true
+    }
+
+    fun runTruecaller(session: TruecallerAuth.Session) {
+        val activity = ctx as? Activity ?: return toOtp(null)
+        phase = Phase.TRUECALLER
+        scope.launch {
+            if (!TruecallerAuth.launch(activity, session)) {
+                toOtp("Truecaller isn't installed — sign in with your phone.")
+                return@launch
+            }
+            when (val r = TruecallerAuth.awaitToken(session.nonce)) {
+                is TruecallerAuth.Result.Success ->
+                    runCatching { FirebaseRepo.signInWithCustomToken(r.customToken) }
+                        .onSuccess { onSignedIn() }
+                        .onFailure { toOtp("Couldn't finish Truecaller sign-in.") }
+                // Rejected / timeout / not-installed / failed -> quietly drop to OTP.
+                else -> toOtp(null)
+            }
+        }
+    }
+
+    fun startTruecaller() {
+        phase = Phase.PROBING
+        scope.launch {
+            val s = runCatching { TruecallerAuth.init() }.getOrNull()
+            if (s != null && TruecallerAuth.isConfigured(s)) {
+                tcConfigured = true
+                runTruecaller(s)
+            } else {
+                tcConfigured = false
+                toOtp(null)
+            }
+        }
+    }
+
+    // Kick off Truecaller the moment the login screen appears.
+    LaunchedEffect(Unit) { startTruecaller() }
+
+    Box(Modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.Center) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Text(
+                "ScreenshotX",
+                style = MaterialTheme.typography.displaySmall,
+                fontWeight = FontWeight.Bold,
+            )
+            Spacer(Modifier.height(12.dp))
+            when (phase) {
+                Phase.PROBING, Phase.TRUECALLER -> {
+                    Text(
+                        "Signing you in with Truecaller…",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        textAlign = TextAlign.Center,
+                    )
+                    Spacer(Modifier.height(22.dp))
+                    CircularProgressIndicator(Modifier.size(26.dp), strokeWidth = 2.dp)
+                    Spacer(Modifier.height(22.dp))
+                    TextButton(onClick = { toOtp(null) }) { Text("Use phone number instead") }
+                }
+                Phase.OTP -> {
+                    Text(
+                        "Sign in to sync your screenshots.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        textAlign = TextAlign.Center,
+                    )
+                    Spacer(Modifier.height(22.dp))
+                    Button(
+                        onClick = { sheetOpen = true },
+                        modifier = Modifier.fillMaxWidth(),
+                    ) { Text("Sign in with phone") }
+                    if (tcConfigured) {
+                        Spacer(Modifier.height(8.dp))
+                        TextButton(onClick = { startTruecaller() }) { Text("Try Truecaller again") }
+                    }
+                }
+            }
+        }
+    }
+
+    if (sheetOpen) {
+        ModalBottomSheet(
+            onDismissRequest = { sheetOpen = false },
+            sheetState = sheetState,
+        ) {
+            PhoneOtpContent(hint = fallbackHint, onSignedIn = onSignedIn)
+        }
+    }
+}
+
+/** Phone-OTP sign-in (the fallback): enter number -> SMS code -> done. Rendered
+ *  inside the bottom sheet. Same number on every device = same library. */
+@Composable
+private fun PhoneOtpContent(hint: String?, onSignedIn: () -> Unit) {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
 
@@ -60,53 +177,6 @@ fun LoginScreen(onSignedIn: () -> Unit) {
     var code by remember { mutableStateOf("") }
     var busy by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
-
-    // Truecaller: probe /init once to learn whether a partner key is configured;
-    // the button stays greyed out until it is (and we don't crash without it).
-    var tcSession by remember { mutableStateOf<TruecallerAuth.Session?>(null) }
-    var tcChecked by remember { mutableStateOf(false) }
-    var tcBusy by remember { mutableStateOf(false) }
-
-    LaunchedEffect(Unit) {
-        runCatching { TruecallerAuth.init() }.onSuccess { tcSession = it }
-        tcChecked = true
-    }
-
-    fun loginWithTruecaller() {
-        val activity = ctx as? Activity ?: return
-        if (busy || tcBusy) return
-        scope.launch {
-            tcBusy = true
-            error = null
-            // A fresh nonce per attempt (the probe nonce may be stale/consumed).
-            val session = runCatching { TruecallerAuth.init() }.getOrNull()
-            if (session == null) {
-                error = "Couldn't reach Truecaller. Try again."; tcBusy = false; return@launch
-            }
-            tcSession = session
-            if (!TruecallerAuth.isConfigured(session)) {
-                error = "Truecaller sign-in isn't available yet."; tcBusy = false; return@launch
-            }
-            if (!TruecallerAuth.launch(activity, session)) {
-                error = "Install the Truecaller app to sign in this way."; tcBusy = false; return@launch
-            }
-            when (val r = TruecallerAuth.awaitToken(session.nonce)) {
-                is TruecallerAuth.Result.Success ->
-                    runCatching { FirebaseRepo.signInWithCustomToken(r.customToken) }
-                        .onSuccess { onSignedIn() }
-                        .onFailure { error = it.message ?: "Sign-in failed"; tcBusy = false }
-                TruecallerAuth.Result.NotInstalled -> {
-                    error = "Install the Truecaller app to sign in this way."; tcBusy = false
-                }
-                TruecallerAuth.Result.Rejected -> {
-                    error = "Truecaller sign-in was cancelled."; tcBusy = false
-                }
-                is TruecallerAuth.Result.Failed -> {
-                    error = "Truecaller sign-in timed out. Try again."; tcBusy = false
-                }
-            }
-        }
-    }
 
     fun sendCode() {
         val activity = ctx as? Activity ?: return
@@ -147,21 +217,31 @@ fun LoginScreen(onSignedIn: () -> Unit) {
     }
 
     Column(
-        modifier = Modifier.fillMaxSize().imePadding().padding(24.dp),
-        verticalArrangement = Arrangement.Center,
+        modifier = Modifier
+            .fillMaxWidth()
+            .imePadding()
+            .navigationBarsPadding()
+            .padding(start = 24.dp, end = 24.dp, bottom = 28.dp, top = 4.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
-        Text("ScreenshotX", style = MaterialTheme.typography.displaySmall, fontWeight = FontWeight.Bold)
-        Spacer(Modifier.height(8.dp))
         Text(
-            if (codeSent) "Enter the 6-digit code we texted to +91 $phone."
-            else "Sign in with your phone — we'll text a 6-digit code.",
+            if (codeSent) "Enter the code" else "Sign in with your phone",
+            style = MaterialTheme.typography.titleLarge,
+            fontWeight = FontWeight.Bold,
+        )
+        Spacer(Modifier.height(6.dp))
+        Text(
+            when {
+                codeSent -> "Enter the 6-digit code we texted to +91 $phone."
+                hint != null -> hint
+                else -> "We'll text you a 6-digit code."
+            },
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             textAlign = TextAlign.Center,
         )
 
-        Spacer(Modifier.height(28.dp))
+        Spacer(Modifier.height(24.dp))
 
         if (!codeSent) {
             OutlinedTextField(
@@ -192,30 +272,6 @@ fun LoginScreen(onSignedIn: () -> Unit) {
                 TextButton(onClick = { sendCode() }) { Text("Resend code") }
                 TextButton(onClick = { codeSent = false; code = ""; error = null }) {
                     Text("Change number")
-                }
-            }
-        }
-
-        // "Login with Truecaller" — one tap = same Firebase account as phone-OTP.
-        // Only offered on the initial screen, before an SMS code is in flight.
-        if (!codeSent) {
-            Spacer(Modifier.height(20.dp))
-            if (tcBusy) {
-                CircularProgressIndicator(Modifier.size(22.dp), strokeWidth = 2.dp)
-            } else {
-                OutlinedButton(
-                    onClick = { loginWithTruecaller() },
-                    enabled = tcChecked && TruecallerAuth.isConfigured(tcSession) && !busy,
-                    modifier = Modifier.fillMaxWidth(),
-                ) { Text("Login with Truecaller") }
-                if (tcChecked && !TruecallerAuth.isConfigured(tcSession)) {
-                    Spacer(Modifier.height(6.dp))
-                    Text(
-                        "Truecaller sign-in isn't available yet.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        textAlign = TextAlign.Center,
-                    )
                 }
             }
         }
