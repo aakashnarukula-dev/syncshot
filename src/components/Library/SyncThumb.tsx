@@ -1,8 +1,13 @@
 import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
-import { Check, ImageOff, Loader2 } from "lucide-react";
-import { saveReceivedScreenshot, storageDownloadUrl } from "@/lib/sync/screenshots";
+import { Check, ImageOff, Loader2, Trash2 } from "lucide-react";
+import {
+  deleteScreenshotDoc,
+  saveReceivedScreenshot,
+  storageDownloadUrl,
+} from "@/lib/sync/screenshots";
 import type { ScreenshotDoc } from "@/lib/sync/types";
+import { useUid } from "@/stores/syncStore";
 import { cn } from "@/lib/utils";
 
 interface SyncThumbProps {
@@ -12,10 +17,12 @@ interface SyncThumbProps {
 /** A single synced screenshot tile: WebP thumb (loaded as a CSP-safe blob URL),
  *  click to download the full image + copy it to this Mac's clipboard. */
 export function SyncThumb({ item }: SyncThumbProps) {
+  const uid = useUid();
   const [src, setSrc] = useState<string | null>(null);
   const [failed, setFailed] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  const [deleting, setDeleting] = useState(false);
 
   // Render via the Storage getDownloadURL token URL as a plain <img src>. The
   // token is a capability (bypasses Storage rules + CORS), so an <img> load
@@ -67,18 +74,45 @@ export function SyncThumb({ item }: SyncThumbProps) {
 
   const uploading = item.status !== "full";
 
+  // Delete EVERYWHERE: removes the Firestore doc + Storage blobs (and any local
+  // cache copy) so the shot leaves every device and the subscription can't
+  // resync it. Also the only way to clear orphaned/corrupted docs whose preview
+  // is unavailable. The subscription drops the doc on the next snapshot, which
+  // unmounts this tile — no local list surgery needed.
+  const onDelete = async () => {
+    if (deleting || !uid) return;
+    setDeleting(true);
+    try {
+      await deleteScreenshotDoc(uid, item);
+      toast.success("Screenshot deleted", { duration: 1500 });
+    } catch (err) {
+      setDeleting(false);
+      toast.error("Failed to delete screenshot", {
+        description: err instanceof Error ? err.message : String(err),
+        duration: 4000,
+      });
+    }
+  };
+
   return (
-    <button
-      type="button"
-      onClick={onClick}
-      disabled={uploading || saving}
-      aria-label={uploading ? "Screenshot uploading" : "Save and copy screenshot"}
+    <div
       className={cn(
         "group relative block aspect-[4/3] w-full overflow-hidden rounded-lg border border-border bg-muted",
-        "transition-all hover:border-ring focus-visible:outline-none focus-visible:border-ring focus-visible:ring-ring/50 focus-visible:ring-[3px]",
-        (uploading || saving) && "cursor-default",
+        "transition-all focus-within:border-ring hover:border-ring",
+        deleting && "pointer-events-none opacity-50",
       )}
     >
+      <button
+        type="button"
+        onClick={onClick}
+        disabled={uploading || saving || deleting}
+        aria-label={uploading ? "Screenshot uploading" : "Save and copy screenshot"}
+        className={cn(
+          "block size-full",
+          "focus-visible:outline-none focus-visible:ring-ring/50 focus-visible:ring-[3px]",
+          (uploading || saving) && "cursor-default",
+        )}
+      >
       {src && !failed ? (
         <img
           src={src}
@@ -122,6 +156,26 @@ export function SyncThumb({ item }: SyncThumbProps) {
           <span className="tabular-nums">{item.width}×{item.height}</span>
         )}
       </span>
-    </button>
+      </button>
+
+      <button
+        type="button"
+        onClick={onDelete}
+        disabled={deleting || !uid}
+        aria-label="Delete screenshot"
+        title="Delete"
+        className={cn(
+          "absolute right-2 top-2 z-10 inline-flex size-7 items-center justify-center rounded-full",
+          "bg-black/55 text-white shadow-md backdrop-blur-sm transition-opacity hover:bg-red-600/90",
+          "opacity-0 group-hover:opacity-100 focus-visible:opacity-100 cursor-pointer disabled:cursor-wait",
+        )}
+      >
+        {deleting ? (
+          <Loader2 className="size-3.5 animate-spin" aria-hidden="true" />
+        ) : (
+          <Trash2 className="size-3.5" aria-hidden="true" />
+        )}
+      </button>
+    </div>
   );
 }

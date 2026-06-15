@@ -269,6 +269,27 @@ function ThumbnailItem({ path, eager = false, onEdit, onRemove }: ThumbnailItemP
   const rootRef = useRef<HTMLDivElement>(null);
   const exitingRef = useRef(false);
 
+  // Resolve a Firebase Storage token URL for this tile when its local cache
+  // file is missing or won't decode — a synced (remote) shot whose Rust
+  // download hasn't landed yet, or an orphaned doc. Firebase is dynamically
+  // imported so it never enters the startup-critical column chunk (same reason
+  // the clipboard list is lazy); the import only fires once a local load fails.
+  // The cache filename of a received shot is `{docId}.png`, so the matching
+  // synced doc (and its CSP-allowed token URL) is recoverable from the path.
+  const resolveFallbackUrl = async (): Promise<string | null> => {
+    try {
+      const { cacheDocId, storageDownloadUrl } = await import("@/lib/sync/screenshots");
+      const id = cacheDocId(path);
+      if (!id) return null;
+      const match = useSyncStore.getState().screenshots.find((s) => s.id === id);
+      const storagePath = match?.thumbPath || match?.fullPath;
+      if (!storagePath) return null;
+      return await storageDownloadUrl(storagePath);
+    } catch {
+      return null;
+    }
+  };
+
   // Windowed mounting: only items near the viewport hold a decoded bitmap, and
   // items scrolled far past it RELEASE theirs (src cleared) — otherwise a long
   // scroll through hundreds of full-res screenshots retains every decode and
@@ -338,8 +359,12 @@ function ThumbnailItem({ path, eager = false, onEdit, onRemove }: ThumbnailItemP
       .then((thumbPath) => {
         if (!cancelled) show(convertFileSrc(thumbPath));
       })
-      .catch(() => {
-        if (!cancelled) show(convertFileSrc(path));
+      .catch(async () => {
+        // No local cache file (or it won't decode) — a synced shot not yet
+        // pulled to disk, or an orphaned doc. Fall back to the Firebase token
+        // URL before giving up so the tile renders instead of showing "?".
+        const fallback = await resolveFallbackUrl();
+        if (!cancelled) show(fallback ?? convertFileSrc(path));
       });
     return () => {
       cancelled = true;
@@ -490,16 +515,24 @@ function ThumbnailItem({ path, eager = false, onEdit, onRemove }: ThumbnailItemP
             beginDrag(e.currentTarget);
           }}
           onError={() => {
-            // Cached thumbnail failed to decode/load — fall back to the
-            // original full-res file once. If that also fails, hold the
-            // shimmer rather than flashing a broken-image icon.
-            const original = convertFileSrc(path);
-            if (src !== original) {
-              setSrc(original);
-              setReady(true);
-            } else {
-              setReady(false);
-            }
+            // Current source failed to decode/load. Try in order: the Firebase
+            // token URL (covers a synced shot whose local file is missing), then
+            // the original full-res local file, then hold the shimmer rather
+            // than flashing a broken-image "?". Each branch moves to a DIFFERENT
+            // src or stops, so this can't loop.
+            void (async () => {
+              const original = convertFileSrc(path);
+              const fallback = await resolveFallbackUrl();
+              if (fallback && src !== fallback) {
+                setSrc(fallback);
+                setReady(true);
+              } else if (src !== original) {
+                setSrc(original);
+                setReady(true);
+              } else {
+                setReady(false);
+              }
+            })();
           }}
           onClick={() => {
             exitingRef.current = true;

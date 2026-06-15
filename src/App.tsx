@@ -824,6 +824,30 @@ function MainApp() {
         const isHydration = firstPass;
         firstPass = false;
 
+        // BACKFILL: on the first pass after sign-in, publish the Mac's existing
+        // local screenshot library to Firebase. Captures are otherwise only
+        // uploaded by the live `new-screenshot` publisher, so anything taken
+        // before sign-in (or before this device ever published) would never
+        // reach users/{uid}/screenshots and the Mac would show empty on other
+        // devices. publishScreenshot dedupes by sha256 so this never double-
+        // uploads; skipped while sync is paused.
+        if (isHydration && disk.length > 0) {
+          const { uid, paused } = useSyncStore.getState();
+          if (uid && !paused) {
+            void Promise.all([
+              import("@/lib/sync/screenshots"),
+              import("@/lib/sync/engine"),
+            ]).then(([{ backfillScreenshots }, { getDevice }]) => {
+              const device = getDevice();
+              if (device) {
+                return backfillScreenshots(uid, device, disk).catch((e) =>
+                  console.error("screenshot backfill failed:", e),
+                );
+              }
+            });
+          }
+        }
+
         const current = thumbsRef.current;
         const changed =
           disk.length !== current.length ||
@@ -1185,7 +1209,23 @@ function MainApp() {
 
   const handleThumbnailItemRemove = useCallback(async (path: string) => {
     const remaining = updateThumbs((prev) => prev.filter((p) => p !== path));
-    invoke("delete_file", { path }).catch(() => {});
+    // Propagate the delete to Firebase so the doc + Storage blobs are removed
+    // and the subscription doesn't resync the shot back onto this (or any
+    // other) device. deleteScreenshotByPath reads the file for its content
+    // hash, deletes the cloud doc/blobs, THEN deletes the local file — so we
+    // must NOT delete the local file first or the hash lookup races it. Signed
+    // out (no uid), there's no cloud doc; just drop the local file.
+    const { uid } = useSyncStore.getState();
+    if (uid) {
+      void import("@/lib/sync/screenshots").then(({ deleteScreenshotByPath }) =>
+        deleteScreenshotByPath(uid, path).catch((e) => {
+          console.error("cloud delete failed:", e);
+          invoke("delete_file", { path }).catch(() => {});
+        }),
+      );
+    } else {
+      invoke("delete_file", { path }).catch(() => {});
+    }
     if (remaining.length === 0) {
       try { await getCurrentWindow().hide(); } catch {}
       if (autoHideTimerRef.current) {

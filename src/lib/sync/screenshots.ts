@@ -15,6 +15,7 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import {
   collection,
+  deleteDoc,
   doc,
   getDocs,
   limit,
@@ -28,7 +29,7 @@ import {
   Timestamp,
   type DocumentData,
 } from "firebase/firestore";
-import { getDownloadURL, ref, uploadBytes } from "firebase/storage";
+import { deleteObject, getDownloadURL, ref, uploadBytes } from "firebase/storage";
 import { db, storage } from "./firebase";
 import { sha256Hex } from "./hash";
 import {
@@ -293,4 +294,154 @@ export async function saveReceivedScreenshot(
  */
 export async function storageDownloadUrl(storagePath: string): Promise<string> {
   return getDownloadURL(ref(storage, storagePath));
+}
+
+/**
+ * The pill column knows screenshots by their local CACHE PATH, not their
+ * Firestore id. A screenshot RECEIVED from another device is written to the
+ * cache as `{docId}.png` (see `saveReceivedScreenshot`), so its doc id is
+ * recoverable from the filename. Locally-captured shots use a generated
+ * filename (no embedded id) and return their basename, which simply won't
+ * match any doc id — the caller falls back to a content hash.
+ */
+export function cacheDocId(path: string): string | null {
+  const base = path.split(/[\\/]/).pop() ?? "";
+  const dot = base.lastIndexOf(".");
+  const id = dot > 0 ? base.slice(0, dot) : base;
+  return id || null;
+}
+
+/**
+ * Backfill the Mac's EXISTING local screenshot library to the cloud on sign-in.
+ *
+ * The capture-time publisher (`publishScreenshot`, wired to the `new-screenshot`
+ * event) only uploads shots taken WHILE signed in. Anything captured before the
+ * first sign-in — or before this device ever published — would otherwise never
+ * reach `users/{uid}/screenshots`, so a freshly-paired Mac shows up empty on
+ * other devices. This walks the local cache and publishes each file.
+ *
+ * Dedup + idempotency come free: `publishScreenshot` content-addresses by
+ * sha256 and no-ops (returns false) when the image is already synced, so
+ * re-running this is safe and never double-uploads. Returns the count newly
+ * published. A small concurrency pool keeps a large library from issuing
+ * hundreds of simultaneous hashes/uploads.
+ */
+export async function backfillScreenshots(
+  uid: string,
+  device: DeviceRef,
+  paths: string[],
+  concurrency = 3,
+): Promise<number> {
+  let published = 0;
+  let next = 0;
+  async function worker(): Promise<void> {
+    while (next < paths.length) {
+      const path = paths[next++];
+      try {
+        if (await publishScreenshot(uid, device, path)) published++;
+      } catch (err) {
+        console.error("backfill publish failed:", path, err);
+      }
+    }
+  }
+  const workers = Math.max(1, Math.min(concurrency, paths.length));
+  await Promise.all(Array.from({ length: workers }, () => worker()));
+  return published;
+}
+
+/**
+ * Delete a screenshot's Firestore doc and BOTH Storage blobs (thumb + full).
+ * The deterministic `users/{uid}/screenshots/{id}/{thumb.webp,full.png}` paths
+ * are deleted in addition to whatever `thumbPath`/`fullPath` the doc carried, so
+ * orphaned/corrupted docs whose fields are missing still get their blobs swept.
+ * Storage deletes are best-effort (a missing object is not an error here).
+ */
+async function deleteDocAndBlobs(
+  uid: string,
+  id: string,
+  thumbPath?: string | null,
+  fullPath?: string | null,
+): Promise<void> {
+  const blobPaths = new Set<string>([
+    `users/${uid}/screenshots/${id}/thumb.webp`,
+    `users/${uid}/screenshots/${id}/full.png`,
+  ]);
+  if (thumbPath) blobPaths.add(thumbPath);
+  if (fullPath) blobPaths.add(fullPath);
+  await Promise.all(
+    [...blobPaths].map((p) => deleteObject(ref(storage, p)).catch(() => {})),
+  );
+  await deleteDoc(doc(screenshotsCol(uid), id));
+}
+
+/** Remove the local cache copy of a synced shot (`{id}.png`), if present. */
+async function deleteLocalCacheById(id: string): Promise<void> {
+  try {
+    const dir = await invoke<string>("get_desktop_directory");
+    await invoke("delete_file", { path: `${dir}/${id}.png` });
+  } catch {
+    /* best-effort: no cache copy or dir unavailable */
+  }
+}
+
+/**
+ * Delete a screenshot KNOWN BY ITS DOC (Library grid). Removes the Firestore
+ * doc, its Storage blobs, and any local cache copy so it disappears from this
+ * device AND every other device's subscription — not just locally.
+ */
+export async function deleteScreenshotDoc(
+  uid: string,
+  item: ScreenshotDoc,
+): Promise<void> {
+  await deleteDocAndBlobs(uid, item.id, item.thumbPath, item.fullPath);
+  await deleteLocalCacheById(item.id);
+}
+
+/**
+ * Delete a screenshot KNOWN BY ITS LOCAL CACHE PATH (pill column).
+ *
+ * Resolves the matching Firestore doc(s) by content hash — robust for
+ * locally-captured shots whose filename carries no doc id — and falls back to
+ * the `{id}.png` filename convention when the file is already gone and can't be
+ * hashed. Deleting the doc + blobs (not just the local file) is what stops the
+ * subscription from re-downloading the shot on the next snapshot, so a deleted
+ * tile stays deleted. The local cache file is removed last, after it's been
+ * read for the hash.
+ */
+export async function deleteScreenshotByPath(
+  uid: string,
+  path: string,
+): Promise<void> {
+  let matched: { id: string; thumbPath?: string | null; fullPath?: string | null }[] = [];
+  try {
+    const resp = await fetch(convertFileSrc(path));
+    const buf = await resp.arrayBuffer();
+    const sha256 = await sha256Hex(buf);
+    const snap = await getDocs(
+      query(screenshotsCol(uid), where("sha256", "==", sha256)),
+    );
+    matched = snap.docs.map((d) => {
+      const data = d.data();
+      return {
+        id: d.id,
+        thumbPath: data.thumbPath ?? null,
+        fullPath: data.fullPath ?? null,
+      };
+    });
+  } catch (err) {
+    console.error("hash-based screenshot lookup failed:", err);
+  }
+
+  // File gone / never synced under a hash we can read — fall back to the
+  // doc id embedded in a received shot's `{id}.png` cache filename.
+  if (matched.length === 0) {
+    const id = cacheDocId(path);
+    if (id) matched = [{ id }];
+  }
+
+  await Promise.all(
+    matched.map((m) => deleteDocAndBlobs(uid, m.id, m.thumbPath, m.fullPath)),
+  );
+
+  await invoke("delete_file", { path }).catch(() => {});
 }
