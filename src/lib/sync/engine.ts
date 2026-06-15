@@ -16,7 +16,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { registerScreenshotLoadMore, useSyncStore } from "@/stores/syncStore";
 import { logout, watchAuth } from "./firebase";
 import { loadSyncPrefs, saveDeviceId, saveDeviceName, savePaused } from "./persistence";
-import { publishScreenshot, saveReceivedScreenshot, subscribeScreenshots } from "./screenshots";
+import { deleteLocalCacheById, publishScreenshot, saveReceivedScreenshot, subscribeScreenshots } from "./screenshots";
 import { subscribeClipboard, writeClipboardEntry } from "./clipboard";
 import type { ClipboardDoc, DeviceRef, ScreenshotDoc } from "./types";
 
@@ -32,6 +32,10 @@ let unlistenClipChanged: UnlistenFn | null = null;
 
 // Full images already pulled to disk — avoids re-saving on every snapshot.
 const savedFullIds = new Set<string>();
+// Doc ids seen in the last snapshot — lets us detect REMOVALS (a shot deleted
+// on another device, or by a cloud cleanup) and purge this Mac's stale local
+// received-cache instead of leaving an "Unavailable" ghost in the column.
+let knownScreenshotIds = new Set<string>();
 // Newest clipboard hash seen (any device) — suppresses echo when we re-copy a
 // remote entry (set_clipboard_text would otherwise bounce back via the poller).
 let recentClipHash: string | null = null;
@@ -42,6 +46,27 @@ function store() {
 
 function handleScreenshots(items: ScreenshotDoc[], hasMore: boolean): void {
   store().setScreenshots(items, hasMore);
+
+  // RECONCILE REMOVALS. The store list is full-replaced above, so the Library
+  // grid already drops a removed doc — but its local received-cache file
+  // ({id}.<ext>) would linger and the edge column (which polls the cache dir)
+  // would keep showing it as a stale / "Unavailable" ghost. Purge those files.
+  //
+  // Only act when the live window holds the WHOLE collection (!hasMore): then a
+  // previously-seen id missing from this snapshot was genuinely DELETED. While
+  // the window is capped (hasMore), a missing id may have merely scrolled past
+  // the limit, so deleting its cache would wrongly remove a still-present shot.
+  const currentIds = new Set(items.map((i) => i.id));
+  if (!hasMore) {
+    for (const id of knownScreenshotIds) {
+      if (!currentIds.has(id)) {
+        savedFullIds.delete(id);
+        void deleteLocalCacheById(id);
+      }
+    }
+  }
+  knownScreenshotIds = currentIds;
+
   for (const item of items) {
     if (
       item.status === "full" &&
@@ -69,6 +94,9 @@ function stopListeners(): void {
   registerScreenshotLoadMore(null);
   unsubClipboard?.();
   unsubClipboard = null;
+  // Drop the removal-reconcile baseline so a re-subscribe (e.g. account switch)
+  // doesn't treat the previous account's ids as "removed" on its first snapshot.
+  knownScreenshotIds = new Set();
 }
 
 function startListeners(uid: string): void {

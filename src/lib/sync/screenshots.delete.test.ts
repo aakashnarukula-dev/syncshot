@@ -42,6 +42,7 @@ vi.mock("firebase/firestore", () => ({
 import {
   backfillScreenshots,
   cacheDocId,
+  deleteLocalCacheById,
   deleteScreenshotByPath,
   deleteScreenshotDoc,
 } from "./screenshots";
@@ -148,6 +149,30 @@ describe("deleteScreenshotDoc", () => {
     expect(deleteDoc).toHaveBeenCalledTimes(1);
     expect(deleteObject).toHaveBeenCalled();
     expect(invokeMock).toHaveBeenCalledWith("delete_file", { path: "/cache/d1.png" });
+  });
+});
+
+describe("deleteLocalCacheById", () => {
+  it("tries every known image extension (the cache file isn't always .png)", async () => {
+    invokeMock.mockImplementation((cmd: string) =>
+      cmd === "get_desktop_directory" ? Promise.resolve("/cache") : Promise.resolve(undefined),
+    );
+
+    await deleteLocalCacheById("d1");
+
+    const deleted = invokeMock.mock.calls
+      .filter((c) => c[0] === "delete_file")
+      .map((c) => (c[1] as { path: string }).path);
+    // A phone JPEG is cached as {id}.jpg, not {id}.png — both must be swept.
+    expect(deleted).toContain("/cache/d1.png");
+    expect(deleted).toContain("/cache/d1.jpg");
+    expect(deleted).toContain("/cache/d1.webp");
+    expect(deleted).toContain("/cache/d1.heic");
+  });
+
+  it("swallows a missing cache dir without throwing", async () => {
+    invokeMock.mockRejectedValue(new Error("no dir"));
+    await expect(deleteLocalCacheById("d1")).resolves.toBeUndefined();
   });
 });
 

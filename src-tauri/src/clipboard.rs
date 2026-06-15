@@ -10,7 +10,9 @@ struct ClipboardChanged {
 }
 
 /// Copy an image file to the system clipboard with BOTH:
-///   - PNG image data (pastes as image into Messages, Slack, Notes, etc.)
+///   - image data tagged with the UTI SNIFFED from the bytes (pastes as image
+///     into Messages, Slack, Notes, etc. — a JPEG must NOT be tagged public.png
+///     or the receiver decodes mislabeled data / shows no preview)
 ///   - file URL (pastes as a file copy into Finder)
 #[cfg(target_os = "macos")]
 pub fn copy_image_to_clipboard(image_path: &str) -> AppResult<()> {
@@ -19,7 +21,12 @@ pub fn copy_image_to_clipboard(image_path: &str) -> AppResult<()> {
     use std::ffi::CString;
 
     let bytes = std::fs::read(image_path).map_err(|e| format!("read image: {}", e))?;
-    let c_png_type = CString::new("public.png").unwrap();
+    // Tag the pasteboard data with the REAL image type, not a hardcoded png —
+    // defaults to public.png for anything we don't recognize (legacy behavior).
+    let image_uti = crate::image::detect_image_kind(&bytes)
+        .map(|k| k.pasteboard_uti())
+        .unwrap_or("public.png");
+    let c_image_type = CString::new(image_uti).unwrap();
     let c_file_url_type = CString::new("public.file-url").unwrap();
     let file_url_str = format!("file://{}", urlencoding::encode(image_path).replace("%2F", "/"));
     let c_file_url = CString::new(file_url_str).map_err(|e| format!("url cstring: {}", e))?;
@@ -48,15 +55,15 @@ pub fn copy_image_to_clipboard(image_path: &str) -> AppResult<()> {
         let ns_file_url_string: *mut AnyObject =
             msg_send![ns_string_cls, stringWithUTF8String: c_file_url.as_ptr()];
 
-        // PNG and file-url types
-        let png_type: *mut AnyObject =
-            msg_send![ns_string_cls, stringWithUTF8String: c_png_type.as_ptr()];
+        // Image (sniffed UTI) and file-url types
+        let image_type: *mut AnyObject =
+            msg_send![ns_string_cls, stringWithUTF8String: c_image_type.as_ptr()];
         let file_url_type: *mut AnyObject =
             msg_send![ns_string_cls, stringWithUTF8String: c_file_url_type.as_ptr()];
 
         // Clear pasteboard, then write both types
         let _: i64 = msg_send![pasteboard, clearContents];
-        let _: bool = msg_send![pasteboard, setData: data, forType: png_type];
+        let _: bool = msg_send![pasteboard, setData: data, forType: image_type];
         let _: bool = msg_send![pasteboard, setString: ns_file_url_string, forType: file_url_type];
     }
 

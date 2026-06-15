@@ -436,11 +436,23 @@ async function deleteDocAndBlobs(
   await deleteDoc(doc(screenshotsCol(uid), id));
 }
 
-/** Remove the local cache copy of a synced shot (`{id}.png`), if present. */
-async function deleteLocalCacheById(id: string): Promise<void> {
+/** Image extensions a received shot may be cached under. The receive path saves
+ *  `{id}.<ext>` where the extension follows the type SNIFFED from the bytes (a
+ *  phone JPEG is no longer forced to `.png` — see Rust `persist_synced_image`),
+ *  so a delete must try every known extension. */
+const CACHE_EXTENSIONS = ["png", "jpg", "jpeg", "gif", "webp", "heic"] as const;
+
+/** Remove the local cache copy of a synced shot (`{id}.<ext>`), if present.
+ *  Tries every known image extension since the cached file's extension follows
+ *  its real, sniffed type — not always `.png`. */
+export async function deleteLocalCacheById(id: string): Promise<void> {
   try {
     const dir = await invoke<string>("get_desktop_directory");
-    await invoke("delete_file", { path: `${dir}/${id}.png` });
+    await Promise.all(
+      CACHE_EXTENSIONS.map((ext) =>
+        invoke("delete_file", { path: `${dir}/${id}.${ext}` }).catch(() => {}),
+      ),
+    );
   } catch {
     /* best-effort: no cache copy or dir unavailable */
   }

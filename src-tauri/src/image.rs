@@ -10,6 +10,81 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::utils::{ensure_dir, generate_filename, AppResult};
 
+/// A small set of raster image formats we sniff from MAGIC BYTES so a synced
+/// file is saved with the RIGHT extension and placed on the pasteboard with the
+/// RIGHT UTI — never trusting the uploader's label. Many phones (e.g. Samsung)
+/// upload JPEG bytes tagged `image/png`; written as `.png` they get no Finder
+/// thumbnail and paste as mislabeled data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageKind {
+    Png,
+    Jpeg,
+    Gif,
+    Webp,
+    Heic,
+}
+
+impl ImageKind {
+    /// File extension (no dot) for this format.
+    pub fn extension(self) -> &'static str {
+        match self {
+            ImageKind::Png => "png",
+            ImageKind::Jpeg => "jpg",
+            ImageKind::Gif => "gif",
+            ImageKind::Webp => "webp",
+            ImageKind::Heic => "heic",
+        }
+    }
+
+    /// macOS pasteboard UTI for this format (so a paste carries the correct type).
+    pub fn pasteboard_uti(self) -> &'static str {
+        match self {
+            ImageKind::Png => "public.png",
+            ImageKind::Jpeg => "public.jpeg",
+            ImageKind::Gif => "com.compuserve.gif",
+            ImageKind::Webp => "org.webmproject.webp",
+            ImageKind::Heic => "public.heic",
+        }
+    }
+}
+
+/// Detect a raster image format from its leading magic bytes. Returns None for
+/// anything unrecognized (the caller keeps its default).
+pub fn detect_image_kind(bytes: &[u8]) -> Option<ImageKind> {
+    // JPEG: FF D8 FF
+    if bytes.len() >= 3 && bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF {
+        return Some(ImageKind::Jpeg);
+    }
+    // PNG: 89 50 4E 47 0D 0A 1A 0A
+    if bytes.len() >= 8 && &bytes[..8] == b"\x89PNG\r\n\x1a\n" {
+        return Some(ImageKind::Png);
+    }
+    // GIF: "GIF87a" or "GIF89a"
+    if bytes.len() >= 6 && (&bytes[..6] == b"GIF87a" || &bytes[..6] == b"GIF89a") {
+        return Some(ImageKind::Gif);
+    }
+    // WEBP: RIFF....WEBP
+    if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return Some(ImageKind::Webp);
+    }
+    // HEIC/HEIF: ....ftyp<brand> with a known HEIF brand
+    if bytes.len() >= 12 && &bytes[4..8] == b"ftyp" {
+        let brand = &bytes[8..12];
+        if brand == b"heic"
+            || brand == b"heix"
+            || brand == b"hevc"
+            || brand == b"heim"
+            || brand == b"heis"
+            || brand == b"hevm"
+            || brand == b"hevs"
+            || brand == b"mif1"
+        {
+            return Some(ImageKind::Heic);
+        }
+    }
+    None
+}
+
 /// Region coordinates for cropping
 #[derive(Debug, Clone, Copy)]
 pub struct CropRegion {
@@ -296,6 +371,55 @@ mod tests {
             assert_eq!(region.width, 1920);
             assert_eq!(region.height, 1080);
             assert!(region.is_valid());
+        }
+    }
+
+    mod detect_image_kind {
+        use super::*;
+
+        #[test]
+        fn detects_jpeg_from_ffd8ff() {
+            let jpeg = [0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10];
+            assert_eq!(detect_image_kind(&jpeg), Some(ImageKind::Jpeg));
+            assert_eq!(ImageKind::Jpeg.extension(), "jpg");
+            assert_eq!(ImageKind::Jpeg.pasteboard_uti(), "public.jpeg");
+        }
+
+        #[test]
+        fn detects_png_signature() {
+            let png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0d";
+            assert_eq!(detect_image_kind(png), Some(ImageKind::Png));
+            assert_eq!(ImageKind::Png.extension(), "png");
+            assert_eq!(ImageKind::Png.pasteboard_uti(), "public.png");
+        }
+
+        #[test]
+        fn detects_gif() {
+            assert_eq!(detect_image_kind(b"GIF89a....."), Some(ImageKind::Gif));
+            assert_eq!(detect_image_kind(b"GIF87a....."), Some(ImageKind::Gif));
+        }
+
+        #[test]
+        fn detects_webp_riff_container() {
+            let webp = b"RIFF\x24\x00\x00\x00WEBPVP8 ";
+            assert_eq!(detect_image_kind(webp), Some(ImageKind::Webp));
+        }
+
+        #[test]
+        fn detects_heic_by_ftyp_brand() {
+            let heic = b"\x00\x00\x00\x18ftypheic";
+            assert_eq!(detect_image_kind(heic), Some(ImageKind::Heic));
+            let mif1 = b"\x00\x00\x00\x18ftypmif1";
+            assert_eq!(detect_image_kind(mif1), Some(ImageKind::Heic));
+        }
+
+        #[test]
+        fn returns_none_for_unknown_or_short() {
+            assert_eq!(detect_image_kind(b"not an image"), None);
+            assert_eq!(detect_image_kind(&[0xFF]), None);
+            assert_eq!(detect_image_kind(b""), None);
+            // A different ftyp brand (e.g. mp4) is not HEIF.
+            assert_eq!(detect_image_kind(b"\x00\x00\x00\x18ftypmp42"), None);
         }
     }
 

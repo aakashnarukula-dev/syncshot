@@ -111,13 +111,31 @@ fn safe_synced_filename(name: &str) -> Result<String, String> {
     }
 }
 
+/// Pick the cache filename for a synced image: sanitize the requested name, then
+/// force its extension to match the image type SNIFFED from the actual bytes.
+/// The receive path passes `{docId}.png` for everything, but a phone's bytes are
+/// often JPEG/WEBP/HEIC — saving under the true extension is what gives the file
+/// a real Finder/QuickLook preview. Falls back to the sanitized name when the
+/// format isn't recognized.
+fn synced_filename_for(name: &str, bytes: &[u8]) -> Result<String, String> {
+    let safe = safe_synced_filename(name)?;
+    match crate::image::detect_image_kind(bytes) {
+        Some(kind) => {
+            let mut p = PathBuf::from(&safe);
+            p.set_extension(kind.extension());
+            Ok(p.to_string_lossy().into_owned())
+        }
+        None => Ok(safe),
+    }
+}
+
 /// Persist raw image bytes into the local screenshot cache (hidden app-data dir,
 /// NOT the Desktop) and copy them to the clipboard. Returns the saved path.
 /// Shared by `save_synced_image` (bytes over IPC) and `download_synced_image`
 /// (bytes fetched in Rust).
 fn persist_synced_image(bytes: &[u8], name: &str) -> Result<String, String> {
     let dir = get_screenshotx_dir()?;
-    let filename = safe_synced_filename(name)?;
+    let filename = synced_filename_for(name, bytes)?;
     let path = PathBuf::from(&dir).join(&filename);
     fs::write(&path, bytes).map_err(|e| format!("Failed to save synced image: {}", e))?;
     let path_str = path.to_string_lossy().into_owned();
@@ -187,6 +205,29 @@ mod tests {
         let generated = safe_synced_filename("").unwrap();
         assert!(generated.starts_with("synced_"), "got: {generated}");
         assert!(generated.ends_with(".png"), "got: {generated}");
+    }
+
+    #[test]
+    fn synced_filename_uses_real_type_over_requested_extension() {
+        // Receive path always asks for `{docId}.png`; JPEG bytes must override
+        // the extension so the saved file gets a Finder preview.
+        let jpeg = [0xFF, 0xD8, 0xFF, 0xE0];
+        assert_eq!(synced_filename_for("doc123.png", &jpeg).unwrap(), "doc123.jpg");
+
+        let png = b"\x89PNG\r\n\x1a\n";
+        assert_eq!(synced_filename_for("doc123.png", png).unwrap(), "doc123.png");
+
+        let webp = b"RIFF\x24\x00\x00\x00WEBPVP8 ";
+        assert_eq!(synced_filename_for("doc123.png", webp).unwrap(), "doc123.webp");
+    }
+
+    #[test]
+    fn synced_filename_keeps_name_when_type_unknown() {
+        // Unrecognized bytes leave the (sanitized) requested name untouched.
+        assert_eq!(
+            synced_filename_for("doc123.png", b"not an image").unwrap(),
+            "doc123.png"
+        );
     }
 }
 
@@ -290,7 +331,10 @@ pub async fn list_screenshots(dir: String) -> Result<Vec<String>, String> {
             .and_then(|e| e.to_str())
             .map(|s| s.to_lowercase())
             .unwrap_or_default();
-        if !matches!(ext.as_str(), "png" | "jpg" | "jpeg") {
+        if !matches!(
+            ext.as_str(),
+            "png" | "jpg" | "jpeg" | "gif" | "webp" | "heic"
+        ) {
             continue;
         }
         let mtime = entry
