@@ -16,5 +16,15 @@ class Prefs(context: Context) {
     val deviceName: String
         get() = Build.MODEL ?: "Android"
 
+    /** High-water-mark for received-screenshot notifications: the newest
+     *  `createdAt` (epoch millis) we've already handled. -1 = not yet initialized
+     *  for this account. On the first authoritative snapshot after (re)login it's
+     *  set to the newest existing doc so the whole backlog counts as already-seen
+     *  (no notification flood); afterwards only docs newer than it notify. Cleared
+     *  on sign-out via [clear]. */
+    var screenshotHighWater: Long
+        get() = sp.getLong("ss_high_water", -1L)
+        set(v) { sp.edit().putLong("ss_high_water", v).apply() }
+
     fun clear() { sp.edit().clear().apply() }
 }

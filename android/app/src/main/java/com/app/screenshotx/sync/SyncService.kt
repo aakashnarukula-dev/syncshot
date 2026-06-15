@@ -56,7 +56,8 @@ class SyncService : Service() {
             val dao = AppDb.get(this@SyncService).screenshots()
             // All devices share one auth uid — our own docs are identified by
             // the per-install deviceId, not the uid.
-            val myDeviceId = Prefs(this@SyncService).deviceId
+            val prefs = Prefs(this@SyncService)
+            val myDeviceId = prefs.deviceId
             // The grid grows ScreenshotPaging.limit as the user scrolls; each new
             // value re-subscribes the listener at the larger page size (collectLatest
             // cancels the prior listener). The newest `limit` docs are always
@@ -82,10 +83,43 @@ class SyncService : Service() {
                             dao.pruneWithinWindow(docs.map { it.id }, docs.minOf { it.createdAt })
                         }
                     }
-                    docs.forEach { doc ->
-                        if (doc.deviceId != myDeviceId && doc.status == "full") {
-                            scope.launch { Receiver.receive(this@SyncService, doc) }
+                    // Notify only for GENUINELY-NEW shots from another device, never
+                    // the login backlog. On (re)login the listener's first snapshot
+                    // carries the ENTIRE existing history; firing a notification per
+                    // doc floods the shade. Gate on a persisted high-water-mark
+                    // (newest handled createdAt):
+                    //  - mark < 0  → not initialized yet. Seed it from the first
+                    //    AUTHORITATIVE (server, !fromCache) snapshot: the whole
+                    //    current set is pre-existing backlog, so set the mark to its
+                    //    newest createdAt (0 if the account is empty) and notify
+                    //    nothing. Cache emissions are ignored until then so a cached
+                    //    backlog can't slip through before the mark exists.
+                    //  - otherwise → notify only docs with createdAt > mark, then
+                    //    advance the mark past them. We key on createdAt + status
+                    //    "full" (NOT documentChanges ADDED): a shot is first ADDED as
+                    //    "thumb" and only later MODIFIED to "full", so an ADDED-only
+                    //    filter would fire before the full image is downloadable.
+                    //    Advancing the mark ONLY from shots we actually notified means
+                    //    a thumb seen ahead of its full (and clock-skewed peers) still
+                    //    notifies once the full arrives. Receiver's received/<sha>.png
+                    //    existence check is the final dedupe so MetadataChanges cache
+                    //    re-delivery can't re-notify the same shot.
+                    val mark = prefs.screenshotHighWater
+                    if (mark < 0L) {
+                        if (!page.fromCache) {
+                            prefs.screenshotHighWater = docs.maxOfOrNull { it.createdAt } ?: 0L
                         }
+                    } else {
+                        var newMark = mark
+                        docs.forEach { doc ->
+                            if (doc.deviceId != myDeviceId && doc.status == "full" &&
+                                doc.createdAt > mark
+                            ) {
+                                scope.launch { Receiver.receive(this@SyncService, doc) }
+                                newMark = maxOf(newMark, doc.createdAt)
+                            }
+                        }
+                        if (newMark > mark) prefs.screenshotHighWater = newMark
                     }
                 }
             }
