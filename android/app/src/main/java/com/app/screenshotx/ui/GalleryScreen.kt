@@ -1,7 +1,5 @@
 package com.app.screenshotx.ui
 
-import android.app.Activity
-import android.content.ContextWrapper
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -62,6 +60,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
@@ -77,13 +76,8 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChanged
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.unit.dp
-import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.snapshotFlow
-import androidx.core.view.WindowCompat
-import androidx.core.view.WindowInsetsCompat
-import androidx.core.view.WindowInsetsControllerCompat
 import androidx.paging.Pager
 import androidx.paging.PagingConfig
 import androidx.paging.compose.collectAsLazyPagingItems
@@ -122,10 +116,10 @@ private fun localFile(ctx: Context, sha: String): File? {
  *  thumb, then the full. Returns null only while the upload still lags (no thumb,
  *  no full, no local) — the tile shows a spinner and re-binds when the doc flips
  *  to status "thumb"/"full" (Room upsert → Paging invalidation → recompose). */
-private fun imageModel(ctx: Context, item: ScreenshotEntity, preferFull: Boolean): ImageRequest? {
+private fun imageModel(ctx: Context, item: ScreenshotEntity, local: File?, preferFull: Boolean): ImageRequest? {
     val b = ImageRequest.Builder(ctx).crossfade(true)
-    localFile(ctx, item.sha256)?.let {
-        return b.data(it).memoryCacheKey("${item.sha256}:l").diskCacheKey("${item.sha256}:l").build()
+    if (local != null) {
+        return b.data(local).memoryCacheKey("${item.sha256}:l").diskCacheKey("${item.sha256}:l").build()
     }
     val first = if (preferFull) item.fullPath else item.thumbPath
     val second = if (preferFull) item.thumbPath else item.fullPath
@@ -264,12 +258,23 @@ fun GalleryScreen(onViewerOpenChange: (Boolean) -> Unit) {
  *  resolves, so a just-captured shot never sits as a dead grey placeholder. */
 @Composable
 private fun GalleryTile(ctx: Context, item: ScreenshotEntity, onClick: () -> Unit) {
-    val model = remember(item.id, item.thumbPath, item.fullPath) {
-        imageModel(ctx, item, preferFull = false)
+    // Prefer the local file. If it isn't there yet (a synced shot still downloading,
+    // or a just-captured one mid-write), keep checking briefly so the tile switches
+    // to the local image rather than staying stuck on a slow/missing network thumb.
+    val local by produceState<File?>(
+        localFile(ctx, item.sha256), item.id, item.thumbPath, item.fullPath,
+    ) {
+        if (value == null) repeat(12) {
+            delay(500)
+            localFile(ctx, item.sha256)?.let { value = it; return@produceState }
+        }
+    }
+    val model = remember(item.id, item.thumbPath, item.fullPath, local) {
+        imageModel(ctx, item, local, preferFull = false)
     }
     // Spinner only while actively loading. Error (e.g. a 404 from a blob deleted on
     // the cloud) settles to the grey surface instead of spinning forever.
-    var loading by remember(item.id, item.thumbPath, item.fullPath) { mutableStateOf(model != null) }
+    var loading by remember(item.id, item.thumbPath, item.fullPath, local) { mutableStateOf(model != null) }
     Box(
         Modifier
             .padding(4.dp)
@@ -305,7 +310,6 @@ private fun FullScreenViewer(
     onClose: () -> Unit,
 ) {
     val ctx = LocalContext.current
-    val view = LocalView.current
     val scope = rememberCoroutineScope()
     if (items.isEmpty()) { onClose(); return }
     val pagerState = rememberPagerState(initialPage = startIndex.coerceIn(0, items.size - 1)) { items.size }
@@ -316,17 +320,6 @@ private fun FullScreenViewer(
     var confirmDelete by remember { mutableStateOf(false) }
 
     BackHandler { onClose() }
-
-    // Immersive: hide the system status/navigation bars while viewing; restore on close.
-    DisposableEffect(Unit) {
-        val window = (ctx.findActivity())?.window
-        val controller = window?.let { WindowCompat.getInsetsController(it, view) }
-        controller?.let {
-            it.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
-            it.hide(WindowInsetsCompat.Type.systemBars())
-        }
-        onDispose { controller?.show(WindowInsetsCompat.Type.systemBars()) }
-    }
 
     if (confirmDelete) AlertDialog(
         onDismissRequest = { confirmDelete = false },
@@ -363,7 +356,7 @@ private fun FullScreenViewer(
             var pan by remember(item.id) { mutableStateOf(Offset.Zero) }
             val isCurrent = page == pagerState.currentPage
             val model = remember(item.id, item.thumbPath, item.fullPath) {
-                imageModel(ctx, item, preferFull = true)
+                imageModel(ctx, item, localFile(ctx, item.sha256), preferFull = true)
             }
             AsyncImage(
                 model = model,
@@ -454,15 +447,6 @@ private fun FullScreenViewer(
             }
         }
     }
-}
-
-private fun Context.findActivity(): Activity? {
-    var c: Context? = this
-    while (c is ContextWrapper) {
-        if (c is Activity) return c
-        c = c.baseContext
-    }
-    return null
 }
 
 @Composable

@@ -62,15 +62,25 @@ class SyncService : Service() {
             // cancels the prior listener). The newest `limit` docs are always
             // included, so live captures still arrive at the top.
             ScreenshotPaging.limit.collectLatest { limit ->
-                FirebaseRepo.screenshotSnapshots(limit).collectLatest { docs ->
+                FirebaseRepo.screenshotSnapshots(limit).collectLatest { page ->
+                    val docs = page.docs
                     dao.upsertAll(docs.map { ScreenshotEntity.of(it) })
-                    // Propagate deletes from other devices: any local row inside the
-                    // snapshot's time window that the snapshot no longer carries was
-                    // deleted elsewhere. Bounded to the window so paged history past
-                    // the current page is never wiped; skipped on an empty snapshot
-                    // to avoid clearing on a transient.
-                    if (docs.isNotEmpty()) {
-                        dao.pruneWithinWindow(docs.map { it.id }, docs.minOf { it.createdAt })
+                    // Reconcile deletes ONLY from authoritative server snapshots — a
+                    // partial cache emission must never drive a delete.
+                    if (!page.fromCache) {
+                        if (docs.size < limit) {
+                            // The listener returned fewer than its page limit, so it
+                            // reached the end of the collection: `docs` is the COMPLETE
+                            // server set. Drop every other local row — this clears
+                            // bulk-deleted shots that sit past the page window (and the
+                            // whole table when everything was deleted).
+                            if (docs.isEmpty()) dao.clearSynced()
+                            else dao.keepOnly(docs.map { it.id })
+                        } else {
+                            // A full page: there may be older docs beyond it, so only
+                            // reconcile within this page's time window.
+                            dao.pruneWithinWindow(docs.map { it.id }, docs.minOf { it.createdAt })
+                        }
                     }
                     docs.forEach { doc ->
                         if (doc.deviceId != myDeviceId && doc.status == "full") {

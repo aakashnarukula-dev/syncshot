@@ -3,6 +3,8 @@ package com.app.screenshotx.data
 import android.app.Activity
 import android.content.Context
 import android.os.Build
+import com.app.screenshotx.data.db.AppDb
+import com.app.screenshotx.data.db.ScreenshotEntity
 import com.google.firebase.Firebase
 import com.google.firebase.FirebaseException
 import com.google.firebase.auth.PhoneAuthCredential
@@ -180,6 +182,34 @@ object FirebaseRepo {
         val thumbPath = "users/$uid/screenshots/$id/thumb.webp"
         val fullPath = "users/$uid/screenshots/$id/full.${type.ext}"
 
+        // Optimistic local row: the grid mirrors Room, so writing the row now (with
+        // status "local") makes the just-captured shot appear and render from its
+        // cached local file IMMEDIATELY — instead of only after the thumb finishes
+        // uploading and the Firestore doc is created. The server snapshot later
+        // upserts the same id (flipping status to thumb/full); the delete-reconcile
+        // never prunes status="local" rows, so this can't be wiped before it syncs.
+        runCatching {
+            AppDb.get(ctx).screenshots().upsertAll(
+                listOf(
+                    ScreenshotEntity(
+                        id = id,
+                        sha256 = sha,
+                        createdAt = System.currentTimeMillis(),
+                        deviceUid = uid,
+                        deviceName = Build.MODEL ?: "Android",
+                        platform = PLATFORM_ANDROID,
+                        width = thumb.width,
+                        height = thumb.height,
+                        bytes = full.size.toLong(),
+                        mime = type.mime,
+                        thumbPath = null,
+                        fullPath = null,
+                        status = "local",
+                    )
+                )
+            )
+        }
+
         storage.getReference(thumbPath)
             .putBytes(thumb.bytes, StorageMetadata.Builder().setContentType("image/webp").build())
             .await()
@@ -228,17 +258,28 @@ object FirebaseRepo {
         col("screenshots").document(id).delete().await()
     }
 
+    /** A screenshot listener emission plus whether it came from the local cache.
+     *  Deletes must only be reconciled from authoritative server snapshots
+     *  ([fromCache] = false) — a partial cache emission while a larger page is still
+     *  loading would otherwise look like "the collection shrank". */
+    data class ScreenshotPage(val docs: List<ScreenshotDoc>, val fromCache: Boolean)
+
     /** Realtime screenshot snapshots, newest first, capped at [limit]. The cap is
      *  paged: the grid grows it (SyncService re-subscribes) as the user scrolls,
      *  instead of pulling the whole history up front. Always includes the newest
      *  `limit` docs, so fresh captures still stream in at the top. Includes
      *  optimistic local writes (pending serverTimestamps estimate to ~now → top). */
-    fun screenshotSnapshots(limit: Long): Flow<List<ScreenshotDoc>> = callbackFlow {
+    fun screenshotSnapshots(limit: Long): Flow<ScreenshotPage> = callbackFlow {
         val reg = col("screenshots")
             .orderBy("createdAt", Query.Direction.DESCENDING)
             .limit(limit)
             .addSnapshotListener(MetadataChanges.INCLUDE) { snap, _ ->
-                if (snap != null) trySend(snap.documents.mapNotNull { ScreenshotDoc.from(it) })
+                if (snap != null) trySend(
+                    ScreenshotPage(
+                        snap.documents.mapNotNull { ScreenshotDoc.from(it) },
+                        snap.metadata.isFromCache,
+                    )
+                )
             }
         awaitClose { reg.remove() }
     }
