@@ -1,5 +1,5 @@
 import { lazy, Suspense, useEffect, useLayoutEffect, useRef, useState } from "react";
-import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { invoke } from "@tauri-apps/api/core";
 import { animate } from "motion";
 import { startDrag } from "@crabnebula/tauri-plugin-drag";
 import { Check, ChevronLeft, ChevronRight, ClipboardList, Copy, Image as ImageIcon, ImageOff, Link2, Loader2, Trash2 } from "lucide-react";
@@ -217,6 +217,7 @@ export function ScreenshotThumbnail({
               key={path}
               path={path}
               eager={i < EAGER_COUNT}
+              fastPaint={i === 0}
               onEdit={() => onEdit(path)}
               onRemove={() => onRemove(path)}
             />
@@ -247,6 +248,8 @@ const EAGER_COUNT = 6;
 interface ThumbnailItemProps {
   path: string;
   eager?: boolean;
+  /** The single newest (top) tile — gets the instant just-captured fast-paint. */
+  fastPaint?: boolean;
   onEdit: () => void;
   onRemove: () => void;
 }
@@ -260,6 +263,72 @@ const THUMB_MAX_PX = 512;
 // Bound both the Firebase URL resolve and the remote image load so the source
 // cascade ALWAYS reaches a terminal state (rendered or "unavailable").
 const REMOTE_TIMEOUT_MS = 8000;
+
+// Decoded-thumbnail blob cache, SHARED across every tile and persisted across
+// mount/unmount (windowed scrolling) — a path's bytes are read over IPC ONCE,
+// never on every render or re-scroll (that re-reading is what made "pictures
+// load very slowly"). The release build serves the UI from http://localhost, so
+// an `asset://` file CANNOT be CORS-loaded by the column's <img> — we instead
+// read the small native thumbnail's bytes via the read_image_bytes IPC and
+// render a SAME-ORIGIN `blob:` URL (no CORS wall, no per-tile remote round-trip).
+// LRU-bounded so the encoded bytes don't grow unbounded; an evicted URL is
+// revoked. The bound is far above the windowed mount count so a still-displayed
+// tile's URL is never revoked out from under it.
+const THUMB_BLOB_CACHE = new Map<string, string>();
+const THUMB_BLOB_INFLIGHT = new Map<string, Promise<string | null>>();
+const THUMB_BLOB_MAX = 120;
+
+function touchThumbBlob(path: string): string | undefined {
+  const url = THUMB_BLOB_CACHE.get(path);
+  if (url) {
+    THUMB_BLOB_CACHE.delete(path);
+    THUMB_BLOB_CACHE.set(path, url); // re-insert = most-recently-used
+  }
+  return url;
+}
+
+function cacheThumbBlob(path: string, url: string) {
+  THUMB_BLOB_CACHE.set(path, url);
+  while (THUMB_BLOB_CACHE.size > THUMB_BLOB_MAX) {
+    const oldest = THUMB_BLOB_CACHE.keys().next().value as string | undefined;
+    if (oldest === undefined) break;
+    const stale = THUMB_BLOB_CACHE.get(oldest);
+    THUMB_BLOB_CACHE.delete(oldest);
+    if (stale) URL.revokeObjectURL(stale);
+  }
+}
+
+// Native ~512px downscale (a cheap PNG, decodes ~50-100x faster than a multi-MB
+// screenshot) read once over IPC into a same-origin blob URL. Concurrent callers
+// for the same path COALESCE onto one in-flight read (so opening the column
+// never fires N duplicate reads for the same tile). Returns null if the source
+// file is missing/undecodable (a synced shot not yet downloaded, an orphaned
+// doc) so the caller falls through to the remote Firebase URL.
+async function loadThumbBlob(path: string): Promise<string | null> {
+  const hit = touchThumbBlob(path);
+  if (hit) return hit;
+  let inflight = THUMB_BLOB_INFLIGHT.get(path);
+  if (!inflight) {
+    inflight = (async () => {
+      try {
+        const thumbPath = await invoke<string>("get_screenshot_thumbnail", {
+          path,
+          maxPx: THUMB_MAX_PX,
+        });
+        const buf = await invoke<ArrayBuffer>("read_image_bytes", { path: thumbPath });
+        const url = URL.createObjectURL(new Blob([buf]));
+        cacheThumbBlob(path, url);
+        return url;
+      } catch {
+        return null;
+      } finally {
+        THUMB_BLOB_INFLIGHT.delete(path);
+      }
+    })();
+    THUMB_BLOB_INFLIGHT.set(path, inflight);
+  }
+  return inflight;
+}
 
 // Test-load `url` in an off-DOM <img> and resolve true only if it actually
 // decoded (false on error or after `timeoutMs`). The cascade commits a source
@@ -305,12 +374,13 @@ function withTimeout<T>(p: Promise<T>, ms: number): Promise<T | null> {
   ]);
 }
 
-function ThumbnailItem({ path, eager = false, onEdit, onRemove }: ThumbnailItemProps) {
-  // Eager (newest, top) items show the full-res original IMMEDIATELY so a fresh
-  // capture appears with zero delay, then swap to the cached thumbnail once it's
-  // decoded (the swap is invisible: same box, pre-decoded bitmap).
-  const [src, setSrc] = useState<string>(() => (eager ? convertFileSrc(path) : ""));
-  const [ready, setReady] = useState(eager);
+function ThumbnailItem({ path, eager = false, fastPaint = false, onEdit, onRemove }: ThumbnailItemProps) {
+  // The source is resolved by the cascade effect below into a same-origin blob
+  // URL (or remote Firebase URL). Starts empty (shimmer) for one tick; for the
+  // newest capture the fast-paint commits its just-written bytes almost
+  // immediately, and a cache hit commits on the first microtask.
+  const [src, setSrc] = useState<string>("");
+  const [ready, setReady] = useState(false);
   // Terminal "unavailable" state: every source (thumb, local, remote) was tried
   // and none rendered. Shows a static placeholder (still deletable) instead of
   // looping back to the shimmer.
@@ -386,18 +456,17 @@ function ThumbnailItem({ path, eager = false, onEdit, onRemove }: ThumbnailItemP
     };
   }, [eager]);
 
-  // Column preview loads a small CACHED THUMBNAIL (native-side downscale) —
-  // decoding a ~512px PNG is dramatically cheaper than a multi-MB screenshot,
-  // which is what made fast scrolling lag. The thumbnail URL is pre-decoded
-  // off-DOM (img.decode()) before swapping in, so the crossfade over the
-  // shimmer never shows a half-painted frame. All ACTIONS (edit, drag payload,
-  // share upload, delete) still use the original full-res `path`. Falls back
-  // to the original if thumbnail generation fails. No `?t=` cache-bust: thumb
-  // paths are content-keyed (path+mtime+size), so they cache across cycles
-  // and change when the file does.
+  // Source cascade — resolves a renderable, SAME-ORIGIN source as fast as
+  // possible. Local sources render as `blob:` URLs (thumbnail or just-captured
+  // bytes read over IPC), NOT `asset://`: the release build serves the UI from
+  // http://localhost, where the asset protocol refuses the column's <img> on
+  // CORS grounds, which is what left own captures on a blank "Screenshot
+  // preview" skeleton until a slow remote round-trip rescued them. All ACTIONS
+  // (edit, drag payload, share upload, delete) still use the original full-res
+  // `path`. Thumbnail blobs are cached module-wide so re-render / re-scroll
+  // never re-reads them.
   useEffect(() => {
-    // A fresh cascade run owns the terminal failure decision; clear the flag so
-    // the optimistic eager src isn't mistaken for a committed one.
+    // A fresh cascade run owns the terminal failure decision.
     committedByCascadeRef.current = false;
     if (!inView) {
       setSrc("");
@@ -406,6 +475,9 @@ function ThumbnailItem({ path, eager = false, onEdit, onRemove }: ThumbnailItemP
       return;
     }
     let cancelled = false;
+    // Transient full-res object URL for the just-captured tile; freed once the
+    // small thumbnail blob takes over.
+    let tempUrl: string | null = null;
 
     const commit = (url: string) => {
       if (cancelled) return;
@@ -415,47 +487,75 @@ function ThumbnailItem({ path, eager = false, onEdit, onRemove }: ThumbnailItemP
       setFailed(false);
     };
 
-    // Deterministic source cascade. Each step PROBES its candidate (off-DOM
-    // load) and only commits one that actually decodes, so an own-device shot
-    // shows instantly from its local file and a synced shot falls back to its
-    // bounded Firebase URL — but a doc with no valid blob anywhere ends in the
-    // terminal "unavailable" state instead of an endless shimmer or an
-    // onError ping-pong between two broken srcs.
     (async () => {
-      const local = convertFileSrc(path);
-
-      // 1. Cheap cached thumbnail (native downscale). TIME-BOUNDED: a hung Rust
-      //    call (or a missing local file → reject) returns null instead of
-      //    stranding the tile on the shimmer forever — we fall through to the
-      //    local file, then the remote URL, and ultimately the terminal state.
-      const thumbPath = await withTimeout(
-        invoke<string>("get_screenshot_thumbnail", { path, maxPx: THUMB_MAX_PX }),
-        REMOTE_TIMEOUT_MS,
-      );
-      if (cancelled) return;
-      if (thumbPath) {
-        const thumbUrl = convertFileSrc(thumbPath);
-        if (await probeImage(thumbUrl)) {
-          commit(thumbUrl);
-          return;
-        }
-      }
-      if (cancelled) return;
-
-      // 2. Original full-res local file. For own captures this is present and
-      //    paints immediately; for eager tiles it's already on-screen.
-      if (await probeImage(local)) {
-        commit(local);
+      // 0. CACHE HIT — this thumbnail blob was already read+decoded this session.
+      //    Instant, zero IPC: the fix for "pictures load very slowly" is that a
+      //    tile scrolled back into view (or re-rendered) reuses its blob instead
+      //    of re-reading full-res bytes off disk every time.
+      const cached = touchThumbBlob(path);
+      if (cached) {
+        commit(cached);
         return;
       }
-      if (cancelled) return;
 
-      // 3. Remote Firebase token URL — the reliable source for a SYNCED shot
-      //    whose local cache file won't decode in the webview (or never landed).
-      //    Probed/loaded in NO-CORS mode: the Storage bucket has no CORS config,
-      //    so a cors probe would fail exactly like the local fast-path it's meant
-      //    to rescue and leave the tile stuck on "?". Both resolve + load are
-      //    time-bounded.
+      // 1. FRESH-CAPTURE FAST PAINT (newest tile only, cache miss): the file the
+      //    capture just wrote is already on disk. read_image_bytes is a plain
+      //    fs::read (no decode/resize), so showing its bytes as a same-origin
+      //    blob is the FASTEST possible first paint — far quicker than waiting on
+      //    thumbnail generation or a remote round-trip. Swapped to the small
+      //    cached thumbnail below to release the full-res decode.
+      if (fastPaint) {
+        try {
+          const buf = await invoke<ArrayBuffer>("read_image_bytes", { path });
+          if (!cancelled) {
+            tempUrl = URL.createObjectURL(new Blob([buf]));
+            commit(tempUrl);
+          }
+        } catch {
+          // e.g. a synced shot whose local file hasn't landed — fall through.
+        }
+      }
+      if (cancelled) {
+        if (tempUrl) URL.revokeObjectURL(tempUrl);
+        return;
+      }
+
+      // 2. CACHED THUMBNAIL BLOB — the low-memory primary source for every tile.
+      //    Coalesced + cached; null if no decodable local file exists.
+      const thumbUrl = await loadThumbBlob(path);
+      if (cancelled) {
+        if (tempUrl) URL.revokeObjectURL(tempUrl);
+        return;
+      }
+      if (thumbUrl) {
+        // Pre-decode off-DOM so the swap (from the full-res fast-paint, or from
+        // the shimmer) never shows a half-painted frame.
+        await new Promise<void>((resolve) => {
+          const probe = new Image();
+          probe.onload = () => resolve();
+          probe.onerror = () => resolve();
+          probe.src = thumbUrl;
+        });
+        if (cancelled) {
+          if (tempUrl) URL.revokeObjectURL(tempUrl);
+          return;
+        }
+        commit(thumbUrl);
+        if (tempUrl) {
+          const stale = tempUrl;
+          tempUrl = null;
+          requestAnimationFrame(() => URL.revokeObjectURL(stale));
+        }
+        return;
+      }
+
+      // 3. The fast-paint already painted the own-capture full-res bytes and no
+      //    thumbnail exists — keep it shown rather than tearing it down.
+      if (tempUrl) return;
+
+      // 4. REMOTE Firebase token URL — the reliable source for a SYNCED shot
+      //    whose local cache file won't decode / never landed. NO-CORS (the
+      //    Storage bucket has no CORS config); resolve + load are time-bounded.
       const remote = await withTimeout(resolveFallbackUrl(), REMOTE_TIMEOUT_MS);
       if (cancelled) return;
       if (remote && (await probeImage(remote, REMOTE_TIMEOUT_MS, false))) {
@@ -464,8 +564,8 @@ function ThumbnailItem({ path, eager = false, onEdit, onRemove }: ThumbnailItemP
       }
       if (cancelled) return;
 
-      // 4. Exhausted every source (no local file AND remote failed/timed out) —
-      //    terminal state so the user can SEE + DELETE an orphaned/corrupted doc.
+      // 5. Exhausted every source — terminal state so the user can SEE + DELETE
+      //    an orphaned/corrupted doc instead of staring at an endless shimmer.
       setSrc("");
       setReady(false);
       setFailed(true);
@@ -473,8 +573,9 @@ function ThumbnailItem({ path, eager = false, onEdit, onRemove }: ThumbnailItemP
 
     return () => {
       cancelled = true;
+      if (tempUrl) URL.revokeObjectURL(tempUrl);
     };
-  }, [path, inView]);
+  }, [path, inView, fastPaint]);
 
   // Drag preview is generated ON DRAG START from the already-decoded <img>
   // (no extra full-res decode, no per-item temp file on mount). The temp icon
@@ -623,14 +724,13 @@ function ThumbnailItem({ path, eager = false, onEdit, onRemove }: ThumbnailItemP
         <img
           src={src}
           alt="Screenshot preview"
-          // CORS mode must match the probe that committed this src (see
-          // probeImage): a local asset:// file loads in cors mode (Tauri supplies
-          // CORS headers; also lets the drag-icon canvas read it back untainted),
-          // while a remote Firebase token URL loads with NO crossOrigin — the
-          // bucket has no CORS config, so a cors request is rejected and a synced
-          // shot would fall to "?". A plain no-cors <img> renders the token URL
-          // fine, exactly like the public share link.
-          crossOrigin={/^https?:\/\//i.test(src) ? undefined : "anonymous"}
+          // No crossOrigin on EITHER source kind. Local sources are same-origin
+          // `blob:` URLs (read via IPC; same-origin → the drag-icon canvas reads
+          // them back untainted, and there's no asset:// CORS wall to hit on the
+          // release localhost origin). Remote Firebase token URLs load no-CORS —
+          // the Storage bucket has no CORS config, so a crossOrigin request would
+          // be rejected; a plain <img> renders the token URL fine, like the
+          // public share link.
           decoding="async"
           className={`relative block h-full w-full object-cover select-none rounded-md cursor-pointer transition-opacity duration-200 ${
             ready ? "opacity-100" : "opacity-0"
@@ -641,15 +741,11 @@ function ThumbnailItem({ path, eager = false, onEdit, onRemove }: ThumbnailItemP
             beginDrag(e.currentTarget);
           }}
           onError={() => {
-            // Two very different on-DOM failures:
-            //  • A cascade-COMMITTED src (already probed-good off-DOM) failing —
-            //    e.g. cache eviction between probe and paint. Terminal: looping
-            //    back through the cascade would risk a local↔remote ping-pong.
-            //  • The OPTIMISTIC eager src (the raw local file shown pre-probe so
-            //    a fresh own-capture appears instantly) 404-ing because a SYNCED
-            //    shot's local copy hasn't downloaded yet. The cascade is still in
-            //    flight resolving the thumbnail/local/remote source, so stay on
-            //    the SHIMMER and let it finish — do NOT flash "Unavailable".
+            // Only a cascade-COMMITTED src (a blob the cascade vetted, or a
+            // probed-good remote URL) reaching the live <img> broken is terminal
+            // — e.g. an evicted/revoked blob. While the cascade is still in
+            // flight (nothing committed) stay on the SHIMMER and let it finish;
+            // never flash "Unavailable".
             setReady(false);
             if (committedByCascadeRef.current) setFailed(true);
           }}

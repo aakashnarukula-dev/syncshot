@@ -549,10 +549,10 @@ function MainApp() {
     setOpenSignal((n) => n + 1);
   }, [setColumnViewBoth]);
 
-  // Idle-based auto-hide: restarts a 5s countdown on every pointer signal. There
+  // Idle-based auto-hide: restarts a 10s countdown on every pointer signal. There
   // is NO sticky "hovering" flag — a flag wedges open forever if a mouseleave is
   // missed (e.g. the window moves out from under a stationary cursor on open).
-  // Instead, any activity re-arms the timer, and 5s of no activity collapses it.
+  // Instead, any activity re-arms the timer, and 10s of no activity collapses it.
   const startAutoHide = useCallback(() => {
     if (autoHideTimerRef.current) clearTimeout(autoHideTimerRef.current);
     autoHideTimerRef.current = null;
@@ -595,7 +595,7 @@ function MainApp() {
       // Play the slide-out animation (same as the manual collapse button)
       // rather than snapping straight to the collapsed pill.
       setCollapseSignal((n) => n + 1);
-    }, 5_000);
+    }, 10_000);
   }, []);
 
   const pauseAutoHide = useCallback(() => {
