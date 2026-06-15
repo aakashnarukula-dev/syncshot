@@ -265,13 +265,22 @@ const REMOTE_TIMEOUT_MS = 8000;
 // decoded (false on error or after `timeoutMs`). The cascade commits a source
 // ONLY after it probes good, so the on-DOM <img> then loads it straight from
 // cache — and we never ping-pong between broken srcs via the <img> onError.
-// crossOrigin must match the displayed <img crossOrigin="anonymous"> so the
-// probed response is cached in CORS mode (a no-cors probe vs cors <img> makes
-// WKWebView reject the cached opaque response and paint a broken "?" instead).
-function probeImage(url: string, timeoutMs?: number): Promise<boolean> {
+//
+// `cors` MUST match the displayed <img>'s crossOrigin mode for the SAME src, or
+// WKWebView serves the probe's cached response in the wrong mode and paints a
+// broken "?". The two modes map to the two source kinds:
+//   • LOCAL  asset:// files → cors=true  (Tauri's asset protocol returns CORS
+//     headers; the cors-cached bitmap is also what lets the drag-icon canvas
+//     export read it back without tainting).
+//   • REMOTE Firebase URLs  → cors=false (the Storage bucket has NO CORS config
+//     — by design; synced bytes are fetched in Rust — so a crossOrigin probe
+//     is rejected and the image never loads, which is exactly what stranded a
+//     synced shot on "?"; a plain no-cors <img> loads the token URL fine, just
+//     like the public share link).
+function probeImage(url: string, timeoutMs?: number, cors = true): Promise<boolean> {
   return new Promise((resolve) => {
     const img = new Image();
-    img.crossOrigin = "anonymous";
+    if (cors) img.crossOrigin = "anonymous";
     let settled = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const finish = (ok: boolean) => {
@@ -428,11 +437,15 @@ function ThumbnailItem({ path, eager = false, onEdit, onRemove }: ThumbnailItemP
       }
       if (cancelled) return;
 
-      // 3. Remote Firebase token URL — a synced shot whose bytes never landed.
-      //    Both the resolve and the load are time-bounded.
+      // 3. Remote Firebase token URL — the reliable source for a SYNCED shot
+      //    whose local cache file won't decode in the webview (or never landed).
+      //    Probed/loaded in NO-CORS mode: the Storage bucket has no CORS config,
+      //    so a cors probe would fail exactly like the local fast-path it's meant
+      //    to rescue and leave the tile stuck on "?". Both resolve + load are
+      //    time-bounded.
       const remote = await withTimeout(resolveFallbackUrl(), REMOTE_TIMEOUT_MS);
       if (cancelled) return;
-      if (remote && (await probeImage(remote, REMOTE_TIMEOUT_MS))) {
+      if (remote && (await probeImage(remote, REMOTE_TIMEOUT_MS, false))) {
         commit(remote);
         return;
       }
@@ -597,7 +610,14 @@ function ThumbnailItem({ path, eager = false, onEdit, onRemove }: ThumbnailItemP
         <img
           src={src}
           alt="Screenshot preview"
-          crossOrigin="anonymous"
+          // CORS mode must match the probe that committed this src (see
+          // probeImage): a local asset:// file loads in cors mode (Tauri supplies
+          // CORS headers; also lets the drag-icon canvas read it back untainted),
+          // while a remote Firebase token URL loads with NO crossOrigin — the
+          // bucket has no CORS config, so a cors request is rejected and a synced
+          // shot would fall to "?". A plain no-cors <img> renders the token URL
+          // fine, exactly like the public share link.
+          crossOrigin={/^https?:\/\//i.test(src) ? undefined : "anonymous"}
           decoding="async"
           className={`relative block h-full w-full object-cover select-none rounded-md cursor-pointer transition-opacity duration-200 ${
             ready ? "opacity-100" : "opacity-0"
