@@ -147,6 +147,28 @@ export function loadMoreScreenshots(): void {
   loadMoreScreenshotsImpl?.();
 }
 
+// The publisher renames an own-capture cache file to carry its doc id
+// (`shot_{ts}.png` -> `{docId}.png`) so the pill column's local file resolves
+// its cloud doc by filename. The column's path list lives in App state, not the
+// store, so App registers a swapper here and the publisher (lib/sync) calls it —
+// keeping the column path in sync WITHOUT the save-dir poll mistaking the rename
+// for a brand-new shot (which would re-surface the window + re-copy the
+// clipboard). Kept OUT of reactive state: it's a one-shot side effect, not data.
+let renameCapturePathImpl: ((from: string, to: string) => void) | null = null;
+
+/** App: register (or clear, on unmount) the pill column's path swapper. */
+export function registerRenameCapturePath(
+  fn: ((from: string, to: string) => void) | null,
+): void {
+  renameCapturePathImpl = fn;
+}
+
+/** Publisher: swap a renamed capture's path in the live pill column. No-op until
+ *  the column has registered its swapper. */
+export function renameCapturePath(from: string, to: string): void {
+  renameCapturePathImpl?.(from, to);
+}
+
 // Selector hooks (stable, minimal re-renders).
 export const useAuthState = () => useSyncStore((s) => s.authState);
 export const useAccountEmail = () => useSyncStore((s) => s.email);

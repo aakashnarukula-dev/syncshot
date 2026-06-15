@@ -18,7 +18,7 @@ use commands::{
     get_screenshot_thumbnail, get_temp_directory,
     list_screenshots, native_capture_fullscreen, native_capture_interactive,
     native_capture_window, open_editor_window, play_screenshot_sound, save_edited_image,
-    save_native_screenshot, save_synced_image, set_clipboard_text,
+    rename_screenshot_to_doc_id, save_native_screenshot, save_synced_image, set_clipboard_text,
 };
 use auth::{browser_auth_listen, close_auth_window};
 use license::{get_machine_id, keychain_delete, keychain_get, keychain_set};
@@ -270,6 +270,7 @@ pub fn run() {
             native_capture_window,
             play_screenshot_sound,
             save_synced_image,
+            rename_screenshot_to_doc_id,
             download_synced_image,
             set_clipboard_text,
             get_mouse_position,

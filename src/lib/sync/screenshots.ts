@@ -30,7 +30,7 @@ import {
   type DocumentData,
 } from "firebase/firestore";
 import { deleteObject, getDownloadURL, ref, uploadBytes } from "firebase/storage";
-import { useSyncStore } from "@/stores/syncStore";
+import { renameCapturePath, useSyncStore } from "@/stores/syncStore";
 import { db, storage } from "./firebase";
 import { sha256Hex } from "./hash";
 import {
@@ -203,6 +203,40 @@ async function makeThumb(
 }
 
 /**
+ * Adopt the doc-id filename for a locally-captured cache file: rename its
+ * on-disk file IN PLACE from the capture name (`shot_{ts}.png`, no embedded id)
+ * to `{docId}.png`, then swap the pill column's path reference to match.
+ *
+ * This is the real fix for own-device captures showing "Unavailable" / their
+ * copy-link copying nothing. The pill column renders LOCAL cache files; a
+ * RECEIVED shot is cached as `{docId}.png`, so the tile resolves its backing
+ * cloud doc straight from the filename (`cacheDocId` -> `findDocForCachePath`)
+ * and the render fallback / copy-link doc lookup / tap-open all work. An own
+ * capture was stuck as `shot_{ts}.png` (no id), so those recovery paths had
+ * nothing to resolve. Giving it the SAME `{docId}.png` name closes the gap.
+ *
+ * We RENAME rather than write a SECOND `{docId}.png` (the naive "obvious fix"):
+ * the column polls the cache dir, so two files for one capture would DOUBLE the
+ * tile. The path swap keeps the live column consistent without the poll
+ * mistaking the rename for a brand-new shot. Best-effort: returns the new path,
+ * or the original if the rename is a no-op / fails (the path->docId map below
+ * still backs the cloud fallback). The bytes are NOT re-read — a rename reuses
+ * the file already on disk.
+ */
+async function adoptDocIdFilename(path: string, docId: string): Promise<string> {
+  let newPath = path;
+  try {
+    newPath = await invoke<string>("rename_screenshot_to_doc_id", { path, docId });
+  } catch (err) {
+    console.error("adopt doc-id cache filename failed:", path, err);
+    newPath = path;
+  }
+  if (newPath !== path) renameCapturePath(path, newPath);
+  useSyncStore.getState().mapLocalCapture(newPath, docId);
+  return newPath;
+}
+
+/**
  * Publish a locally-captured screenshot file at `path` to the library.
  * No-op (returns false) if an identical image (same sha256) already exists.
  */
@@ -221,9 +255,10 @@ export async function publishScreenshot(
     query(screenshotsCol(uid), where("sha256", "==", sha256), limit(1)),
   );
   if (!dupes.empty) {
-    // Already synced (e.g. backfill re-run): still remember this capture's doc id
-    // so the tile/open-handler can reach its cloud copy if the local file fails.
-    useSyncStore.getState().mapLocalCapture(path, dupes.docs[0].id);
+    // Already synced (e.g. backfill re-run): adopt the doc-id cache filename so
+    // this own capture resolves its cloud copy by filename, exactly like a
+    // received shot (and swap the column path to the renamed file).
+    await adoptDocIdFilename(path, dupes.docs[0].id);
     return false;
   }
 
@@ -232,9 +267,10 @@ export async function publishScreenshot(
   // Allocate the doc id up front so the Storage path can use it.
   const docRef = doc(screenshotsCol(uid));
   const id = docRef.id;
-  // Remember capture-path → doc id so an own-device shot whose local file won't
-  // load can fall back to its cloud thumb/full (own captures are cached as
-  // `shot_{ts}.png` with no embedded id — see syncStore.localCaptureDocIds).
+  // Remember capture-path → doc id immediately so the tile/open-handler can
+  // reach the cloud copy during the upload window, before the on-disk file is
+  // renamed below (own captures are cached as `shot_{ts}.png` with no embedded
+  // id — see syncStore.localCaptureDocIds).
   useSyncStore.getState().mapLocalCapture(path, id);
 
   const thumbRef = ref(storage, `users/${uid}/screenshots/${id}/thumb.webp`);
@@ -261,6 +297,15 @@ export async function publishScreenshot(
     fullPath: fullRef.fullPath,
     bytes: blob.size,
   });
+
+  // Adopt the doc-id cache filename (`shot_{ts}.png` → `{docId}.png`) so the
+  // pill column's local file carries the id: tap-open / copy-link / the render
+  // fallback all resolve the cloud doc straight from the filename. Done AFTER
+  // the doc is created (not at capture time): the renamed file matches
+  // RECEIVED_CACHE_ID and so becomes subject to reconcileLocalCache — renaming
+  // before the doc exists on the server could let a reconcile snapshot whose
+  // keep-set lacks this fresh id delete the just-captured file.
+  await adoptDocIdFilename(path, id);
 
   return true;
 }
@@ -579,12 +624,15 @@ export async function deleteLocalCacheById(id: string): Promise<void> {
 }
 
 /**
- * A RECEIVED shot's cache file is named `{firestoreDocId}.<ext>`, and a Firestore
- * auto id is exactly 20 chars of [A-Za-z0-9] — no separators. Own-device captures
- * (and every other locally-generated file: `shot_…`, `screenshot_…`, `region_…`,
- * `screenshotx_…`, `synced_…`) always carry an underscore, so this pattern
- * matches ONLY received-shot cache files and never a local capture. The full-set
- * reconcile uses it to avoid ever deleting a local-origin file.
+ * A SYNCED shot's cache file is named `{firestoreDocId}.<ext>`, and a Firestore
+ * auto id is exactly 20 chars of [A-Za-z0-9] — no separators. This matches BOTH
+ * a received shot AND a published own-device capture, which is renamed from its
+ * capture name to `{docId}.<ext>` once it has a backing cloud doc (see
+ * `adoptDocIdFilename`). An UNpublished local file — `shot_…` straight from
+ * capture, plus `screenshot_…`, `region_…`, `screenshotx_…`, `synced_…` — always
+ * carries an underscore, so it never matches. The full-set reconcile uses this to
+ * delete only files that DO have a cloud doc (and so should follow a cloud
+ * delete), never an unpublished local-only capture.
  */
 const RECEIVED_CACHE_ID = /^[A-Za-z0-9]{20}$/;
 
@@ -594,10 +642,12 @@ const RECEIVED_CACHE_ID = /^[A-Za-z0-9]{20}$/;
  * The per-snapshot reconcile only knew the ids it had SEEN in this session, so a
  * bulk cloud delete left ghost tiles for received shots cached in a PRIOR session
  * (or that had never paged into the live window). This sweeps the actual cache
- * directory: every received-shot file (`{docId}.<ext>`) whose doc id is absent
+ * directory: every synced-shot file (`{docId}.<ext>`) whose doc id is absent
  * from `keepIds` is gone from the server and its local copy is deleted, so the
- * edge rail (which polls the cache dir) drops it. Only received-shot files are
- * touched (see RECEIVED_CACHE_ID) — local captures are never removed.
+ * edge rail (which polls the cache dir) drops it. Files carrying a cloud doc id
+ * are touched (see RECEIVED_CACHE_ID) — received shots AND published own captures
+ * (renamed to `{docId}.<ext>`), so a deleted own shot also drops; an UNpublished
+ * local capture (`shot_…`) is never removed.
  *
  * MUST be called only with the set from an AUTHORITATIVE, COMPLETE server
  * snapshot (not Firestore's local cache, and not a capped/`hasMore` window), or

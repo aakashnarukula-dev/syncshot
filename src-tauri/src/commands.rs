@@ -90,6 +90,47 @@ pub async fn save_synced_image(bytes: Vec<u8>, name: String) -> Result<String, S
     persist_synced_image(&bytes, &name)
 }
 
+/// Rename a locally-captured screenshot cache file so it carries its Firestore
+/// doc id (`{docId}.<ext>`, SAME directory, extension preserved). Captures land
+/// as `shot_{ts}.png` (no embedded id); once published we adopt the doc-id name
+/// so the pill column's local file resolves its cloud doc straight from the
+/// filename (`cacheDocId`) — copy-link, the render fallback and tap-open all
+/// work. We RENAME (not copy) so there is exactly ONE cache file: a second
+/// `{docId}.png` alongside `shot_{ts}.png` would double the tile, since the
+/// column polls the cache dir. Idempotent: a file already named `{docId}.<ext>`
+/// is returned unchanged. Returns the new absolute path.
+#[tauri::command]
+pub async fn rename_screenshot_to_doc_id(path: String, doc_id: String) -> Result<String, String> {
+    let src = PathBuf::from(&path);
+    if !src.exists() {
+        return Err(format!("Screenshot file not found: {}", path));
+    }
+    // Defensive: a Firestore auto id is already [A-Za-z0-9], but strip anything
+    // else so the doc id can never escape the cache dir via the filename.
+    let stem: String = doc_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    if stem.is_empty() {
+        return Err("Invalid doc id for cache filename".to_string());
+    }
+    let ext = src
+        .extension()
+        .and_then(|e| e.to_str())
+        .filter(|e| !e.is_empty())
+        .unwrap_or("png")
+        .to_string();
+    let dir = src
+        .parent()
+        .ok_or_else(|| "Screenshot path has no parent directory".to_string())?;
+    let dest = dir.join(format!("{}.{}", stem, ext));
+    if dest == src {
+        return Ok(path);
+    }
+    fs::rename(&src, &dest).map_err(|e| format!("Failed to rename screenshot: {}", e))?;
+    Ok(dest.to_string_lossy().into_owned())
+}
+
 /// Sanitize a supplied name into a safe filename for the local cache; fall back
 /// to a generated one if it sanitizes to empty. Pure (no I/O) so it can be unit
 /// tested without touching the filesystem or clipboard.

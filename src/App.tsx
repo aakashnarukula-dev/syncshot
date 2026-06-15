@@ -12,7 +12,7 @@ import { editorActions } from "@/stores/editorStore";
 import { loadLicenseStatus, type LicenseStatus } from "@/lib/license";
 import { Paywall } from "@/components/Paywall";
 // Light module (zustand + types only — no Firebase): safe in the entry chunk.
-import { useSyncStore } from "@/stores/syncStore";
+import { registerRenameCapturePath, useSyncStore } from "@/stores/syncStore";
 // Startup-critical: static import so it ships in the entry chunk and never
 // needs a runtime protocol fetch that can stall behind the launch IPC burst.
 import { ScreenshotThumbnail } from "./components/ScreenshotThumbnail";
@@ -519,6 +519,20 @@ function MainApp() {
     setThumbs(next);
     return next;
   }, []);
+
+  // The capture publisher renames an own-capture cache file to carry its doc id
+  // (`shot_{ts}.png` → `{docId}.png`) so the tile resolves its cloud doc by
+  // filename. Swap the column's path in place when that happens — the save-dir
+  // poll is the authoritative source of `thumbs`, so doing this keeps the
+  // visible tile pointing at the renamed file and stops the poll from treating
+  // the rename as a brand-new shot (which would re-surface the window + re-copy
+  // the clipboard).
+  useEffect(() => {
+    registerRenameCapturePath((from, to) =>
+      updateThumbs((prev) => prev.map((p) => (p === from ? to : p))),
+    );
+    return () => registerRenameCapturePath(null);
+  }, [updateThumbs]);
 
   // Show the column, then trigger its open animation (now that it's visible).
   // Fresh reveals (capture / synced-in shot / dock click) always land on the
