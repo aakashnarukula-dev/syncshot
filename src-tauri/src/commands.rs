@@ -426,6 +426,35 @@ pub async fn get_screenshot_thumbnail(
     Ok(tauri::ipc::Response::new(bytes))
 }
 
+/// Return a LOCAL file's raw, FULL-RES bytes as `tauri::ipc::Response` (the
+/// frontend receives an ArrayBuffer, not a JSON number array).
+///
+/// Why this exists: the release webview's `http://localhost:38217` origin
+/// CANNOT CORS-load an `asset://` path, so the sync layer's old
+/// `fetch(convertFileSrc(path))` REJECTS for local cache files in release —
+/// breaking own-capture upload, the share-link button, and local-file probing.
+/// Reading the bytes in Rust and handing them back over IPC is origin-
+/// independent: it works in `tauri dev` AND the release localhost build. The
+/// frontend wraps these bytes in a `Blob` and hashes/uploads exactly as before.
+#[tauri::command]
+pub async fn read_image_bytes(path: String) -> Result<tauri::ipc::Response, String> {
+    let bytes = tauri::async_runtime::spawn_blocking(move || {
+        std::fs::read(&path).map_err(|e| format!("Failed to read {}: {}", path, e))
+    })
+    .await
+    .map_err(|e| format!("Read task failed: {}", e))??;
+    Ok(tauri::ipc::Response::new(bytes))
+}
+
+/// Cheap existence probe for a LOCAL file path. Used by the sync layer to ask
+/// "is the local cache file still present?" without a CORS `asset://` fetch
+/// (which always fails from the release localhost origin) and without reading
+/// the whole file's bytes. Returns false on a missing file or any stat error.
+#[tauri::command]
+pub fn file_exists(path: String) -> bool {
+    std::path::Path::new(&path).is_file()
+}
+
 /// Check if screencapture is already running
 fn is_screencapture_running() -> bool {
     let output = Command::new("pgrep")
