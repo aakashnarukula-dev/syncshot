@@ -124,9 +124,20 @@ private fun imageModel(ctx: Context, item: ScreenshotEntity, local: File?, prefe
     val first = if (preferFull) item.fullPath else item.thumbPath
     val second = if (preferFull) item.thumbPath else item.fullPath
     val suffix = if (preferFull) ":f" else ":t"
-    if (!first.isNullOrBlank())
-        return b.data(FirebaseRepo.storageRef(first)).memoryCacheKey("${item.sha256}$suffix")
-            .diskCacheKey("${item.sha256}$suffix").build()
+    if (!first.isNullOrBlank()) {
+        val rb = b.data(FirebaseRepo.storageRef(first)).memoryCacheKey("${item.sha256}$suffix")
+            .diskCacheKey("${item.sha256}$suffix")
+        // Viewer (preferFull) requests the full image, which isn't cached yet when
+        // there's no local file → it would download over a black screen. Point it at
+        // the thumb the grid tile already cached so it paints instantly (upscaled for
+        // a split second) and crossfades to full. Falls back to the ":any" key the
+        // grid uses when a shot only has a full (no thumb) blob.
+        if (preferFull) {
+            val ph = if (!item.thumbPath.isNullOrBlank()) "${item.sha256}:t" else "${item.sha256}:any"
+            rb.placeholderMemoryCacheKey(ph)
+        }
+        return rb.build()
+    }
     if (!second.isNullOrBlank())
         return b.data(FirebaseRepo.storageRef(second)).memoryCacheKey("${item.sha256}:any")
             .diskCacheKey("${item.sha256}:any").build()
