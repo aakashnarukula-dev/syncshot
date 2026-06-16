@@ -404,16 +404,26 @@ pub async fn get_temp_directory() -> Result<String, String> {
         .ok_or_else(|| "Failed to convert temp directory path to string".to_string())
 }
 
-/// Return a cached, downscaled thumbnail path for the screenshot at `path`.
-/// Decode/resize/encode runs on a blocking thread so fast scrolling (many
-/// concurrent calls) never stalls the async runtime.
+/// Return a cached, downscaled thumbnail of the screenshot at `path` as raw PNG
+/// BYTES (via `tauri::ipc::Response`, so the frontend receives an ArrayBuffer —
+/// not a JSON number array). Decode/resize/encode runs on a blocking thread so
+/// fast scrolling (many concurrent calls) never stalls the async runtime.
+///
+/// Returns BYTES, not a file path, on purpose: the release webview's
+/// `http://localhost:38217` origin cannot CORS-load an `asset://` path, so the
+/// frontend builds a same-origin `blob:` URL from these bytes (works in dev AND
+/// release). The on-disk thumbnail cache is still reused under the hood.
 #[tauri::command]
-pub async fn get_screenshot_thumbnail(path: String, max_px: u32) -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        crate::image::screenshot_thumbnail(&path, max_px)
+pub async fn get_screenshot_thumbnail(
+    path: String,
+    max_px: u32,
+) -> Result<tauri::ipc::Response, String> {
+    let bytes = tauri::async_runtime::spawn_blocking(move || {
+        crate::image::screenshot_thumbnail_bytes(&path, max_px)
     })
     .await
-    .map_err(|e| format!("Thumbnail task failed: {}", e))?
+    .map_err(|e| format!("Thumbnail task failed: {}", e))??;
+    Ok(tauri::ipc::Response::new(bytes))
 }
 
 /// Check if screencapture is already running
