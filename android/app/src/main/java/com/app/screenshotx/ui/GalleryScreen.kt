@@ -116,8 +116,19 @@ private fun localFile(ctx: Context, sha: String): File? {
  *  thumb, then the full. Returns null only while the upload still lags (no thumb,
  *  no full, no local) — the tile shows a spinner and re-binds when the doc flips
  *  to status "thumb"/"full" (Room upsert → Paging invalidation → recompose). */
-private fun imageModel(ctx: Context, item: ScreenshotEntity, local: File?, preferFull: Boolean): ImageRequest? {
+private fun imageModel(
+    ctx: Context,
+    item: ScreenshotEntity,
+    local: File?,
+    preferFull: Boolean,
+    thumbOnly: Boolean = false,
+    targetSizePx: Int? = null,
+): ImageRequest? {
     val b = ImageRequest.Builder(ctx).crossfade(true)
+    // Grid cells are tiny; cap the decode so Coil never builds a full-res bitmap
+    // for a thumbnail (saves memory + decode time). Viewer leaves this null for
+    // full resolution so pinch-zoom stays sharp.
+    if (targetSizePx != null) b.size(targetSizePx)
     if (local != null) {
         return b.data(local).memoryCacheKey("${item.sha256}:l").diskCacheKey("${item.sha256}:l").build()
     }
@@ -138,6 +149,11 @@ private fun imageModel(ctx: Context, item: ScreenshotEntity, local: File?, prefe
         }
         return rb.build()
     }
+    // Grid tiles must NEVER download the full image (up to 64MB) into a small cell.
+    // If there's no thumb (and no local file) yet, return null so the tile stays a
+    // placeholder and re-binds once the thumb blob lands (doc flips → Paging
+    // invalidation → recompose), instead of pulling the full PNG over the network.
+    if (thumbOnly) return null
     if (!second.isNullOrBlank())
         return b.data(FirebaseRepo.storageRef(second)).memoryCacheKey("${item.sha256}:any")
             .diskCacheKey("${item.sha256}:any").build()
@@ -281,7 +297,8 @@ private fun GalleryTile(ctx: Context, item: ScreenshotEntity, onClick: () -> Uni
         }
     }
     val model = remember(item.id, item.thumbPath, item.fullPath, local) {
-        imageModel(ctx, item, local, preferFull = false)
+        // Grid: thumb (or local) only — never the full image — decoded small.
+        imageModel(ctx, item, local, preferFull = false, thumbOnly = true, targetSizePx = 384)
     }
     // Spinner only while actively loading. Error (e.g. a 404 from a blob deleted on
     // the cloud) settles to the grey surface instead of spinning forever.
