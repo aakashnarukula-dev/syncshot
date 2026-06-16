@@ -267,6 +267,19 @@ pub fn screenshot_thumbnail(source_path: &str, max_px: u32) -> AppResult<String>
     Ok(thumb_path.to_string_lossy().into_owned())
 }
 
+/// Like `screenshot_thumbnail`, but returns the thumbnail's PNG BYTES rather than
+/// its on-disk path. The frontend builds a same-origin `blob:` URL from these
+/// bytes instead of an `asset://` URL: in the RELEASE build the webview origin is
+/// `http://localhost:38217`, which CANNOT CORS-load the `asset://` protocol, so a
+/// path-based `<img src>` never paints (the bug this fixes). A `blob:` URL is
+/// same-origin and renders regardless of webview origin (dev `tauri://` AND
+/// release `http://localhost`). Reuses the on-disk thumbnail cache, so repeated
+/// calls for the same file still avoid re-decoding.
+pub fn screenshot_thumbnail_bytes(source_path: &str, max_px: u32) -> AppResult<Vec<u8>> {
+    let thumb_path = screenshot_thumbnail(source_path, max_px)?;
+    fs::read(&thumb_path).map_err(|e| format!("Failed to read thumbnail bytes: {}", e))
+}
+
 /// Copy a screenshot file to a destination directory
 pub fn copy_screenshot_to_dir(source_path: &str, save_dir: &str) -> AppResult<String> {
     let src_path = PathBuf::from(source_path);

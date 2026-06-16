@@ -268,10 +268,13 @@ const REMOTE_TIMEOUT_MS = 8000;
 //
 // `cors` MUST match the displayed <img>'s crossOrigin mode for the SAME src, or
 // WKWebView serves the probe's cached response in the wrong mode and paints a
-// broken "?". The two modes map to the two source kinds:
+// broken "?". The modes map to the source kinds:
+//   • OWN CAPTURE blob: thumbnail bytes → cors=false (a blob URL is same-origin;
+//     this is the origin-independent PRIMARY load that renders in the release
+//     `http://localhost` webview, which can't CORS-load asset://).
 //   • LOCAL  asset:// files → cors=true  (Tauri's asset protocol returns CORS
 //     headers; the cors-cached bitmap is also what lets the drag-icon canvas
-//     export read it back without tainting).
+//     export read it back without tainting). Fallback only — blocked in release.
 //   • REMOTE Firebase URLs  → cors=false (the Storage bucket has NO CORS config
 //     — by design; synced bytes are fetched in Rust — so a crossOrigin probe
 //     is rejected and the image never loads, which is exactly what stranded a
@@ -388,13 +391,17 @@ function ThumbnailItem({ path, eager = false, onEdit, onRemove }: ThumbnailItemP
 
   // Column preview loads a small CACHED THUMBNAIL (native-side downscale) —
   // decoding a ~512px PNG is dramatically cheaper than a multi-MB screenshot,
-  // which is what made fast scrolling lag. The thumbnail URL is pre-decoded
-  // off-DOM (img.decode()) before swapping in, so the crossfade over the
-  // shimmer never shows a half-painted frame. All ACTIONS (edit, drag payload,
-  // share upload, delete) still use the original full-res `path`. Falls back
-  // to the original if thumbnail generation fails. No `?t=` cache-bust: thumb
-  // paths are content-keyed (path+mtime+size), so they cache across cycles
-  // and change when the file does.
+  // which is what made fast scrolling lag. The thumbnail BYTES come back over
+  // IPC and are wrapped in a same-origin `blob:` URL (NOT `asset://`): in the
+  // RELEASE build the webview origin is `http://localhost:38217`, which cannot
+  // CORS-load `asset://`, so a path-based <img> never paints and a just-taken
+  // own capture stranded on "Unavailable". A `blob:` URL renders regardless of
+  // origin (dev AND release) — the same Rust-bytes trick synced shots already
+  // use. The blob is pre-decoded off-DOM (probeImage) before swapping in, so the
+  // crossfade over the shimmer never shows a half-painted frame. All ACTIONS
+  // (edit, drag payload, share upload, delete) still use the original full-res
+  // `path`. No cache-bust needed: the native thumbnail cache is content-keyed
+  // (path+mtime+size), so the bytes change when the file does.
   useEffect(() => {
     // A fresh cascade run owns the terminal failure decision; clear the flag so
     // the optimistic eager src isn't mistaken for a committed one.
@@ -406,6 +413,12 @@ function ThumbnailItem({ path, eager = false, onEdit, onRemove }: ThumbnailItemP
       return;
     }
     let cancelled = false;
+    // The one `blob:` URL this run may mint (from the thumbnail bytes). Revoked
+    // on cleanup (deps change / unmount) so a long scroll doesn't leak object
+    // URLs. Revoking after the bitmap has painted is safe — the decoded image
+    // stays; only a fresh load of the (now-dead) URL would fail, which never
+    // happens for an already-committed src.
+    let createdUrl: string | null = null;
 
     const commit = (url: string) => {
       if (cancelled) return;
@@ -424,18 +437,24 @@ function ThumbnailItem({ path, eager = false, onEdit, onRemove }: ThumbnailItemP
     (async () => {
       const local = convertFileSrc(path);
 
-      // 1. Cheap cached thumbnail (native downscale). TIME-BOUNDED: a hung Rust
-      //    call (or a missing local file → reject) returns null instead of
-      //    stranding the tile on the shimmer forever — we fall through to the
-      //    local file, then the remote URL, and ultimately the terminal state.
-      const thumbPath = await withTimeout(
-        invoke<string>("get_screenshot_thumbnail", { path, maxPx: THUMB_MAX_PX }),
+      // 1. Cheap cached thumbnail (native downscale), returned as raw BYTES and
+      //    wrapped in a same-origin `blob:` URL — NEVER `asset://`, so it loads
+      //    under the release webview's `http://localhost` origin (which can't
+      //    CORS-load `asset://`). This is the PRIMARY, origin-independent load
+      //    for OWN local captures. TIME-BOUNDED: a hung Rust call (or a missing
+      //    local file → reject) returns null instead of stranding the tile on
+      //    the shimmer forever — we fall through to the local file, then the
+      //    remote URL, and ultimately the terminal state. A `blob:` URL is
+      //    same-origin, so it's probed/loaded in NO-CORS mode (no crossOrigin).
+      const thumbBytes = await withTimeout(
+        invoke<ArrayBuffer>("get_screenshot_thumbnail", { path, maxPx: THUMB_MAX_PX }),
         REMOTE_TIMEOUT_MS,
       );
       if (cancelled) return;
-      if (thumbPath) {
-        const thumbUrl = convertFileSrc(thumbPath);
-        if (await probeImage(thumbUrl)) {
+      if (thumbBytes && thumbBytes.byteLength > 0) {
+        const thumbUrl = URL.createObjectURL(new Blob([thumbBytes], { type: "image/png" }));
+        createdUrl = thumbUrl;
+        if (await probeImage(thumbUrl, undefined, false)) {
           commit(thumbUrl);
           return;
         }
@@ -473,6 +492,7 @@ function ThumbnailItem({ path, eager = false, onEdit, onRemove }: ThumbnailItemP
 
     return () => {
       cancelled = true;
+      if (createdUrl) URL.revokeObjectURL(createdUrl);
     };
   }, [path, inView]);
 
@@ -624,13 +644,19 @@ function ThumbnailItem({ path, eager = false, onEdit, onRemove }: ThumbnailItemP
           src={src}
           alt="Screenshot preview"
           // CORS mode must match the probe that committed this src (see
-          // probeImage): a local asset:// file loads in cors mode (Tauri supplies
-          // CORS headers; also lets the drag-icon canvas read it back untainted),
-          // while a remote Firebase token URL loads with NO crossOrigin — the
-          // bucket has no CORS config, so a cors request is rejected and a synced
-          // shot would fall to "?". A plain no-cors <img> renders the token URL
-          // fine, exactly like the public share link.
-          crossOrigin={/^https?:\/\//i.test(src) ? undefined : "anonymous"}
+          // probeImage). Three source kinds, two modes:
+          //   • blob:/data:  (own-capture thumbnail bytes) → NO crossOrigin. A
+          //     blob URL is same-origin, so a crossOrigin="anonymous" would add a
+          //     pointless CORS check; this is the origin-independent path that
+          //     renders in the release localhost webview.
+          //   • https://     (remote Firebase token URL) → NO crossOrigin. The
+          //     Storage bucket has no CORS config, so a cors request is rejected
+          //     and a synced shot would fall to "?"; a plain no-cors <img> loads
+          //     the token URL fine, like the public share link.
+          //   • asset://     (local full-res fallback) → crossOrigin="anonymous".
+          //     Tauri's asset protocol supplies CORS headers, and the cors-cached
+          //     bitmap lets the drag-icon canvas read it back untainted.
+          crossOrigin={/^(blob:|data:|https?:\/\/)/i.test(src) ? undefined : "anonymous"}
           decoding="async"
           className={`relative block h-full w-full object-cover select-none rounded-md cursor-pointer transition-opacity duration-200 ${
             ready ? "opacity-100" : "opacity-0"
