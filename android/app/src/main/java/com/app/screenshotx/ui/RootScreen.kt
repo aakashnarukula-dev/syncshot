@@ -19,6 +19,8 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.AccountCircle
@@ -30,7 +32,6 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -62,8 +63,11 @@ fun RootScreen(onSignedOut: () -> Unit) {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
 
-    // 0 = Screenshots grid, 1 = Text/clipboard list.
-    var tab by remember { mutableIntStateOf(0) }
+    // Two horizontally-swipeable pages: 0 = Screenshots grid, 1 = Text/clipboard list.
+    // pagerState is the single source of truth for the selected view: swiping moves the
+    // pager and the pill highlight follows pagerState.currentPage; tapping a pill segment
+    // animates the pager to that page. No separate "tab" state to keep in sync.
+    val pagerState = rememberPagerState(pageCount = { 2 })
     var showProfile by remember { mutableStateOf(false) }
     // GalleryScreen raises this when an image is opened; chrome hides while true.
     var viewerOpen by remember { mutableStateOf(false) }
@@ -113,19 +117,26 @@ fun RootScreen(onSignedOut: () -> Unit) {
                         )
                     }
                     Box(Modifier.fillMaxWidth().weight(1f)) {
-                        // Content fills the area and scrolls *behind* the floating pill.
-                        // It registers as the haze backdrop source the pill samples.
-                        Box(Modifier.fillMaxSize().hazeSource(hazeState)) {
-                            when (tab) {
+                        // Swipeable content fills the area and scrolls *behind* the floating
+                        // pill. It registers as the haze backdrop source the pill samples.
+                        // While the full-screen image viewer is open we disable horizontal
+                        // scroll so the root pager can't steal the viewer's own swipe gestures.
+                        HorizontalPager(
+                            state = pagerState,
+                            userScrollEnabled = !viewerOpen,
+                            modifier = Modifier.fillMaxSize().hazeSource(hazeState),
+                        ) { page ->
+                            when (page) {
                                 0 -> GalleryScreen(onViewerOpenChange = { viewerOpen = it })
                                 else -> ClipboardScreen(embedded = true)
                             }
                         }
                         // Floating glass toggle, pinned bottom-center above the gesture inset.
+                        // Highlight follows the swipe (currentPage); a tap animates the pager.
                         if (!viewerOpen) {
                             NavPill(
-                                selected = tab,
-                                onSelect = { tab = it },
+                                selected = pagerState.currentPage,
+                                onSelect = { scope.launch { pagerState.animateScrollToPage(it) } },
                                 hazeState = hazeState,
                                 modifier = Modifier
                                     .align(Alignment.BottomCenter)
