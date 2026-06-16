@@ -54,9 +54,12 @@ import com.app.screenshotx.data.FirebaseRepo
 import com.app.screenshotx.sync.ClipboardCaptureService
 import kotlinx.coroutines.launch
 
+/** @param embedded true when shown under the shared header + Screenshots|Text pill
+ *  (RootScreen) — it then drops its own status-bar inset and "ClipboardX" title to
+ *  avoid a duplicate header. Standalone (false) keeps the old self-contained chrome. */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun ClipboardScreen() {
+fun ClipboardScreen(embedded: Boolean = false) {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -87,12 +90,14 @@ fun ClipboardScreen() {
         Toast.makeText(ctx, "Copied", Toast.LENGTH_SHORT).show()
     }
 
-    Column(Modifier.fillMaxSize().statusBarsPadding()) {
-        Text(
-            "ClipboardX",
-            style = MaterialTheme.typography.titleLarge,
-            modifier = Modifier.padding(start = 16.dp, top = 8.dp, bottom = 8.dp),
-        )
+    Column(Modifier.fillMaxSize().then(if (embedded) Modifier else Modifier.statusBarsPadding())) {
+        if (!embedded) {
+            Text(
+                "ClipboardX",
+                style = MaterialTheme.typography.titleLarge,
+                modifier = Modifier.padding(start = 16.dp, top = 8.dp, bottom = 8.dp),
+            )
+        }
 
         if (!captureEnabled) {
             CaptureOnboarding {

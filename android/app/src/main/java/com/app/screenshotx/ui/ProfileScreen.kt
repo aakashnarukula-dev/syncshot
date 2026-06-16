@@ -2,6 +2,7 @@ package com.app.screenshotx.ui
 
 import android.text.format.DateUtils
 import android.widget.Toast
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -17,6 +18,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Logout
 import androidx.compose.material.icons.filled.Laptop
 import androidx.compose.material.icons.filled.Phone
@@ -55,7 +57,8 @@ import kotlinx.coroutines.withContext
  *  (each remotely sign-out-able), and sign-out for this device. The header logout
  *  used to live in the gallery/clipboard top bars — it now lives only here. */
 @Composable
-fun ProfileScreen(onSignedOut: () -> Unit) {
+fun ProfileScreen(onSignedOut: () -> Unit, onBack: (() -> Unit)? = null) {
+    if (onBack != null) BackHandler(onBack = onBack)
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
     val myDeviceId = remember { Prefs(ctx).deviceId }
@@ -115,11 +118,19 @@ fun ProfileScreen(onSignedOut: () -> Unit) {
     }
 
     Column(Modifier.fillMaxSize().statusBarsPadding()) {
-        Text(
-            "Profile",
-            style = MaterialTheme.typography.titleLarge,
-            modifier = Modifier.padding(start = 16.dp, top = 8.dp, bottom = 8.dp),
-        )
+        Row(
+            Modifier.fillMaxWidth().padding(start = 4.dp, top = 8.dp, bottom = 8.dp, end = 16.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            if (onBack != null) {
+                IconButton(onClick = onBack) {
+                    Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                }
+            } else {
+                Spacer(Modifier.size(12.dp))
+            }
+            Text("Profile", style = MaterialTheme.typography.titleLarge)
+        }
 
         LazyColumn(
             Modifier.fillMaxSize(),

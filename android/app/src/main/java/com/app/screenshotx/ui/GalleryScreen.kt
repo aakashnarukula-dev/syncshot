@@ -2,9 +2,6 @@ package com.app.screenshotx.ui
 
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.PickVisualMediaRequest
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
@@ -42,7 +39,6 @@ import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.outlined.Delete
@@ -174,49 +170,12 @@ fun GalleryScreen(onViewerOpenChange: (Boolean) -> Unit) {
         }.distinctUntilChanged().collect { nearEnd -> if (nearEnd) ScreenshotPaging.loadMore() }
     }
 
-    val pickMedia = rememberLauncherForActivityResult(
-        ActivityResultContracts.PickMultipleVisualMedia()
-    ) { uris ->
-        if (uris.isNotEmpty()) {
-            scope.launch {
-                var failures = 0
-                for (uri in uris) {
-                    val ok = withContext(Dispatchers.IO) {
-                        runCatching {
-                            val bytes = ctx.contentResolver.openInputStream(uri)?.use { it.readBytes() }
-                                ?: return@runCatching false
-                            FirebaseRepo.publishScreenshot(ctx, bytes); true
-                        }.getOrDefault(false)
-                    }
-                    if (!ok) failures++
-                }
-                if (failures > 0) {
-                    Toast.makeText(ctx, "$failures image(s) failed to upload", Toast.LENGTH_SHORT).show()
-                }
-            }
-        }
-    }
-
     AnimatedContent(
         targetState = selected,
         transitionSpec = { fadeIn(tween(220)) togetherWith fadeOut(tween(220)) },
         label = "viewer",
     ) { sel ->
         if (sel == null) {
-            Column(Modifier.fillMaxSize().statusBarsPadding()) {
-                Row(
-                    Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Text("ScreenshotX", style = MaterialTheme.typography.titleLarge)
-                    IconButton(onClick = {
-                        pickMedia.launch(
-                            PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
-                        )
-                    }) { Icon(Icons.Filled.Add, "Add image") }
-                }
-
                 PullToRefreshBox(
                     isRefreshing = refreshing,
                     onRefresh = {
@@ -254,7 +213,6 @@ fun GalleryScreen(onViewerOpenChange: (Boolean) -> Unit) {
                         }
                     }
                 }
-            }
         } else {
             FullScreenViewer(
                 items = shots.itemSnapshotList.items,
