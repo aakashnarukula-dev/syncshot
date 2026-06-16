@@ -26,25 +26,38 @@ import kotlinx.coroutines.launch
  * `cm.primaryClip` returns null. So the old approach (read the clip directly inside this
  * service on the primary-clip-changed callback) only works while ScreenshotX is in focus.
  *
- * The OnPrimaryClipChangedListener STILL fires in the background even though the read is
- * denied. We use that signal to open [ClipReadActivity] — a 1px invisible translucent
- * activity that, by virtue of being foreground for a moment, is allowed to read the clip.
- * It reads, publishes, and finishes immediately (imperceptible flash). When ScreenshotX is
- * already in focus we skip the activity and read directly here.
+ * DEEPER on-device finding (Samsung): the OnPrimaryClipChangedListener does NOT fire for a
+ * background app at all on this OEM. Samsung's ClipboardService gates *listener delivery*
+ * itself on clipboard-access, so a background `onClipChanged()` never runs → the
+ * foreground-moment read is never triggered → nothing publishes. Logcat shows the
+ * accessibility selection path working ("selection tracked") but never "listener fired".
  *
- * Fallback if the OEM blocks the background activity launch: we remember the most recent
- * selected text from accessibility events and publish that instead (heuristic, needs no
- * clipboard permission).
+ * PRIMARY background trigger is therefore the AccessibilityService event stream, which keeps
+ * receiving events while we're backgrounded:
+ *   - Track the latest selected text on TYPE_VIEW_TEXT_SELECTION_CHANGED (and best-effort on
+ *     TYPE_VIEW_TEXT_CHANGED) into [lastSelectionText].
+ *   - Detect a COPY action: when the user taps "Copy"/"Cut" in the text-selection floating
+ *     toolbar a TYPE_VIEW_CLICKED fires whose node text/contentDescription is the localized
+ *     "Copy"/"Cut" label. On such a click we publish [lastSelectionText] directly (it == the
+ *     text being copied). If there's no selection (e.g. a "Copy link" button), we fall back to
+ *     [ClipReadActivity] (the foreground-moment real-clipboard read).
+ *
+ * SECONDARY (kept, harmless): the OnPrimaryClipChangedListener still works in the foreground
+ * and on non-Samsung OEMs, and the foreground-moment read. De-dup ([lastPublishedText] +
+ * debounce) stops the same copy publishing twice across the listener path and the a11y path.
  */
 class ClipboardCaptureService : AccessibilityService() {
     private var clipboard: ClipboardManager? = null
     private var listener: ClipboardManager.OnPrimaryClipChangedListener? = null
 
-    /** Most recent text selection seen via accessibility events (fallback source). */
+    /** Most recent text selection seen via accessibility events (primary publish source). */
     @Volatile private var lastSelectionText: String? = null
 
     /** Debounce: a single copy can fire the listener several times in a row. */
     private var lastFireAt = 0L
+
+    /** Debounce: a copy tap can emit several click events; also stops listener+a11y racing. */
+    private var lastCopyClickAt = 0L
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -122,7 +135,16 @@ class ClipboardCaptureService : AccessibilityService() {
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event == null) return
-        if (event.eventType != AccessibilityEvent.TYPE_VIEW_TEXT_SELECTION_CHANGED) return
+        when (event.eventType) {
+            AccessibilityEvent.TYPE_VIEW_TEXT_SELECTION_CHANGED,
+            AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED -> trackSelection(event)
+            AccessibilityEvent.TYPE_VIEW_CLICKED,
+            AccessibilityEvent.TYPE_VIEW_LONG_CLICKED -> maybeCopyClick(event)
+        }
+    }
+
+    /** Remember the user's current text selection — this is what a text copy puts on the clip. */
+    private fun trackSelection(event: AccessibilityEvent) {
         try {
             val full = event.text?.joinToString("")?.takeIf { it.isNotEmpty() }
                 ?: event.source?.text?.toString()
@@ -140,6 +162,54 @@ class ClipboardCaptureService : AccessibilityService() {
         }
     }
 
+    /**
+     * PRIMARY background trigger. A tap on the "Copy"/"Cut" button in the text-selection
+     * floating toolbar surfaces as a CLICKED event whose label is the localized action name.
+     * On a match we publish the tracked selection (== the copied text); if there's no
+     * selection we fall back to the foreground-moment real-clipboard read.
+     */
+    private fun maybeCopyClick(event: AccessibilityEvent) {
+        val label = clickedLabel(event)
+        if (label == null) {
+            Log.i(TAG, "click no usable label (near-miss)")
+            return
+        }
+        if (!isCopyLabel(label)) {
+            Log.i(TAG, "click label not a copy action (near-miss)")
+            return
+        }
+        val now = SystemClock.uptimeMillis()
+        if (now - lastCopyClickAt < DEBOUNCE_MS) {
+            Log.i(TAG, "a11y copy debounced duplicate (${now - lastCopyClickAt}ms)")
+            return
+        }
+        lastCopyClickAt = now
+        val sel = lastSelectionText
+        Log.i(TAG, "a11y copy detected (label='$label'), selLen=${sel?.length ?: 0}")
+        if (!sel.isNullOrBlank()) {
+            publish(applicationContext, "a11y-copy", sel)
+        } else {
+            Log.i(TAG, "a11y-copy: no selection -> foreground-moment read")
+            launchForegroundRead()
+        }
+    }
+
+    /** Pull a usable label off a CLICKED node (event text, then source text/contentDescription). */
+    private fun clickedLabel(event: AccessibilityEvent): String? {
+        event.text?.joinToString("")?.trim()?.takeIf { it.isNotEmpty() }?.let { return it }
+        event.contentDescription?.toString()?.trim()?.takeIf { it.isNotEmpty() }?.let { return it }
+        return try {
+            val node = event.source ?: return null
+            node.text?.toString()?.trim()?.takeIf { it.isNotEmpty() }
+                ?: node.contentDescription?.toString()?.trim()?.takeIf { it.isNotEmpty() }
+        } catch (e: Throwable) {
+            null
+        }
+    }
+
+    private fun isCopyLabel(label: String): Boolean =
+        COPY_LABELS.any { it.equals(label, ignoreCase = true) }
+
     override fun onInterrupt() {}
 
     override fun onDestroy() {
@@ -150,6 +220,15 @@ class ClipboardCaptureService : AccessibilityService() {
     companion object {
         private const val TAG = "SSXClip"
         private const val DEBOUNCE_MS = 400L
+
+        /**
+         * Localized labels of the text-selection toolbar "copy" actions we react to.
+         * Device locale is en-IN; a few common variants are enough to cover the toolbar
+         * and "Copy link" affordances. Matched case-insensitively.
+         */
+        private val COPY_LABELS = listOf(
+            "Copy", "Cut", "Copy text", "Copy link", "Copy link address", "Copy URL"
+        )
 
         /** Process-lifetime scope so a publish survives the launching component finishing. */
         private val publishScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
