@@ -12,7 +12,7 @@
  * saveReceivedScreenshot) and save them into the local cache.
  */
 
-import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { invoke } from "@tauri-apps/api/core";
 import {
   collection,
   deleteDoc,
@@ -43,6 +43,22 @@ import {
 
 function screenshotsCol(uid: string) {
   return collection(db, "users", uid, "screenshots");
+}
+
+/**
+ * Read a LOCAL cache file's raw, full-res bytes via Rust IPC.
+ *
+ * We do NOT use `fetch(convertFileSrc(path))` here: the RELEASE webview runs on
+ * the `http://localhost:38217` origin, which CANNOT CORS-load an `asset://`
+ * URL, so that fetch REJECTS for local files in release (it only happened to
+ * work in `tauri dev`, whose `tauri://localhost` origin is exempt). Reading the
+ * bytes in Rust is origin-independent — works in dev AND release — and is the
+ * own-capture twin of how RECEIVED shots already avoid CORS (Rust HTTP fetch in
+ * `saveReceivedScreenshot`). `read_image_bytes` returns a `tauri::ipc::Response`
+ * so this resolves to an ArrayBuffer, not a JSON number array.
+ */
+async function readLocalBytes(path: string): Promise<ArrayBuffer> {
+  return invoke<ArrayBuffer>("read_image_bytes", { path });
 }
 
 function tsToMillis(value: unknown): number | null {
@@ -245,9 +261,8 @@ export async function publishScreenshot(
   device: DeviceRef,
   path: string,
 ): Promise<boolean> {
-  const resp = await fetch(convertFileSrc(path));
-  const blob = await resp.blob();
-  const buf = await blob.arrayBuffer();
+  const buf = await readLocalBytes(path);
+  const blob = new Blob([buf]);
   const sha256 = await sha256Hex(buf);
 
   // Content-addressed dedup — skip if this exact image is already synced.
@@ -325,9 +340,8 @@ export async function shareScreenshotLink(
   device: DeviceRef,
   path: string,
 ): Promise<string> {
-  const resp = await fetch(convertFileSrc(path));
-  const blob = await resp.blob();
-  const buf = await blob.arrayBuffer();
+  const buf = await readLocalBytes(path);
+  const blob = new Blob([buf]);
   const sha256 = await sha256Hex(buf);
 
   const dupes = await getDocs(
@@ -522,10 +536,12 @@ export function findDocForCachePath(path: string): ScreenshotDoc | null {
  */
 export async function ensureLocalScreenshot(path: string): Promise<string> {
   try {
-    const resp = await fetch(convertFileSrc(path));
-    if (resp.ok) return path;
+    // Cheap existence probe in Rust — NOT a CORS `asset://` fetch (which always
+    // rejects from the release localhost origin, forcing a needless cloud
+    // re-download even when the file is right there on disk).
+    if (await invoke<boolean>("file_exists", { path })) return path;
   } catch {
-    /* asset fetch failed → local file missing, try the cloud copy below */
+    /* probe failed → treat as missing, try the cloud copy below */
   }
   const docMatch = findDocForCachePath(path);
   if (docMatch?.fullPath) {
@@ -699,8 +715,7 @@ export async function deleteScreenshotByPath(
 ): Promise<void> {
   let matched: { id: string; thumbPath?: string | null; fullPath?: string | null }[] = [];
   try {
-    const resp = await fetch(convertFileSrc(path));
-    const buf = await resp.arrayBuffer();
+    const buf = await readLocalBytes(path);
     const sha256 = await sha256Hex(buf);
     const snap = await getDocs(
       query(screenshotsCol(uid), where("sha256", "==", sha256)),

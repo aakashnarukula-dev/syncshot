@@ -97,8 +97,12 @@ describe("cacheDocId", () => {
 
 describe("deleteScreenshotByPath", () => {
   it("hashes the file, finds the doc by sha256, sweeps both blobs + the doc, then the local file", async () => {
-    globalThis.fetch = vi.fn(() =>
-      Promise.resolve({ arrayBuffer: () => Promise.resolve(new ArrayBuffer(4)) } as Response),
+    // Local bytes now come from Rust IPC (read_image_bytes), NOT a CORS
+    // asset:// fetch — the release localhost origin can't CORS-load asset://.
+    invokeMock.mockImplementation((cmd: string) =>
+      cmd === "read_image_bytes"
+        ? Promise.resolve(new ArrayBuffer(4))
+        : Promise.resolve(undefined),
     );
     sha256Hex.mockResolvedValue("sha-xyz");
     getDocs.mockResolvedValue({
@@ -112,7 +116,6 @@ describe("deleteScreenshotByPath", () => {
         },
       ],
     });
-    invokeMock.mockResolvedValue(undefined);
 
     await deleteScreenshotByPath(UID, "/cache/d1.png");
 
@@ -125,8 +128,13 @@ describe("deleteScreenshotByPath", () => {
   });
 
   it("falls back to the {id}.png filename when the local file can't be hashed", async () => {
-    globalThis.fetch = vi.fn(() => Promise.reject(new Error("file gone")));
-    invokeMock.mockResolvedValue(undefined);
+    // File gone → the read_image_bytes IPC rejects, so no sha256 to query by;
+    // the doc id is recovered from the {id}.png filename instead.
+    invokeMock.mockImplementation((cmd: string) =>
+      cmd === "read_image_bytes"
+        ? Promise.reject(new Error("file gone"))
+        : Promise.resolve(undefined),
+    );
 
     await deleteScreenshotByPath(UID, "/cache/orphanId.png");
 
@@ -241,10 +249,12 @@ describe("backfillScreenshots", () => {
   });
 
   it("publishes each path, skipping already-synced (sha256 dupe) shots", async () => {
-    globalThis.fetch = vi.fn(() =>
-      Promise.resolve({
-        blob: () => Promise.resolve({ size: 4, arrayBuffer: () => Promise.resolve(new ArrayBuffer(4)) }),
-      } as unknown as Response),
+    // publishScreenshot reads local bytes via read_image_bytes IPC (origin-
+    // independent), then content-addresses by sha256 exactly as before.
+    invokeMock.mockImplementation((cmd: string) =>
+      cmd === "read_image_bytes"
+        ? Promise.resolve(new ArrayBuffer(4))
+        : Promise.resolve(undefined),
     );
     sha256Hex.mockResolvedValue("dupe-sha");
     // Every dedup query returns a hit, so publishScreenshot short-circuits to
