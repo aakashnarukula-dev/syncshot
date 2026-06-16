@@ -33,6 +33,11 @@ import { deleteObject, getDownloadURL, ref, uploadBytes } from "firebase/storage
 import { renameCapturePath, useSyncStore } from "@/stores/syncStore";
 import { db, storage } from "./firebase";
 import { sha256Hex } from "./hash";
+// Pure (Firebase-free) cache-path → doc helpers live in ./order so App.tsx can
+// import column ordering without dragging the Firebase SDK onto the critical
+// path. Re-exported here for existing `@/lib/sync/screenshots` importers/tests.
+import { cacheDocId, findDocForCachePath } from "./order";
+export { cacheDocId, findDocForCachePath } from "./order";
 import {
   SCREENSHOTS_PAGE_SIZE,
   THUMB_MAX_EDGE,
@@ -489,49 +494,6 @@ export async function saveReceivedScreenshot(
  */
 export async function storageDownloadUrl(storagePath: string): Promise<string> {
   return getDownloadURL(ref(storage, storagePath));
-}
-
-/**
- * The pill column knows screenshots by their local CACHE PATH, not their
- * Firestore id. A screenshot RECEIVED from another device is written to the
- * cache as `{docId}.png` (see `saveReceivedScreenshot`), so its doc id is
- * recoverable from the filename. Locally-captured shots use a generated
- * filename (no embedded id) and return their basename, which simply won't
- * match any doc id — the caller falls back to a content hash.
- */
-export function cacheDocId(path: string): string | null {
-  const base = path.split(/[\\/]/).pop() ?? "";
-  const dot = base.lastIndexOf(".");
-  const id = dot > 0 ? base.slice(0, dot) : base;
-  return id || null;
-}
-
-/**
- * Resolve the Firestore screenshot doc backing a local cache PATH, for either
- * kind of cached shot:
- *   • RECEIVED — cached as `{docId}.png`, so the id is in the filename.
- *   • OWN-DEVICE CAPTURE — cached as `shot_{ts}.png` (no embedded id); its doc id
- *     was recorded at publish time in `syncStore.localCaptureDocIds`.
- *
- * Returns the matching loaded `ScreenshotDoc`, or null if neither lookup hits a
- * doc in the current subscription window. This is what lets an own-device shot
- * fall back to its cloud thumb/full (render) and be re-materialized on open —
- * the same safety net synced shots already had — so it never strands on
- * "Unavailable".
- */
-export function findDocForCachePath(path: string): ScreenshotDoc | null {
-  const { screenshots, localCaptureDocIds } = useSyncStore.getState();
-  const byName = cacheDocId(path);
-  if (byName) {
-    const match = screenshots.find((s) => s.id === byName);
-    if (match) return match;
-  }
-  const mappedId = localCaptureDocIds[path];
-  if (mappedId) {
-    const match = screenshots.find((s) => s.id === mappedId);
-    if (match) return match;
-  }
-  return null;
 }
 
 /**
