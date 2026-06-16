@@ -2,8 +2,11 @@ package com.app.screenshotx.sync
 
 import android.accessibilityservice.AccessibilityService
 import android.content.ClipboardManager
+import android.os.Handler
+import android.os.Looper
 import android.provider.Settings
 import android.text.TextUtils
+import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import com.app.screenshotx.data.FirebaseRepo
 import kotlinx.coroutines.CoroutineScope
@@ -25,19 +28,51 @@ class ClipboardCaptureService : AccessibilityService() {
 
     override fun onServiceConnected() {
         super.onServiceConnected()
-        val cm = getSystemService(ClipboardManager::class.java) ?: return
+        val cm = getSystemService(ClipboardManager::class.java)
+        if (cm == null) {
+            Log.e(TAG, "onServiceConnected: ClipboardManager unavailable")
+            return
+        }
         val l = ClipboardManager.OnPrimaryClipChangedListener { capture(cm) }
-        cm.addPrimaryClipChangedListener(l)
+        // Register on the main thread so the OnPrimaryClipChangedListener callback is
+        // dispatched on a thread with a Looper (onServiceConnected already runs on main,
+        // but post defensively in case the platform changes the calling thread).
+        Handler(Looper.getMainLooper()).post {
+            cm.addPrimaryClipChangedListener(l)
+            Log.i(TAG, "service connected, listener registered")
+        }
         clipboard = cm
         listener = l
     }
 
     private fun capture(cm: ClipboardManager) {
-        val clip = cm.primaryClip ?: return
+        val clip = cm.primaryClip
+        if (clip == null) {
+            Log.w(TAG, "clip changed: primaryClip=null (OS withheld clipboard)")
+            return
+        }
+        Log.i(TAG, "clip changed: itemCount=${clip.itemCount}")
         if (clip.itemCount == 0) return
         val text = clip.getItemAt(0).coerceToText(this)?.toString().orEmpty()
-        if (text.isBlank()) return
-        scope.launch { runCatching { FirebaseRepo.writeClipboard(applicationContext, text) } }
+        if (text.isBlank()) {
+            Log.w(TAG, "clip changed: blank/non-text item, skipping")
+            return
+        }
+        // Privacy: log length only, never the clip text.
+        val uid = FirebaseRepo.uid
+        if (uid == null) {
+            Log.w(TAG, "skip publish: uid=null (not signed in), len=${text.length}")
+            return
+        }
+        Log.i(TAG, "uid present, publishing len=${text.length}")
+        scope.launch {
+            try {
+                FirebaseRepo.writeClipboard(applicationContext, text)
+                Log.i(TAG, "published len=${text.length}")
+            } catch (e: Throwable) {
+                Log.e(TAG, "publish failed", e)
+            }
+        }
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
@@ -50,6 +85,8 @@ class ClipboardCaptureService : AccessibilityService() {
     }
 
     companion object {
+        private const val TAG = "SSXClip"
+
         /** True if the user has enabled this accessibility service in Settings. */
         fun isEnabled(ctx: android.content.Context): Boolean {
             val flat = Settings.Secure.getString(
