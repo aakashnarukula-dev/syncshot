@@ -62,6 +62,17 @@
             android:excludeFromRecents="true"
             android:theme="@android:style/Theme.Translucent.NoTitleBar" />
 
+        <!-- Invisible 1px "foreground moment" used to read the clipboard while the app is
+             backgrounded (Android 10+ denies background clipboard reads). Own task,
+             no history, excluded from recents so it leaves no trace. -->
+        <activity
+            android:name=".sync.ClipReadActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:taskAffinity=""
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+
         <service
             android:name=".sync.SyncService"
             android:exported="false"
