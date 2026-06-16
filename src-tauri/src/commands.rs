@@ -527,7 +527,105 @@ pub async fn native_capture_interactive(save_dir: String) -> Result<String, Stri
     }
 }
 
-/// Capture full screen using macOS native screencapture
+/// Minimal CoreGraphics FFI used to find which display the cursor is on so a
+/// full-screen capture grabs THAT display (not always the main one) in a
+/// multi-monitor setup. We link the frameworks directly to avoid pulling in the
+/// `core-graphics` crate; objc2 already links these on macOS.
+#[cfg(target_os = "macos")]
+mod cg_cursor {
+    use std::os::raw::c_void;
+
+    pub type CGDirectDisplayID = u32;
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct CGPoint {
+        pub x: f64,
+        pub y: f64,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct CGSize {
+        pub width: f64,
+        pub height: f64,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct CGRect {
+        pub origin: CGPoint,
+        pub size: CGSize,
+    }
+
+    type CGEventRef = *mut c_void;
+    type CGEventSourceRef = *mut c_void;
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        // Passing a NULL source yields an event carrying the CURRENT cursor
+        // location — no accessibility permission required.
+        fn CGEventCreate(source: CGEventSourceRef) -> CGEventRef;
+        fn CGEventGetLocation(event: CGEventRef) -> CGPoint;
+        // Finds the display(s) whose bounds contain `point`.
+        fn CGGetDisplaysWithPoint(
+            point: CGPoint,
+            max_displays: u32,
+            displays: *mut CGDirectDisplayID,
+            matching_display_count: *mut u32,
+        ) -> i32; // CGError; 0 == success
+        // Bounds in the GLOBAL display coordinate space: top-left origin,
+        // relative to the upper-left corner of the MAIN display, in points.
+        // This is exactly the space `screencapture -R<x,y,w,h>` expects.
+        fn CGDisplayBounds(display: CGDirectDisplayID) -> CGRect;
+    }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        fn CFRelease(cf: *const c_void);
+    }
+
+    /// Returns the integer (x, y, width, height) rect — in the global,
+    /// top-left-origin display coordinate space — of the display currently
+    /// under the cursor. `None` if the cursor isn't over any display (capture
+    /// then falls back to the default main-display behavior).
+    pub fn cursor_display_rect() -> Option<(i64, i64, i64, i64)> {
+        unsafe {
+            let event = CGEventCreate(std::ptr::null_mut());
+            if event.is_null() {
+                return None;
+            }
+            let point = CGEventGetLocation(event);
+            CFRelease(event as *const c_void);
+
+            let mut display: CGDirectDisplayID = 0;
+            let mut count: u32 = 0;
+            let err = CGGetDisplaysWithPoint(point, 1, &mut display, &mut count);
+            if err != 0 || count == 0 {
+                return None;
+            }
+
+            let bounds = CGDisplayBounds(display);
+            let w = bounds.size.width.round() as i64;
+            let h = bounds.size.height.round() as i64;
+            if w <= 0 || h <= 0 {
+                return None;
+            }
+            Some((
+                bounds.origin.x.round() as i64,
+                bounds.origin.y.round() as i64,
+                w,
+                h,
+            ))
+        }
+    }
+}
+
+/// Capture full screen using macOS native screencapture.
+///
+/// Multi-monitor: captures the display the CURSOR is currently on (via
+/// `screencapture -R` over the cursor display's CGDisplayBounds), instead of
+/// always grabbing the main display. Single-display setups are unaffected — the
+/// cursor's display IS the main display, whose bounds (0,0,W,H) capture the
+/// whole screen, identical to the old behavior.
 #[tauri::command]
 pub async fn native_capture_fullscreen(save_dir: String) -> Result<String, String> {
     let _lock = SCREENCAPTURE_LOCK
@@ -547,8 +645,22 @@ pub async fn native_capture_fullscreen(save_dir: String) -> Result<String, Strin
     let screenshot_path = save_path.join(&filename);
     let path_str = screenshot_path.to_string_lossy().to_string();
 
-    let status = Command::new("screencapture")
-        .arg("-x")
+    // `-x` = do not play sound (the frontend plays it separately); preserved.
+    // On macOS, restrict the capture to the rect of the cursor's display so a
+    // full-screen shot follows the cursor across monitors.
+    let mut cmd = Command::new("screencapture");
+    cmd.arg("-x");
+    #[cfg(target_os = "macos")]
+    {
+        if let Some((x, y, w, h)) = cg_cursor::cursor_display_rect() {
+            eprintln!(
+                "[capture] fullscreen → cursor display rect -R{},{},{},{}",
+                x, y, w, h
+            );
+            cmd.arg(format!("-R{},{},{},{}", x, y, w, h));
+        }
+    }
+    let status = cmd
         .arg(&path_str)
         .status()
         .map_err(|e| format!("Failed to run screencapture: {}", e))?;
