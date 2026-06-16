@@ -4,18 +4,23 @@ import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.FileUpload
-import androidx.compose.material.icons.filled.Person
+import androidx.compose.material.icons.rounded.AccountCircle
+import androidx.compose.material.icons.rounded.CloudUpload
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -30,8 +35,12 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import com.app.screenshotx.R
 import com.app.screenshotx.data.FirebaseRepo
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -115,7 +124,8 @@ fun RootScreen(onSignedOut: () -> Unit) {
     }
 }
 
-/** Top app bar: "ScreenshotX" on the left; upload + profile icon buttons on the right. */
+/** Top app bar: app logo + compact "ScreenshotX" title on the left; upload + profile
+ *  icon buttons on the right. */
 @Composable
 private fun AppHeader(onUpload: () -> Unit, onProfile: () -> Unit) {
     Row(
@@ -123,13 +133,25 @@ private fun AppHeader(onUpload: () -> Unit, onProfile: () -> Unit) {
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Text("ScreenshotX", style = MaterialTheme.typography.titleLarge)
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Image(
+                painter = painterResource(R.mipmap.ic_launcher),
+                contentDescription = null,
+                modifier = Modifier.size(26.dp).clip(RoundedCornerShape(6.dp)),
+            )
+            Spacer(Modifier.width(8.dp))
+            Text(
+                "ScreenshotX",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold,
+            )
+        }
         Row(verticalAlignment = Alignment.CenterVertically) {
             IconButton(onClick = onUpload) {
-                Icon(Icons.Filled.FileUpload, contentDescription = "Upload screenshot")
+                Icon(Icons.Rounded.CloudUpload, contentDescription = "Upload screenshot")
             }
             IconButton(onClick = onProfile) {
-                Icon(Icons.Filled.Person, contentDescription = "Profile")
+                Icon(Icons.Rounded.AccountCircle, contentDescription = "Profile")
             }
         }
     }
