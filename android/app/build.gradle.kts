@@ -73,6 +73,8 @@ dependencies {
     implementation(libs.androidx.material.icons.extended)
     implementation(libs.coil.compose)
     implementation(libs.androidx.work.runtime.ktx)
+    implementation(libs.haze)
+    implementation(libs.haze.materials)
 
     implementation(platform(libs.firebase.bom))
     implementation(libs.firebase.firestore)

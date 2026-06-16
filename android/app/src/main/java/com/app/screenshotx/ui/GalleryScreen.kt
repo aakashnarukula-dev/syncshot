@@ -22,10 +22,13 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.asPaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -170,6 +173,9 @@ fun GalleryScreen(onViewerOpenChange: (Boolean) -> Unit) {
     var selected by remember { mutableStateOf<ScreenshotEntity?>(null) }
     val gridState = rememberLazyGridState()
     var refreshing by remember { mutableStateOf(false) }
+    // Extra bottom space so the last row can scroll clear of the floating glass pill
+    // (pill height + spacing) and above the system gesture inset.
+    val pillClearance = 96.dp + WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()
 
     // Keep the host (RootScreen) in sync so it can hide the bottom nav while the
     // image viewer is open.
@@ -206,7 +212,9 @@ fun GalleryScreen(onViewerOpenChange: (Boolean) -> Unit) {
                         state = gridState,
                         columns = GridCells.Adaptive(110.dp),
                         modifier = Modifier.fillMaxSize(),
-                        contentPadding = PaddingValues(10.dp),
+                        contentPadding = PaddingValues(
+                            start = 10.dp, top = 10.dp, end = 10.dp, bottom = 10.dp + pillClearance,
+                        ),
                     ) {
                         if (shots.itemCount == 0) {
                             item(span = { GridItemSpan(maxLineSpan) }) {

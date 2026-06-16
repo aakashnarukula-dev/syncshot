@@ -13,10 +13,12 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.AccountCircle
@@ -42,6 +44,8 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.app.screenshotx.R
 import com.app.screenshotx.data.FirebaseRepo
+import dev.chrisbanes.haze.HazeState
+import dev.chrisbanes.haze.hazeSource
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -63,6 +67,9 @@ fun RootScreen(onSignedOut: () -> Unit) {
     var showProfile by remember { mutableStateOf(false) }
     // GalleryScreen raises this when an image is opened; chrome hides while true.
     var viewerOpen by remember { mutableStateOf(false) }
+    // Backdrop source for the floating glass pill: the scrolling content registers
+    // as the haze source; the pill samples it (blurred on API 31+).
+    val hazeState = remember { HazeState() }
 
     // The header's upload action: import an image and publish it as a screenshot
     // (same behavior the old gallery "+" had — only the glyph changed).
@@ -104,18 +111,27 @@ fun RootScreen(onSignedOut: () -> Unit) {
                             },
                             onProfile = { showProfile = true },
                         )
-                        NavPill(
-                            selected = tab,
-                            onSelect = { tab = it },
-                            modifier = Modifier
-                                .align(Alignment.CenterHorizontally)
-                                .padding(bottom = 8.dp),
-                        )
                     }
                     Box(Modifier.fillMaxWidth().weight(1f)) {
-                        when (tab) {
-                            0 -> GalleryScreen(onViewerOpenChange = { viewerOpen = it })
-                            else -> ClipboardScreen(embedded = true)
+                        // Content fills the area and scrolls *behind* the floating pill.
+                        // It registers as the haze backdrop source the pill samples.
+                        Box(Modifier.fillMaxSize().hazeSource(hazeState)) {
+                            when (tab) {
+                                0 -> GalleryScreen(onViewerOpenChange = { viewerOpen = it })
+                                else -> ClipboardScreen(embedded = true)
+                            }
+                        }
+                        // Floating glass toggle, pinned bottom-center above the gesture inset.
+                        if (!viewerOpen) {
+                            NavPill(
+                                selected = tab,
+                                onSelect = { tab = it },
+                                hazeState = hazeState,
+                                modifier = Modifier
+                                    .align(Alignment.BottomCenter)
+                                    .windowInsetsPadding(WindowInsets.navigationBars)
+                                    .padding(bottom = 18.dp),
+                            )
                         }
                     }
                 }

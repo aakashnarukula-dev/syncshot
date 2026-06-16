@@ -1,20 +1,15 @@
 package com.app.screenshotx.ui
 
+import android.os.Build
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.ContentPaste
-import androidx.compose.material.icons.filled.PhotoLibrary
-import androidx.compose.material3.Icon
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -23,61 +18,83 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.selected
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
+import dev.chrisbanes.haze.HazeState
+import dev.chrisbanes.haze.hazeEffect
+import dev.chrisbanes.haze.materials.ExperimentalHazeMaterialsApi
+import dev.chrisbanes.haze.materials.HazeMaterials
 
-/** Compact segmented toggle that replaces the old ScreenshotX/ClipboardX bottom
- *  tabs: a dark rounded pill with two segments — "Screenshots" (image) and
- *  "Text" (clipboard). The active segment sits on a raised, highlighted chip.
- *  Mirrors the macOS app's edge-pill control. Tab 0 = Screenshots, 1 = Text. */
+/** Floating "Screenshots | Text" toggle — a translucent iOS-26 "liquid glass"
+ *  capsule that floats at the bottom-center over the scrolling content. On API 31+
+ *  it renders a real backdrop blur (Haze samples the [hazeState] source layer); on
+ *  older devices it degrades to a tasteful semi-transparent tinted capsule. The
+ *  active segment sits on a slightly more opaque chip so it stays readable on glass.
+ *  Tab 0 = Screenshots, 1 = Text. Behavior is unchanged from the old top pill. */
+@OptIn(ExperimentalHazeMaterialsApi::class)
 @Composable
-fun NavPill(selected: Int, onSelect: (Int) -> Unit, modifier: Modifier = Modifier) {
+fun NavPill(
+    selected: Int,
+    onSelect: (Int) -> Unit,
+    hazeState: HazeState,
+    modifier: Modifier = Modifier,
+) {
+    val shape = CircleShape
+    // Real RenderEffect backdrop blur is API 31+. Below that, Haze can't blur, so we
+    // paint a clean translucent tint instead of a broken/opaque surface.
+    val supportsBlur = Build.VERSION.SDK_INT >= 31
     Row(
         modifier
-            .clip(RoundedCornerShape(50))
-            .background(MaterialTheme.colorScheme.surfaceVariant)
-            .padding(4.dp),
+            .shadow(elevation = 12.dp, shape = shape, clip = false)
+            .clip(shape)
+            .then(
+                if (supportsBlur) {
+                    Modifier.hazeEffect(state = hazeState, style = HazeMaterials.ultraThin())
+                } else {
+                    Modifier.background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.86f))
+                }
+            )
+            .border(width = 1.dp, color = Color.White.copy(alpha = 0.18f), shape = shape)
+            .padding(5.dp),
         horizontalArrangement = Arrangement.spacedBy(4.dp),
+        verticalAlignment = Alignment.CenterVertically,
     ) {
-        PillSegment(
-            label = "Screenshots",
-            icon = Icons.Filled.PhotoLibrary,
-            active = selected == 0,
-            onClick = { onSelect(0) },
-        )
-        PillSegment(
-            label = "Text",
-            icon = Icons.Filled.ContentPaste,
-            active = selected == 1,
-            onClick = { onSelect(1) },
-        )
+        PillSegment(label = "Screenshots", active = selected == 0, onClick = { onSelect(0) })
+        PillSegment(label = "Text", active = selected == 1, onClick = { onSelect(1) })
     }
 }
 
 @Composable
-private fun PillSegment(label: String, icon: ImageVector, active: Boolean, onClick: () -> Unit) {
+private fun PillSegment(label: String, active: Boolean, onClick: () -> Unit) {
+    // A subtle white chip behind the active segment keeps it legible on the glass.
     val bg by animateColorAsState(
-        if (active) MaterialTheme.colorScheme.surface else androidx.compose.ui.graphics.Color.Transparent,
+        if (active) Color.White.copy(alpha = 0.22f) else Color.Transparent,
         label = "pillSegBg",
     )
     val fg by animateColorAsState(
-        if (active) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant,
+        if (active) Color.White else Color.White.copy(alpha = 0.66f),
         label = "pillSegFg",
     )
-    Row(
-        Modifier
-            .clip(RoundedCornerShape(50))
+    Text(
+        text = label,
+        color = fg,
+        style = MaterialTheme.typography.labelLarge,
+        modifier = Modifier
+            .clip(CircleShape)
             .background(bg)
             .clickable(
                 interactionSource = remember { MutableInteractionSource() },
                 indication = null,
                 onClick = onClick,
             )
-            .padding(horizontal = 14.dp, vertical = 7.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Icon(icon, contentDescription = label, tint = fg, modifier = Modifier.size(16.dp))
-        Spacer(Modifier.width(6.dp))
-        Text(label, color = fg, style = MaterialTheme.typography.labelLarge)
-    }
+            .semantics {
+                contentDescription = label
+                this.selected = active
+            }
+            .padding(horizontal = 18.dp, vertical = 9.dp),
+    )
 }

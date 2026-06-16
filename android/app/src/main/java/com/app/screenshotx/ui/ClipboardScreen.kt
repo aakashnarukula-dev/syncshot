@@ -11,10 +11,14 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.asPaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.lazy.LazyColumn
@@ -117,9 +121,14 @@ fun ClipboardScreen(embedded: Boolean = false) {
             },
             modifier = Modifier.fillMaxSize(),
         ) {
+            // When embedded under RootScreen, leave room for the floating glass pill
+            // (pill height + spacing + gesture inset) so the last row scrolls clear.
+            val pillClearance =
+                if (embedded) 96.dp + WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()
+                else 0.dp
             LazyColumn(
                 Modifier.fillMaxSize(),
-                contentPadding = androidx.compose.foundation.layout.PaddingValues(12.dp),
+                contentPadding = PaddingValues(start = 12.dp, top = 12.dp, end = 12.dp, bottom = 12.dp + pillClearance),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 if (sorted.isEmpty()) {
