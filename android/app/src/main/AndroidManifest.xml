@@ -62,6 +62,23 @@
             android:excludeFromRecents="true"
             android:theme="@android:style/Theme.Translucent.NoTitleBar" />
 
+        <!-- Share target: shared URLs/text from another app's share sheet route
+             here (ACTION_SEND text/plain) and get saved via writeClipboard. This
+             is the reliable capture path for a "share URL" action, which never
+             triggers the background clipboard listener. -->
+        <activity
+            android:name=".sync.ShareActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:label="@string/app_name"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar">
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="text/plain" />
+            </intent-filter>
+        </activity>
+
         <service
             android:name=".sync.SyncService"
             android:exported="false"
