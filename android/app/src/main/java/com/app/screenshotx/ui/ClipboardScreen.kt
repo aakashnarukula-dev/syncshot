@@ -11,10 +11,14 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.asPaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.lazy.LazyColumn
@@ -54,9 +58,12 @@ import com.app.screenshotx.data.FirebaseRepo
 import com.app.screenshotx.sync.ClipboardCaptureService
 import kotlinx.coroutines.launch
 
+/** @param embedded true when shown under the shared header + Screenshots|Text pill
+ *  (RootScreen) — it then drops its own status-bar inset and "ClipboardX" title to
+ *  avoid a duplicate header. Standalone (false) keeps the old self-contained chrome. */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun ClipboardScreen() {
+fun ClipboardScreen(embedded: Boolean = false) {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -87,12 +94,14 @@ fun ClipboardScreen() {
         Toast.makeText(ctx, "Copied", Toast.LENGTH_SHORT).show()
     }
 
-    Column(Modifier.fillMaxSize().statusBarsPadding()) {
-        Text(
-            "ClipboardX",
-            style = MaterialTheme.typography.titleLarge,
-            modifier = Modifier.padding(start = 16.dp, top = 8.dp, bottom = 8.dp),
-        )
+    Column(Modifier.fillMaxSize().then(if (embedded) Modifier else Modifier.statusBarsPadding())) {
+        if (!embedded) {
+            Text(
+                "ClipboardX",
+                style = MaterialTheme.typography.titleLarge,
+                modifier = Modifier.padding(start = 16.dp, top = 8.dp, bottom = 8.dp),
+            )
+        }
 
         if (!captureEnabled) {
             CaptureOnboarding {
@@ -112,9 +121,14 @@ fun ClipboardScreen() {
             },
             modifier = Modifier.fillMaxSize(),
         ) {
+            // When embedded under RootScreen, leave room for the floating glass pill
+            // (pill height + spacing + gesture inset) so the last row scrolls clear.
+            val pillClearance =
+                if (embedded) 96.dp + WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()
+                else 0.dp
             LazyColumn(
                 Modifier.fillMaxSize(),
-                contentPadding = androidx.compose.foundation.layout.PaddingValues(12.dp),
+                contentPadding = PaddingValues(start = 12.dp, top = 12.dp, end = 12.dp, bottom = 12.dp + pillClearance),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 if (sorted.isEmpty()) {

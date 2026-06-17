@@ -2,9 +2,6 @@ package com.app.screenshotx.ui
 
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.PickVisualMediaRequest
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
@@ -25,10 +22,13 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.asPaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -42,7 +42,6 @@ import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.outlined.Delete
@@ -116,17 +115,44 @@ private fun localFile(ctx: Context, sha: String): File? {
  *  thumb, then the full. Returns null only while the upload still lags (no thumb,
  *  no full, no local) — the tile shows a spinner and re-binds when the doc flips
  *  to status "thumb"/"full" (Room upsert → Paging invalidation → recompose). */
-private fun imageModel(ctx: Context, item: ScreenshotEntity, local: File?, preferFull: Boolean): ImageRequest? {
+private fun imageModel(
+    ctx: Context,
+    item: ScreenshotEntity,
+    local: File?,
+    preferFull: Boolean,
+    thumbOnly: Boolean = false,
+    targetSizePx: Int? = null,
+): ImageRequest? {
     val b = ImageRequest.Builder(ctx).crossfade(true)
+    // Grid cells are tiny; cap the decode so Coil never builds a full-res bitmap
+    // for a thumbnail (saves memory + decode time). Viewer leaves this null for
+    // full resolution so pinch-zoom stays sharp.
+    if (targetSizePx != null) b.size(targetSizePx)
     if (local != null) {
         return b.data(local).memoryCacheKey("${item.sha256}:l").diskCacheKey("${item.sha256}:l").build()
     }
     val first = if (preferFull) item.fullPath else item.thumbPath
     val second = if (preferFull) item.thumbPath else item.fullPath
     val suffix = if (preferFull) ":f" else ":t"
-    if (!first.isNullOrBlank())
-        return b.data(FirebaseRepo.storageRef(first)).memoryCacheKey("${item.sha256}$suffix")
-            .diskCacheKey("${item.sha256}$suffix").build()
+    if (!first.isNullOrBlank()) {
+        val rb = b.data(FirebaseRepo.storageRef(first)).memoryCacheKey("${item.sha256}$suffix")
+            .diskCacheKey("${item.sha256}$suffix")
+        // Viewer (preferFull) requests the full image, which isn't cached yet when
+        // there's no local file → it would download over a black screen. Point it at
+        // the thumb the grid tile already cached so it paints instantly (upscaled for
+        // a split second) and crossfades to full. Falls back to the ":any" key the
+        // grid uses when a shot only has a full (no thumb) blob.
+        if (preferFull) {
+            val ph = if (!item.thumbPath.isNullOrBlank()) "${item.sha256}:t" else "${item.sha256}:any"
+            rb.placeholderMemoryCacheKey(ph)
+        }
+        return rb.build()
+    }
+    // Grid tiles must NEVER download the full image (up to 64MB) into a small cell.
+    // If there's no thumb (and no local file) yet, return null so the tile stays a
+    // placeholder and re-binds once the thumb blob lands (doc flips → Paging
+    // invalidation → recompose), instead of pulling the full PNG over the network.
+    if (thumbOnly) return null
     if (!second.isNullOrBlank())
         return b.data(FirebaseRepo.storageRef(second)).memoryCacheKey("${item.sha256}:any")
             .diskCacheKey("${item.sha256}:any").build()
@@ -147,6 +173,9 @@ fun GalleryScreen(onViewerOpenChange: (Boolean) -> Unit) {
     var selected by remember { mutableStateOf<ScreenshotEntity?>(null) }
     val gridState = rememberLazyGridState()
     var refreshing by remember { mutableStateOf(false) }
+    // Extra bottom space so the last row can scroll clear of the floating glass pill
+    // (pill height + spacing) and above the system gesture inset.
+    val pillClearance = 96.dp + WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()
 
     // Keep the host (RootScreen) in sync so it can hide the bottom nav while the
     // image viewer is open.
@@ -163,49 +192,12 @@ fun GalleryScreen(onViewerOpenChange: (Boolean) -> Unit) {
         }.distinctUntilChanged().collect { nearEnd -> if (nearEnd) ScreenshotPaging.loadMore() }
     }
 
-    val pickMedia = rememberLauncherForActivityResult(
-        ActivityResultContracts.PickMultipleVisualMedia()
-    ) { uris ->
-        if (uris.isNotEmpty()) {
-            scope.launch {
-                var failures = 0
-                for (uri in uris) {
-                    val ok = withContext(Dispatchers.IO) {
-                        runCatching {
-                            val bytes = ctx.contentResolver.openInputStream(uri)?.use { it.readBytes() }
-                                ?: return@runCatching false
-                            FirebaseRepo.publishScreenshot(ctx, bytes); true
-                        }.getOrDefault(false)
-                    }
-                    if (!ok) failures++
-                }
-                if (failures > 0) {
-                    Toast.makeText(ctx, "$failures image(s) failed to upload", Toast.LENGTH_SHORT).show()
-                }
-            }
-        }
-    }
-
     AnimatedContent(
         targetState = selected,
         transitionSpec = { fadeIn(tween(220)) togetherWith fadeOut(tween(220)) },
         label = "viewer",
     ) { sel ->
         if (sel == null) {
-            Column(Modifier.fillMaxSize().statusBarsPadding()) {
-                Row(
-                    Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Text("ScreenshotX", style = MaterialTheme.typography.titleLarge)
-                    IconButton(onClick = {
-                        pickMedia.launch(
-                            PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
-                        )
-                    }) { Icon(Icons.Filled.Add, "Add image") }
-                }
-
                 PullToRefreshBox(
                     isRefreshing = refreshing,
                     onRefresh = {
@@ -220,7 +212,9 @@ fun GalleryScreen(onViewerOpenChange: (Boolean) -> Unit) {
                         state = gridState,
                         columns = GridCells.Adaptive(110.dp),
                         modifier = Modifier.fillMaxSize(),
-                        contentPadding = PaddingValues(10.dp),
+                        contentPadding = PaddingValues(
+                            start = 10.dp, top = 10.dp, end = 10.dp, bottom = 10.dp + pillClearance,
+                        ),
                     ) {
                         if (shots.itemCount == 0) {
                             item(span = { GridItemSpan(maxLineSpan) }) {
@@ -243,7 +237,6 @@ fun GalleryScreen(onViewerOpenChange: (Boolean) -> Unit) {
                         }
                     }
                 }
-            }
         } else {
             FullScreenViewer(
                 items = shots.itemSnapshotList.items,
@@ -270,7 +263,8 @@ private fun GalleryTile(ctx: Context, item: ScreenshotEntity, onClick: () -> Uni
         }
     }
     val model = remember(item.id, item.thumbPath, item.fullPath, local) {
-        imageModel(ctx, item, local, preferFull = false)
+        // Grid: thumb (or local) only — never the full image — decoded small.
+        imageModel(ctx, item, local, preferFull = false, thumbOnly = true, targetSizePx = 384)
     }
     // Spinner only while actively loading. Error (e.g. a 404 from a blob deleted on
     // the cloud) settles to the grey surface instead of spinning forever.

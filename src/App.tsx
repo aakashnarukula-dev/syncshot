@@ -12,7 +12,11 @@ import { editorActions } from "@/stores/editorStore";
 import { loadLicenseStatus, type LicenseStatus } from "@/lib/license";
 import { Paywall } from "@/components/Paywall";
 // Light module (zustand + types only — no Firebase): safe in the entry chunk.
-import { registerRenameCapturePath, useSyncStore } from "@/stores/syncStore";
+import { registerRenameCapturePath, useScreenshots, useSyncStore } from "@/stores/syncStore";
+// Firebase-FREE column ordering (own module so the heavy Firebase SDK stays off
+// this startup-critical path): order the edge column by each screenshot's true
+// creation time, not file mtime.
+import { orderScreenshotsByCreatedAt } from "@/lib/sync/order";
 // Startup-critical: static import so it ships in the entry chunk and never
 // needs a runtime protocol fetch that can stall behind the launch IPC burst.
 import { ScreenshotThumbnail } from "./components/ScreenshotThumbnail";
@@ -549,10 +553,10 @@ function MainApp() {
     setOpenSignal((n) => n + 1);
   }, [setColumnViewBoth]);
 
-  // Idle-based auto-hide: restarts a 5s countdown on every pointer signal. There
+  // Idle-based auto-hide: restarts a 10s countdown on every pointer signal. There
   // is NO sticky "hovering" flag — a flag wedges open forever if a mouseleave is
   // missed (e.g. the window moves out from under a stationary cursor on open).
-  // Instead, any activity re-arms the timer, and 5s of no activity collapses it.
+  // Instead, any activity re-arms the timer, and 10s of no activity collapses it.
   const startAutoHide = useCallback(() => {
     if (autoHideTimerRef.current) clearTimeout(autoHideTimerRef.current);
     autoHideTimerRef.current = null;
@@ -595,7 +599,7 @@ function MainApp() {
       // Play the slide-out animation (same as the manual collapse button)
       // rather than snapping straight to the collapsed pill.
       setCollapseSignal((n) => n + 1);
-    }, 5_000);
+    }, 10_000);
   }, []);
 
   const pauseAutoHide = useCallback(() => {
@@ -867,15 +871,23 @@ function MainApp() {
           }
         }
 
+        // Detect file add/remove by SET membership, not positional equality:
+        // the column is ordered by creation time (below), which differs from the
+        // mtime order `disk` arrives in, so a positional diff would fire every
+        // poll. Re-ordering on doc/createdAt updates is handled by its own effect.
         const current = thumbsRef.current;
-        const changed =
-          disk.length !== current.length ||
-          disk.some((p, i) => p !== current[i]);
-        if (!changed) return;
-
-        const newOnes = disk.filter((p) => !current.includes(p));
+        const currentSet = new Set(current);
+        const diskSet = new Set(disk);
+        const newOnes = disk.filter((p) => !currentSet.has(p));
+        const removed = current.some((p) => !diskSet.has(p));
         const hasNew = newOnes.length > 0;
-        const next = updateThumbs(() => disk);
+        if (!hasNew && !removed) return;
+
+        // Order newest-first by true creation time (doc createdAt → shot_{ts} →
+        // mtime), NOT the raw mtime order `disk` comes in — see the bug where a
+        // re-downloaded phone shot's fresh mtime floated it above an older Mac
+        // capture on reopen.
+        const next = updateThumbs(() => orderScreenshotsByCreatedAt(disk));
 
         // A normal decorated window (Library/Preferences) is showing — keep the
         // thumb list current but don't switch mode or re-apply column geometry,
@@ -916,6 +928,23 @@ function MainApp() {
       clearInterval(interval);
     };
   }, [saveDir, syncAuthState, updateThumbs, startAutoHide]);
+
+  // Re-order the column whenever the synced doc set changes. On quit/reopen the
+  // poll hydrates from disk BEFORE the Firebase subscription has loaded (it's
+  // deferred off the critical path), so a received `{docId}.png` shot can't yet
+  // resolve its createdAt and lands in mtime order. Once `screenshots` arrives,
+  // re-sort in place so the newest shot — Mac or phone — settles on top and the
+  // order is stable. Own `shot_{ts}` captures already sort right from the start
+  // (their epoch is in the filename); this fixes the doc-id-named ones.
+  const screenshotDocs = useScreenshots();
+  useEffect(() => {
+    const cur = thumbsRef.current;
+    if (cur.length === 0) return;
+    const ordered = orderScreenshotsByCreatedAt(cur);
+    const same =
+      ordered.length === cur.length && ordered.every((p, i) => p === cur[i]);
+    if (!same) updateThumbs(() => ordered);
+  }, [screenshotDocs, updateThumbs]);
 
 
   const handleCapture = useCallback(async (captureMode: CaptureMode = "region") => {
@@ -989,7 +1018,13 @@ function MainApp() {
         });
       }
 
-      const next = updateThumbs((prev) => [finalPath, ...prev]);
+      // Prepend the just-captured shot, then re-apply the creation-time order so
+      // the session order matches what a quit/reopen will render. Its name is
+      // `shot_{now}.png`, so its capture epoch ranks it on top — and it stays on
+      // top after reopen (its createdAt/shot_{ts} outranks every existing shot).
+      const next = updateThumbs((prev) =>
+        orderScreenshotsByCreatedAt([finalPath, ...prev]),
+      );
       setMode("thumbnail");
       isCollapsedRef.current = false;
       setIsCollapsed(false);
