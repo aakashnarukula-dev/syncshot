@@ -3,6 +3,8 @@ package com.app.screenshotx.ui
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.VectorConverter
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
@@ -14,6 +16,7 @@ import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.calculatePan
 import androidx.compose.foundation.gestures.calculateZoom
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Arrangement
@@ -346,8 +349,11 @@ private fun FullScreenViewer(
             modifier = Modifier.fillMaxSize(),
         ) { page ->
             val item = items[page]
-            var scale by remember(item.id) { mutableFloatStateOf(1f) }
-            var pan by remember(item.id) { mutableStateOf(Offset.Zero) }
+            val scaleAnim = remember(item.id) { Animatable(1f) }
+            val panAnim = remember(item.id) { Animatable(Offset.Zero, Offset.VectorConverter) }
+            val pageScope = rememberCoroutineScope()
+            val scale = scaleAnim.value
+            val pan = panAnim.value
             val isCurrent = page == pagerState.currentPage
             val model = remember(item.id, item.thumbPath, item.fullPath) {
                 imageModel(ctx, item, localFile(ctx, item.sha256), preferFull = true)
@@ -372,22 +378,57 @@ private fun FullScreenViewer(
                                 val zoom = event.calculateZoom()
                                 val panChange = event.calculatePan()
                                 if (zoom != 1f) {
-                                    scale = (scale * zoom).coerceIn(1f, 4f)
-                                    pagerScrollEnabled = scale <= 1f
+                                    val next = (scaleAnim.value * zoom).coerceIn(1f, 4f)
+                                    pageScope.launch { scaleAnim.snapTo(next) }
+                                    pagerScrollEnabled = next <= 1f
                                 }
-                                if (scale > 1f) {
-                                    pan += panChange
+                                if (scaleAnim.value > 1f) {
+                                    val next = panAnim.value + panChange
+                                    pageScope.launch { panAnim.snapTo(next) }
                                     event.changes.forEach { if (it.positionChanged()) it.consume() }
                                 } else if (abs(panChange.y) > abs(panChange.x)) {
                                     dismissY += panChange.y
                                 }
                             } while (event.changes.any { it.pressed })
-                            if (scale <= 1f) {
-                                pan = Offset.Zero
+                            if (scaleAnim.value <= 1f) {
+                                pageScope.launch { panAnim.snapTo(Offset.Zero) }
                                 pagerScrollEnabled = true
                                 if (dismissY > 300f) onClose() else dismissY = 0f
                             }
                         }
+                    }
+                    .pointerInput(item.id) {
+                        detectTapGestures(
+                            onDoubleTap = { tapOffset ->
+                                if (scaleAnim.value > 1f) {
+                                    // Already zoomed → animate back to fit.
+                                    pagerScrollEnabled = true
+                                    pageScope.launch { scaleAnim.animateTo(1f, tween(220)) }
+                                    pageScope.launch { panAnim.animateTo(Offset.Zero, tween(220)) }
+                                } else {
+                                    // Zoom IN toward the tapped point. Keep the tap location
+                                    // anchored: with a graphicsLayer that scales about the
+                                    // view centre then translates, the pan that keeps point
+                                    // p fixed is (1 - target) * (p - centre).
+                                    val target = 2.5f
+                                    val cx = size.width / 2f
+                                    val cy = size.height / 2f
+                                    val rawX = (1f - target) * (tapOffset.x - cx)
+                                    val rawY = (1f - target) * (tapOffset.y - cy)
+                                    // Coerce so we don't reveal empty edges past the image
+                                    // bounds (max content overhang each side after scaling).
+                                    val maxX = (size.width * (target - 1f)) / 2f
+                                    val maxY = (size.height * (target - 1f)) / 2f
+                                    val target2 = Offset(
+                                        rawX.coerceIn(-maxX, maxX),
+                                        rawY.coerceIn(-maxY, maxY),
+                                    )
+                                    pagerScrollEnabled = false
+                                    pageScope.launch { scaleAnim.animateTo(target, tween(220)) }
+                                    pageScope.launch { panAnim.animateTo(target2, tween(220)) }
+                                }
+                            },
+                        )
                     },
             )
         }
