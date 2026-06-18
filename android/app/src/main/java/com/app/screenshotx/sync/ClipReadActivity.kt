@@ -36,8 +36,16 @@ class ClipReadActivity : Activity() {
         window.addFlags(WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE)
         overridePendingTransition(0, 0)
         Log.i(TAG, "ClipReadActivity created (foreground moment)")
-        // Safety net: if focus never arrives, force a final attempt and finish.
-        timeout.postDelayed({ tryRead(final = true) }, TIMEOUT_MS)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // A background-launched 1px/alpha-0 window often never gets onWindowFocusChanged(true), and
+        // the clipboard read is denied until we are actually the foreground app — which lands a beat
+        // after onResume. So instead of a single timed read, POLL with backoff: the first attempt
+        // that the OS lets through wins. Much more reliable (and faster) than one 2s timeout, which
+        // could be missed entirely if the activity is torn down early.
+        poll(0)
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
@@ -45,24 +53,34 @@ class ClipReadActivity : Activity() {
         if (hasFocus) tryRead(final = false)
     }
 
-    private fun tryRead(final: Boolean) {
+    /** Attempt a read; if still denied/empty, retry on a backoff schedule until [READ_BACKOFF_MS] runs out. */
+    private fun poll(idx: Int) {
         if (handled) return
+        if (tryRead(final = idx >= READ_BACKOFF_MS.size - 1)) return
+        if (idx < READ_BACKOFF_MS.size - 1) {
+            timeout.postDelayed({ poll(idx + 1) }, READ_BACKOFF_MS[idx + 1] - READ_BACKOFF_MS[idx])
+        }
+    }
+
+    /** @return true once handled (published or finally gave up); false if a retry should follow. */
+    private fun tryRead(final: Boolean): Boolean {
+        if (handled) return true
         val text = readClipOrFallback()
         if (text.isBlank()) {
             if (final) {
                 Log.w(TAG, "foreground read empty + no fallback, giving up")
                 handled = true
                 doFinish()
-            } else {
-                Log.i(TAG, "read empty on focus, awaiting retry/timeout")
+                return true
             }
-            return
+            return false
         }
         handled = true
         timeout.removeCallbacksAndMessages(null)
         Log.i(TAG, "foreground read OK len=${text.length}")
         ClipboardCaptureService.publish(applicationContext, "fg-read", text)
         doFinish()
+        return true
     }
 
     private fun readClipOrFallback(): String {
@@ -102,7 +120,9 @@ class ClipReadActivity : Activity() {
 
     companion object {
         private const val TAG = "SSXClip"
-        private const val TIMEOUT_MS = 2000L
+
+        /** Cumulative ms offsets to retry the clipboard read at (covers ~2.5s of focus latency). */
+        private val READ_BACKOFF_MS = longArrayOf(0, 120, 280, 500, 800, 1200, 1700, 2300)
         const val EXTRA_FALLBACK = "fallback_text"
     }
 }

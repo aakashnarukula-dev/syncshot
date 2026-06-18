@@ -53,11 +53,17 @@ class ClipboardCaptureService : AccessibilityService() {
     /** Most recent text selection seen via accessibility events (primary publish source). */
     @Volatile private var lastSelectionText: String? = null
 
+    /** When [lastSelectionText] was last updated — gates the speculative selection-copy fallback. */
+    @Volatile private var lastSelectionAt = 0L
+
     /** Debounce: a single copy can fire the listener several times in a row. */
     private var lastFireAt = 0L
 
     /** Debounce: a copy tap can emit several click events; also stops listener+a11y racing. */
     private var lastCopyClickAt = 0L
+
+    /** Debounce: one copy emits several "Copied to clipboard" toasts (app toast + system toast). */
+    private var lastToastReadAt = 0L
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -140,6 +146,7 @@ class ClipboardCaptureService : AccessibilityService() {
             AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED -> trackSelection(event)
             AccessibilityEvent.TYPE_VIEW_CLICKED,
             AccessibilityEvent.TYPE_VIEW_LONG_CLICKED -> maybeCopyClick(event)
+            AccessibilityEvent.TYPE_NOTIFICATION_STATE_CHANGED -> maybeClipboardToast(event)
         }
     }
 
@@ -155,6 +162,7 @@ class ClipboardCaptureService : AccessibilityService() {
                 full.substring(from, to) else null
             if (!sel.isNullOrBlank()) {
                 lastSelectionText = sel
+                lastSelectionAt = SystemClock.uptimeMillis()
                 Log.i(TAG, "selection tracked len=${sel.length}")
             }
         } catch (e: Throwable) {
@@ -171,11 +179,37 @@ class ClipboardCaptureService : AccessibilityService() {
     private fun maybeCopyClick(event: AccessibilityEvent) {
         val label = clickedLabel(event)
         if (label == null) {
-            Log.i(TAG, "click no usable label (near-miss)")
+            Log.i(
+                TAG,
+                "click no usable label (near-miss) cls=${event.className} pkg=${event.packageName}"
+            )
             return
         }
         if (!isCopyLabel(label)) {
-            Log.i(TAG, "click label not a copy action (near-miss)")
+            // Some apps (e.g. X/Twitter's in-app text selection) report the toolbar "Copy" tap as a
+            // CLICKED on the underlying text view — the label is the SELECTED text, not "Copy", and no
+            // "Copied" toast fires. If the clicked text matches the text we just saw selected, treat it
+            // as a probable copy and do a foreground-moment read. publish() de-dups, so a non-copy tap
+            // on selected text is harmless (reads the unchanged clip → skipped).
+            val sel = lastSelectionText
+            val nowSpec = SystemClock.uptimeMillis()
+            if (!sel.isNullOrBlank() && nowSpec - lastSelectionAt < SELECTION_WINDOW_MS &&
+                label.contains(sel)
+            ) {
+                if (nowSpec - lastCopyClickAt < DEBOUNCE_MS) {
+                    Log.i(TAG, "speculative selection-copy debounced (${nowSpec - lastCopyClickAt}ms)")
+                    return
+                }
+                lastCopyClickAt = nowSpec
+                Log.i(TAG, "click==recent selection, no copy label -> speculative foreground read")
+                launchForegroundRead()
+                return
+            }
+            Log.i(
+                TAG,
+                "click label not a copy action (near-miss) label='${label.take(40)}' " +
+                    "cls=${event.className} pkg=${event.packageName}"
+            )
             return
         }
         val now = SystemClock.uptimeMillis()
@@ -194,6 +228,39 @@ class ClipboardCaptureService : AccessibilityService() {
         }
     }
 
+    /**
+     * STRONG cross-app fallback. Many apps surface a copy NOT as a TYPE_VIEW_CLICKED on a labelled
+     * "Copy" button — on-device, X/Twitter's "Copy link" emits NO click event at all; its only a11y
+     * signal is the "Copied to clipboard" confirmation Toast (a TYPE_NOTIFICATION_STATE_CHANGED whose
+     * source is an android.widget.Toast). Android 13+ additionally shows a system "Copied to clipboard"
+     * toast (pkg com.android.systemui) for every copy. On such a toast we open the foreground-moment
+     * activity to read the ACTUAL clipboard and publish it.
+     *
+     * Safe because [publish] de-dups on [lastPublishedText] (a copy already captured by the click path
+     * won't double-publish). We also suppress this briefly right after a click-path copy to avoid a
+     * redundant invisible foreground-read, and debounce the duplicate toasts a single copy emits.
+     */
+    private fun maybeClipboardToast(event: AccessibilityEvent) {
+        val text = event.text?.joinToString(" ")?.lowercase()
+        if (text.isNullOrBlank() || !isCopyToast(text)) return
+        val now = SystemClock.uptimeMillis()
+        // The click path (Chrome / selection toolbar) already captured this copy.
+        if (now - lastCopyClickAt < TOAST_SUPPRESS_AFTER_CLICK_MS) {
+            Log.i(TAG, "copy-toast ignored (click path handled ${now - lastCopyClickAt}ms ago)")
+            return
+        }
+        // One copy emits several toasts (app toast then system toast, ~2s apart) — read once.
+        if (now - lastToastReadAt < TOAST_DEBOUNCE_MS) {
+            Log.i(TAG, "copy-toast debounced (${now - lastToastReadAt}ms)")
+            return
+        }
+        lastToastReadAt = now
+        Log.i(TAG, "copy-toast detected pkg=${event.packageName} -> foreground-moment read")
+        launchForegroundRead()
+    }
+
+    private fun isCopyToast(lower: String): Boolean = COPY_TOAST_HINTS.any { lower.contains(it) }
+
     /** Pull a usable label off a CLICKED node (event text, then source text/contentDescription). */
     private fun clickedLabel(event: AccessibilityEvent): String? {
         event.text?.joinToString("")?.trim()?.takeIf { it.isNotEmpty() }?.let { return it }
@@ -207,8 +274,15 @@ class ClipboardCaptureService : AccessibilityService() {
         }
     }
 
+    /**
+     * Robust, locale-tolerant copy-label match. Exact-matches the known labels, else does a
+     * word-boundary "copy"/"cut" match so variants like "Copy link to post", "Copy text",
+     * "Copy URL", "Cut" all count — while NOT matching substrings like "shortcut" or unrelated
+     * actions. Word boundary keeps it from firing on every label that happens to contain the
+     * letters.
+     */
     private fun isCopyLabel(label: String): Boolean =
-        COPY_LABELS.any { it.equals(label, ignoreCase = true) }
+        COPY_LABELS.any { it.equals(label, ignoreCase = true) } || COPY_WORD.containsMatchIn(label)
 
     override fun onInterrupt() {}
 
@@ -221,14 +295,32 @@ class ClipboardCaptureService : AccessibilityService() {
         private const val TAG = "SSXClip"
         private const val DEBOUNCE_MS = 400L
 
+        /** After a click-path copy, ignore the follow-up "Copied" toast (already captured). */
+        private const val TOAST_SUPPRESS_AFTER_CLICK_MS = 3000L
+
+        /** A single copy emits an app toast then a system toast ~2s apart — read once per window. */
+        private const val TOAST_DEBOUNCE_MS = 3000L
+
+        /** How recent a text selection must be to treat a matching CLICKED as a probable copy. */
+        private const val SELECTION_WINDOW_MS = 8000L
+
         /**
-         * Localized labels of the text-selection toolbar "copy" actions we react to.
-         * Device locale is en-IN; a few common variants are enough to cover the toolbar
-         * and "Copy link" affordances. Matched case-insensitively.
+         * Labels of the text-selection toolbar / share-sheet "copy" actions we react to. Device
+         * locale is en-IN. Exact list documents the common ones; [COPY_WORD] generalises it.
          */
         private val COPY_LABELS = listOf(
             "Copy", "Cut", "Copy text", "Copy link", "Copy link address", "Copy URL"
         )
+
+        /** Word-boundary "copy"/"cut" — matches "Copy link to post" but not "shortcut". */
+        private val COPY_WORD = Regex("\\b(copy|cut)\\b", RegexOption.IGNORE_CASE)
+
+        /**
+         * Substrings of a "copied to clipboard" confirmation toast (X's own toast + the Android 13+
+         * system toast). Lower-cased before matching. Covers "Copied to clipboard", "Link copied",
+         * "Copied!", etc. en-IN device.
+         */
+        private val COPY_TOAST_HINTS = listOf("copied", "clipboard")
 
         /** Process-lifetime scope so a publish survives the launching component finishing. */
         private val publishScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
