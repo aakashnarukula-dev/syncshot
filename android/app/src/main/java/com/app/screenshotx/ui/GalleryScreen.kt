@@ -16,7 +16,6 @@ import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.calculatePan
 import androidx.compose.foundation.gestures.calculateZoom
-import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Arrangement
@@ -74,6 +73,7 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.input.pointer.PointerEvent
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChanged
 import androidx.compose.ui.layout.ContentScale
@@ -371,64 +371,103 @@ private fun FullScreenViewer(
                         translationY = pan.y + (if (isCurrent) dismissY else 0f)
                     }
                     .pointerInput(item.id) {
+                        // ONE unified pointer pipeline so a double-tap is detected
+                        // reliably regardless of current zoom level. The previous design
+                        // had pinch/pan in awaitEachGesture (which greedily consumed
+                        // pointer changes while zoomed) PLUS a separate detectTapGestures
+                        // block — the gesture detector got starved when scale>1, so the
+                        // second double-tap (zoom-out) never fired. Here pinch, pan,
+                        // swipe-dismiss AND tap-counting all live in the same loop.
+                        val doubleTapTimeout = viewConfiguration.doubleTapTimeoutMillis
+                        val slop = viewConfiguration.touchSlop
+
+                        // Animate a double-tap toward the tapped point (zoom in) or back
+                        // to fit (zoom out), depending on current scale.
+                        fun toggleZoom(tapOffset: Offset) {
+                            if (scaleAnim.value > 1f) {
+                                pagerScrollEnabled = true
+                                pageScope.launch { scaleAnim.animateTo(1f, tween(220)) }
+                                pageScope.launch { panAnim.animateTo(Offset.Zero, tween(220)) }
+                            } else {
+                                // Keep the tapped point anchored: with a graphicsLayer that
+                                // scales about the view centre then translates, the pan that
+                                // keeps point p fixed is (1 - target) * (p - centre).
+                                val target = 2.5f
+                                val cx = size.width / 2f
+                                val cy = size.height / 2f
+                                val rawX = (1f - target) * (tapOffset.x - cx)
+                                val rawY = (1f - target) * (tapOffset.y - cy)
+                                val maxX = (size.width * (target - 1f)) / 2f
+                                val maxY = (size.height * (target - 1f)) / 2f
+                                val target2 = Offset(
+                                    rawX.coerceIn(-maxX, maxX),
+                                    rawY.coerceIn(-maxY, maxY),
+                                )
+                                pagerScrollEnabled = false
+                                pageScope.launch { scaleAnim.animateTo(target, tween(220)) }
+                                pageScope.launch { panAnim.animateTo(target2, tween(220)) }
+                            }
+                        }
+
+                        var lastTapUptime = 0L
+                        var lastTapPos = Offset.Zero
                         awaitEachGesture {
-                            awaitFirstDown(requireUnconsumed = false)
+                            val down = awaitFirstDown(requireUnconsumed = false)
+                            var maxPointers = 1
+                            var moved = false
+                            var event: PointerEvent
                             do {
-                                val event = awaitPointerEvent()
+                                event = awaitPointerEvent()
+                                maxPointers = maxOf(maxPointers, event.changes.count { it.pressed })
                                 val zoom = event.calculateZoom()
                                 val panChange = event.calculatePan()
                                 if (zoom != 1f) {
                                     val next = (scaleAnim.value * zoom).coerceIn(1f, 4f)
                                     pageScope.launch { scaleAnim.snapTo(next) }
                                     pagerScrollEnabled = next <= 1f
+                                    moved = true
                                 }
                                 if (scaleAnim.value > 1f) {
                                     val next = panAnim.value + panChange
                                     pageScope.launch { panAnim.snapTo(next) }
                                     event.changes.forEach { if (it.positionChanged()) it.consume() }
+                                    if (panChange.getDistance() > 0f) moved = true
                                 } else if (abs(panChange.y) > abs(panChange.x)) {
                                     dismissY += panChange.y
+                                    if (abs(panChange.y) > slop) moved = true
                                 }
                             } while (event.changes.any { it.pressed })
+
                             if (scaleAnim.value <= 1f) {
                                 pageScope.launch { panAnim.snapTo(Offset.Zero) }
                                 pagerScrollEnabled = true
-                                if (dismissY > 300f) onClose() else dismissY = 0f
+                                if (dismissY > 300f) {
+                                    onClose()
+                                    return@awaitEachGesture
+                                } else {
+                                    dismissY = 0f
+                                }
+                            }
+
+                            // Tap = single pointer, no significant movement. Count taps
+                            // manually to detect a double-tap toggle in BOTH directions.
+                            if (maxPointers == 1 && !moved) {
+                                val up = event.changes.firstOrNull() ?: down
+                                val now = up.uptimeMillis
+                                val pos = up.position
+                                if (now - lastTapUptime <= doubleTapTimeout &&
+                                    (pos - lastTapPos).getDistance() <= slop * 4
+                                ) {
+                                    toggleZoom(pos)
+                                    lastTapUptime = 0L
+                                } else {
+                                    lastTapUptime = now
+                                    lastTapPos = pos
+                                }
+                            } else {
+                                lastTapUptime = 0L
                             }
                         }
-                    }
-                    .pointerInput(item.id) {
-                        detectTapGestures(
-                            onDoubleTap = { tapOffset ->
-                                if (scaleAnim.value > 1f) {
-                                    // Already zoomed → animate back to fit.
-                                    pagerScrollEnabled = true
-                                    pageScope.launch { scaleAnim.animateTo(1f, tween(220)) }
-                                    pageScope.launch { panAnim.animateTo(Offset.Zero, tween(220)) }
-                                } else {
-                                    // Zoom IN toward the tapped point. Keep the tap location
-                                    // anchored: with a graphicsLayer that scales about the
-                                    // view centre then translates, the pan that keeps point
-                                    // p fixed is (1 - target) * (p - centre).
-                                    val target = 2.5f
-                                    val cx = size.width / 2f
-                                    val cy = size.height / 2f
-                                    val rawX = (1f - target) * (tapOffset.x - cx)
-                                    val rawY = (1f - target) * (tapOffset.y - cy)
-                                    // Coerce so we don't reveal empty edges past the image
-                                    // bounds (max content overhang each side after scaling).
-                                    val maxX = (size.width * (target - 1f)) / 2f
-                                    val maxY = (size.height * (target - 1f)) / 2f
-                                    val target2 = Offset(
-                                        rawX.coerceIn(-maxX, maxX),
-                                        rawY.coerceIn(-maxY, maxY),
-                                    )
-                                    pagerScrollEnabled = false
-                                    pageScope.launch { scaleAnim.animateTo(target, tween(220)) }
-                                    pageScope.launch { panAnim.animateTo(target2, tween(220)) }
-                                }
-                            },
-                        )
                     },
             )
         }
