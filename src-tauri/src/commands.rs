@@ -622,19 +622,17 @@ mod cg_cursor {
         fn CFRelease(cf: *const c_void);
     }
 
-    /// Returns the integer (x, y, width, height) rect — in the global,
-    /// top-left-origin display coordinate space — of the display currently
-    /// under the cursor. `None` if the cursor isn't over any display (capture
-    /// then falls back to the default main-display behavior).
-    pub fn cursor_display_rect() -> Option<(i64, i64, i64, i64)> {
-        unsafe {
-            let event = CGEventCreate(std::ptr::null_mut());
-            if event.is_null() {
-                return None;
-            }
-            let point = CGEventGetLocation(event);
-            CFRelease(event as *const c_void);
+    /// Convenience constructor so callers (e.g. Tauri commands) can build a
+    /// `CGPoint` without naming the framework struct's repr details.
+    pub fn point(x: f64, y: f64) -> CGPoint {
+        CGPoint { x, y }
+    }
 
+    /// Returns the integer (x, y, width, height) rect — in the global,
+    /// top-left-origin display coordinate space, in POINTS — of the display
+    /// whose bounds contain `point`. `None` if no display contains the point.
+    pub fn display_rect_for_point(point: CGPoint) -> Option<(i64, i64, i64, i64)> {
+        unsafe {
             let mut display: CGDirectDisplayID = 0;
             let mut count: u32 = 0;
             let err = CGGetDisplaysWithPoint(point, 1, &mut display, &mut count);
@@ -654,6 +652,22 @@ mod cg_cursor {
                 w,
                 h,
             ))
+        }
+    }
+
+    /// Returns the integer (x, y, width, height) rect — in the global,
+    /// top-left-origin display coordinate space — of the display currently
+    /// under the cursor. `None` if the cursor isn't over any display (capture
+    /// then falls back to the default main-display behavior).
+    pub fn cursor_display_rect() -> Option<(i64, i64, i64, i64)> {
+        unsafe {
+            let event = CGEventCreate(std::ptr::null_mut());
+            if event.is_null() {
+                return None;
+            }
+            let point = CGEventGetLocation(event);
+            CFRelease(event as *const c_void);
+            display_rect_for_point(point)
         }
     }
 
@@ -767,6 +781,28 @@ pub async fn get_mouse_position() -> Result<(f64, f64), String> {
     #[cfg(not(target_os = "macos"))]
     {
         Err("unsupported".into())
+    }
+}
+
+/// Returns the (x, y, width, height) rect — in the GLOBAL, top-left-origin
+/// display coordinate space, in POINTS (logical) — of the display containing
+/// the given point, or the display under the cursor when no point is supplied.
+/// This is the same coordinate space Tauri's `LogicalPosition`/`LogicalSize`
+/// use, so the frontend can place windows on the correct physical display
+/// regardless of mixed per-display scale factors.
+#[tauri::command]
+pub async fn cursor_display_bounds(x: Option<f64>, y: Option<f64>) -> Option<(i64, i64, i64, i64)> {
+    #[cfg(target_os = "macos")]
+    {
+        match (x, y) {
+            (Some(px), Some(py)) => cg_cursor::display_rect_for_point(cg_cursor::point(px, py)),
+            _ => cg_cursor::cursor_display_rect(),
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (x, y);
+        None
     }
 }
 

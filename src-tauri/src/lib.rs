@@ -13,7 +13,8 @@ mod screenshot;
 mod utils;
 
 use commands::{
-    capture_all_monitors, capture_once, capture_region, copy_to_clipboard, delete_file,
+    capture_all_monitors, capture_once, capture_region, copy_to_clipboard, cursor_display_bounds,
+    delete_file,
     download_synced_image, get_desktop_directory, get_desktop_root, get_mouse_position,
     file_exists, get_screenshot_thumbnail, get_temp_directory,
     list_screenshots, native_capture_fullscreen, native_capture_interactive,
@@ -276,6 +277,7 @@ pub fn run() {
             download_synced_image,
             set_clipboard_text,
             get_mouse_position,
+            cursor_display_bounds,
             get_machine_id,
             keychain_get,
             keychain_set,

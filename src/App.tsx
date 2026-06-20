@@ -1,6 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
-import { availableMonitors } from "@tauri-apps/api/window";
 import { getCurrentWindow, LogicalPosition, LogicalSize } from "@tauri-apps/api/window";
 import { getAllWebviewWindows } from "@tauri-apps/api/webviewWindow";
 import { register, unregister } from "@tauri-apps/plugin-global-shortcut";
@@ -121,55 +120,32 @@ const DEFAULT_SHORTCUTS: KeyboardShortcut[] = [
   { id: "window", action: "Capture Window", shortcut: "CommandOrControl+Shift+D", enabled: false },
 ];
 
-// Cache the active monitor's logical geometry so expanding from the pill needs
-// zero IPC (availableMonitors() round-trips to Rust). Refreshed on every query.
+// Cache the active display's logical geometry so expanding from the pill needs
+// zero IPC. Refreshed on every placement. Fields are GLOBAL top-left-origin
+// POINTS (the LogicalPosition space) — never divide by scaleFactor here.
 let cachedMon: { left: number; top: number; height: number } | null = null;
-function cacheMonitor(m: { position: { x: number; y: number }; size: { height: number }; scaleFactor: number }) {
-  const sf = m.scaleFactor || 1;
-  cachedMon = { left: m.position.x / sf, top: m.position.y / sf, height: m.size.height / sf };
+function cacheRect(rect: { left: number; top: number; height: number }) {
+  cachedMon = { left: rect.left, top: rect.top, height: rect.height };
 }
 
-type Monitor = Awaited<ReturnType<typeof availableMonitors>>[number];
-
-// availableMonitors() reports position/size in PHYSICAL px; setPosition uses
-// LOGICAL px and the AppleScript mouse coords are LOGICAL too. Convert each
-// monitor metric to logical via scaleFactor before hit-testing, otherwise the
-// column lands ~scaleFactor× too low on Retina screens.
-function monitorForCursor(
-  monitors: Monitor[],
+// Resolve the rect of the physical display under a point (or the cursor when no
+// point is given) via CoreGraphics (CGGetDisplaysWithPoint + CGDisplayBounds).
+// winit's availableMonitors() reports positions in a single global PHYSICAL
+// space, so dividing each monitor by its OWN scaleFactor mismatched the cursor's
+// display across mixed-DPI setups (retina built-in + scale-1 externals). The CG
+// rect is already in global top-left-origin POINTS = the LogicalPosition space.
+async function cursorDisplayRect(
   mouseX?: number,
   mouseY?: number,
-): Monitor | undefined {
-  const hit =
-    mouseX !== undefined && mouseY !== undefined
-      ? monitors.find((m) => {
-          const sf = m.scaleFactor || 1;
-          const px = m.position.x / sf;
-          const py = m.position.y / sf;
-          const sw = m.size.width / sf;
-          const sh = m.size.height / sf;
-          return mouseX >= px && mouseX < px + sw && mouseY >= py && mouseY < py + sh;
-        })
-      : null;
-  return hit || monitors[0];
-}
-
-// Resolve the monitor under the current cursor for the placement paths that have
-// no capture-supplied coords (collapsed reveal, dock-click resurface). Queries
-// the cursor (LOGICAL coords) and the monitor list, then reuses monitorForCursor.
-async function cursorMonitor(): Promise<Monitor | undefined> {
+): Promise<{ left: number; top: number; width: number; height: number } | null> {
   try {
-    const [[mx, my], monitors] = await Promise.all([
-      invoke<[number, number]>("get_mouse_position"),
-      availableMonitors(),
-    ]);
-    return monitorForCursor(monitors, mx, my);
+    const r = await invoke<[number, number, number, number] | null>("cursor_display_bounds", {
+      x: mouseX,
+      y: mouseY,
+    });
+    return r ? { left: r[0], top: r[1], width: r[2], height: r[3] } : null;
   } catch {
-    try {
-      return (await availableMonitors())[0];
-    } catch {
-      return undefined;
-    }
+    return null;
   }
 }
 
@@ -177,9 +153,10 @@ async function showThumbnailWindow(count: number, mouseX?: number, mouseY?: numb
   const appWindow = getCurrentWindow();
   const height = computeThumbWindowHeight(count);
 
-  // Kick off the monitor query immediately and run the geometry-independent
+  // Kick off the display query immediately and run the geometry-independent
   // window flags concurrently, instead of awaiting ~6 IPC calls one-by-one.
-  const monitorsPromise = availableMonitors();
+  // Passing undefined coords lets Rust fall back to the current cursor.
+  const rectPromise = cursorDisplayRect(mouseX, mouseY);
   const flags = Promise.all([
     appWindow.setDecorations(false).catch(() => {}),
     appWindow.setResizable(false).catch(() => {}),
@@ -189,27 +166,11 @@ async function showThumbnailWindow(count: number, mouseX?: number, mouseY?: numb
 
   let placed = false;
   try {
-    const monitors = await monitorsPromise;
-    let target: Monitor | undefined;
-    if (mouseX !== undefined && mouseY !== undefined) {
-      target = monitorForCursor(monitors, mouseX, mouseY);
-    } else {
-      try {
-        const [mx, my] = await invoke<[number, number]>("get_mouse_position");
-        target = monitorForCursor(monitors, mx, my);
-      } catch {
-        target = monitorForCursor(monitors, undefined, undefined);
-      }
-    }
-
-    if (target) {
-      cacheMonitor(target);
-      const sf = target.scaleFactor || 1;
-      const monLeft = target.position.x / sf;
-      const monTop = target.position.y / sf;
-      const monHeight = target.size.height / sf;
-      const x = monLeft; // flush to the left screen edge (pill touches edge)
-      const y = monTop + Math.max(THUMB_MARGIN, (monHeight - height) / 2);
+    const rect = await rectPromise;
+    if (rect) {
+      cacheRect(rect);
+      const x = rect.left; // flush to the left screen edge (pill touches edge)
+      const y = rect.top + Math.max(THUMB_MARGIN, (rect.height - height) / 2);
       await Promise.all([
         appWindow.setSize(new LogicalSize(THUMB_WIDTH, height)),
         appWindow.setPosition(new LogicalPosition(x, y)),
@@ -254,12 +215,11 @@ async function showCollapsedThumbnail() {
   try { await appWindow.setResizable(false); } catch {}
   await appWindow.setSize(new LogicalSize(COLLAPSED_WIDTH, COLLAPSED_HEIGHT));
   try {
-    const m = await cursorMonitor();
-    if (m) {
-      cacheMonitor(m);
-      const sf = m.scaleFactor || 1; // physical → logical (see showThumbnailWindow)
-      const x = m.position.x / sf;
-      const y = m.position.y / sf + Math.max(THUMB_MARGIN, (m.size.height / sf - COLLAPSED_HEIGHT) / 2);
+    const rect = await cursorDisplayRect();
+    if (rect) {
+      cacheRect(rect);
+      const x = rect.left;
+      const y = rect.top + Math.max(THUMB_MARGIN, (rect.height - COLLAPSED_HEIGHT) / 2);
       await appWindow.setPosition(new LogicalPosition(x, y));
     }
   } catch {}
@@ -276,8 +236,8 @@ async function expandThumbWindow(height: number) {
   const appWindow = getCurrentWindow();
   let mon = cachedMon;
   if (!mon) {
-    const m = await cursorMonitor();
-    if (m) cacheMonitor(m);
+    const rect = await cursorDisplayRect();
+    if (rect) cacheRect(rect);
     mon = cachedMon;
   }
   try {
@@ -299,8 +259,8 @@ async function resizeThumbWindowKeepingBottom(count: number) {
   try {
     let mon = cachedMon;
     if (!mon) {
-      const m = await cursorMonitor();
-      if (m) cacheMonitor(m);
+      const rect = await cursorDisplayRect();
+      if (rect) cacheRect(rect);
       mon = cachedMon;
     }
     const newH = computeThumbWindowHeight(count);
