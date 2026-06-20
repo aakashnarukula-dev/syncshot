@@ -25,3 +25,7 @@ dist-ssr
 
 # Claude Code
 CLAUDE.md
+
+# Tooling artifacts
+.playwright-mcp/
+firebase/.firebase/
