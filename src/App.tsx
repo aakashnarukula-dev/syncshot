@@ -129,6 +129,50 @@ function cacheMonitor(m: { position: { x: number; y: number }; size: { height: n
   cachedMon = { left: m.position.x / sf, top: m.position.y / sf, height: m.size.height / sf };
 }
 
+type Monitor = Awaited<ReturnType<typeof availableMonitors>>[number];
+
+// availableMonitors() reports position/size in PHYSICAL px; setPosition uses
+// LOGICAL px and the AppleScript mouse coords are LOGICAL too. Convert each
+// monitor metric to logical via scaleFactor before hit-testing, otherwise the
+// column lands ~scaleFactor× too low on Retina screens.
+function monitorForCursor(
+  monitors: Monitor[],
+  mouseX?: number,
+  mouseY?: number,
+): Monitor | undefined {
+  const hit =
+    mouseX !== undefined && mouseY !== undefined
+      ? monitors.find((m) => {
+          const sf = m.scaleFactor || 1;
+          const px = m.position.x / sf;
+          const py = m.position.y / sf;
+          const sw = m.size.width / sf;
+          const sh = m.size.height / sf;
+          return mouseX >= px && mouseX < px + sw && mouseY >= py && mouseY < py + sh;
+        })
+      : null;
+  return hit || monitors[0];
+}
+
+// Resolve the monitor under the current cursor for the placement paths that have
+// no capture-supplied coords (collapsed reveal, dock-click resurface). Queries
+// the cursor (LOGICAL coords) and the monitor list, then reuses monitorForCursor.
+async function cursorMonitor(): Promise<Monitor | undefined> {
+  try {
+    const [[mx, my], monitors] = await Promise.all([
+      invoke<[number, number]>("get_mouse_position"),
+      availableMonitors(),
+    ]);
+    return monitorForCursor(monitors, mx, my);
+  } catch {
+    try {
+      return (await availableMonitors())[0];
+    } catch {
+      return undefined;
+    }
+  }
+}
+
 async function showThumbnailWindow(count: number, mouseX?: number, mouseY?: number) {
   const appWindow = getCurrentWindow();
   const height = computeThumbWindowHeight(count);
@@ -146,21 +190,7 @@ async function showThumbnailWindow(count: number, mouseX?: number, mouseY?: numb
   let placed = false;
   try {
     const monitors = await monitorsPromise;
-    // availableMonitors() reports position/size in PHYSICAL px; setPosition uses
-    // LOGICAL px and the AppleScript mouse coords are LOGICAL too. Convert every
-    // monitor metric to logical via scaleFactor before comparing/placing,
-    // otherwise the column lands ~scaleFactor× too low on Retina screens.
-    const target =
-      (mouseX !== undefined && mouseY !== undefined
-        ? monitors.find((m) => {
-            const sf = m.scaleFactor || 1;
-            const px = m.position.x / sf;
-            const py = m.position.y / sf;
-            const sw = m.size.width / sf;
-            const sh = m.size.height / sf;
-            return mouseX >= px && mouseX < px + sw && mouseY >= py && mouseY < py + sh;
-          })
-        : null) || monitors[0];
+    const target = monitorForCursor(monitors, mouseX, mouseY);
 
     if (target) {
       cacheMonitor(target);
@@ -214,8 +244,7 @@ async function showCollapsedThumbnail() {
   try { await appWindow.setResizable(false); } catch {}
   await appWindow.setSize(new LogicalSize(COLLAPSED_WIDTH, COLLAPSED_HEIGHT));
   try {
-    const monitors = await availableMonitors();
-    const m = monitors[0];
+    const m = await cursorMonitor();
     if (m) {
       cacheMonitor(m);
       const sf = m.scaleFactor || 1; // physical → logical (see showThumbnailWindow)
@@ -237,11 +266,9 @@ async function expandThumbWindow(height: number) {
   const appWindow = getCurrentWindow();
   let mon = cachedMon;
   if (!mon) {
-    try {
-      const monitors = await availableMonitors();
-      if (monitors[0]) cacheMonitor(monitors[0]);
-      mon = cachedMon;
-    } catch {}
+    const m = await cursorMonitor();
+    if (m) cacheMonitor(m);
+    mon = cachedMon;
   }
   try {
     if (mon) {
@@ -260,14 +287,17 @@ async function expandThumbWindow(height: number) {
 async function resizeThumbWindowKeepingBottom(count: number) {
   const appWindow = getCurrentWindow();
   try {
-    const monitors = await availableMonitors();
-    const m = monitors[0];
+    let mon = cachedMon;
+    if (!mon) {
+      const m = await cursorMonitor();
+      if (m) cacheMonitor(m);
+      mon = cachedMon;
+    }
     const newH = computeThumbWindowHeight(count);
     let placed = false;
-    if (m) {
-      const sf = m.scaleFactor || 1; // physical → logical (see showThumbnailWindow)
-      const x = m.position.x / sf; // flush to the left screen edge (pill touches edge)
-      const y = m.position.y / sf + Math.max(THUMB_MARGIN, (m.size.height / sf - newH) / 2);
+    if (mon) {
+      const x = mon.left; // flush to the left screen edge (pill touches edge)
+      const y = mon.top + Math.max(THUMB_MARGIN, (mon.height - newH) / 2);
       await appWindow.setSize(new LogicalSize(THUMB_WIDTH, newH));
       await appWindow.setPosition(new LogicalPosition(x, y));
       placed = true;
@@ -1183,10 +1213,17 @@ function MainApp() {
           const w = getCurrentWindow();
           if (await w.isVisible()) { await w.setFocus(); return; }
         } catch {}
+        // Resurface under the cursor's display, not wherever the pill last sat.
+        let mx: number | undefined;
+        let my: number | undefined;
+        try {
+          [mx, my] = await invoke<[number, number]>("get_mouse_position");
+        } catch {}
+        cachedMon = null;
         if (thumbsRef.current.length > 0) {
           isCollapsedRef.current = false;
           setIsCollapsed(false);
-          await openThumbnailWindow(thumbsRef.current.length);
+          await openThumbnailWindow(thumbsRef.current.length, mx, my);
         } else {
           await showCollapsedThumbnail();
           isCollapsedRef.current = true;
