@@ -214,25 +214,6 @@ pub async fn download_synced_image(url: String, name: String) -> Result<String, 
     persist_synced_image(&bytes, &name)
 }
 
-/// Read a local image file's raw bytes and hand them to the webview.
-///
-/// The publisher / copy-link path needs the on-disk capture bytes to hash,
-/// thumbnail and upload. It used to read them with `fetch(convertFileSrc(path))`
-/// in the webview, but the RELEASE build serves the UI from
-/// `http://localhost:38217` (tauri_plugin_localhost) and a `fetch()` of the
-/// `asset://` URL is a cross-origin request the asset protocol refuses for that
-/// origin — so the read failed, the own capture never published (no cloud doc →
-/// its pill tile fell to "Unavailable", unlike a phone shot which has a synced
-/// doc to fall back to) and copy-link uploaded nothing. IPC keeps full access on
-/// the localhost origin (default capability `remote.urls`), so reading the bytes
-/// here sidesteps the asset-protocol CORS wall. The bytes are returned as a raw
-/// IPC `Response`, which the webview receives as an `ArrayBuffer`.
-#[tauri::command]
-pub async fn read_image_bytes(path: String) -> Result<tauri::ipc::Response, String> {
-    let bytes = fs::read(&path).map_err(|e| format!("Failed to read image bytes: {}", e))?;
-    Ok(tauri::ipc::Response::new(bytes))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

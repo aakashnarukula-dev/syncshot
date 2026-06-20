@@ -57,7 +57,6 @@ fn build_tray_menu<R: tauri::Runtime>(
 /// tray menu reflects signed-in vs signed-out (see build_tray_menu).
 #[tauri::command]
 fn update_tray_menu(app: tauri::AppHandle, signed_in: bool) -> Result<(), String> {
-    use tauri::Manager;
     let menu = build_tray_menu(&app, signed_in).map_err(|e| e.to_string())?;
     if let Some(tray) = app.tray_by_id("main") {
         tray.set_menu(Some(menu)).map_err(|e| e.to_string())?;
