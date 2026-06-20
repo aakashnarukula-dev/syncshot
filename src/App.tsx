@@ -434,6 +434,48 @@ function MainApp() {
     return () => clearInterval(interval);
   }, []);
 
+  // Follow the cursor across displays: while the edge pill / thumbnail column is
+  // the visible surface, relocate it to whichever physical display the cursor is
+  // currently on (flush-left, vertically centered) — live, not only at reveal.
+  // Repositions only (never resizes), so it preserves collapsed-pill vs expanded-
+  // column geometry and won't fight the genie animations or the auto-hide poll.
+  useEffect(() => {
+    const POLL_MS = 400;
+    let busy = false;
+    const id = setInterval(async () => {
+      if (busy) return;
+      // Only while the column/pill is the visible surface and not mid-use.
+      if (modeRef.current === "pairing" || modeRef.current === "preferences") return;
+      if (thumbsRef.current.length === 0) return;
+      if (openEditorsRef.current > 0) return;
+      busy = true;
+      try {
+        const w = getCurrentWindow();
+        if (!(await w.isVisible())) return; // hidden → nothing to move
+        const rect = await cursorDisplayRect(); // cursor's current display
+        if (!rect) return;
+        // Already on this display? (origins are integer CGDisplayBounds points.)
+        if (cachedMon && rect.left === cachedMon.left && rect.top === cachedMon.top) return;
+        // Don't yank the window out from under an active hover/interaction.
+        if (await cursorInsideWindow()) return;
+        // Relocate, preserving current size (collapsed pill vs expanded column).
+        const sf = await w.scaleFactor();
+        const size = await w.outerSize();
+        const hLogical = size.height / sf;
+        const x = rect.left;
+        const y = rect.top + Math.max(THUMB_MARGIN, (rect.height - hLogical) / 2);
+        await w.setPosition(new LogicalPosition(x, y));
+        cacheRect(rect);
+      } catch {
+        // ignore transient IPC errors
+      } finally {
+        busy = false;
+      }
+    }, POLL_MS);
+    return () => clearInterval(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const handleActivated = useCallback(async (_key: string) => {
     const status = await loadLicenseStatus();
     setLicenseStatus(status);
