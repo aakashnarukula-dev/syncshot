@@ -656,6 +656,22 @@ mod cg_cursor {
             ))
         }
     }
+
+    /// Returns the current cursor location in the GLOBAL, top-left-origin display
+    /// coordinate space, in POINTS (logical) — exactly the space the JS hit-test
+    /// expects (it compares against `availableMonitors` position/scaleFactor), so
+    /// no Y flip or rescale is applied. `None` if the event can't be created.
+    pub fn cursor_location() -> Option<(f64, f64)> {
+        unsafe {
+            let event = CGEventCreate(std::ptr::null_mut());
+            if event.is_null() {
+                return None;
+            }
+            let p = CGEventGetLocation(event);
+            CFRelease(event as *const c_void);
+            Some((p.x, p.y))
+        }
+    }
 }
 
 /// Capture full screen using macOS native screencapture.
@@ -733,35 +749,25 @@ pub async fn play_screenshot_sound() -> Result<(), String> {
     Ok(())
 }
 
-/// Get the current mouse cursor position (for determining which screen to open editor on)
+/// Get the current mouse cursor position (for determining which screen to open editor on).
+///
+/// Reads the real cursor location via CoreGraphics (`CGEventGetLocation`), which
+/// returns GLOBAL top-left-origin coordinates in points — exactly what the JS
+/// multi-monitor hit-test expects. (The old `osascript`/System Events path always
+/// errored: System Events has no `mouse` property.)
 #[tauri::command]
 pub async fn get_mouse_position() -> Result<(f64, f64), String> {
-    // Use AppleScript to get mouse position - it's the most reliable cross-version approach
-    let output = Command::new("osascript")
-        .arg("-e")
-        .arg("tell application \"System Events\" to return (get position of mouse)")
-        .output()
-        .map_err(|e| format!("Failed to get mouse position: {}", e))?;
-
-    if !output.status.success() {
-        return Err("Failed to get mouse position".to_string());
+    #[cfg(target_os = "macos")]
+    {
+        match cg_cursor::cursor_location() {
+            Some((x, y)) => Ok((x, y)),
+            None => Err("Failed to get mouse position".to_string()),
+        }
     }
-
-    let position_str = String::from_utf8_lossy(&output.stdout);
-    let parts: Vec<&str> = position_str.trim().split(", ").collect();
-
-    if parts.len() != 2 {
-        return Err("Invalid mouse position format".to_string());
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err("unsupported".into())
     }
-
-    let x: f64 = parts[0]
-        .parse()
-        .map_err(|_| "Failed to parse X coordinate")?;
-    let y: f64 = parts[1]
-        .parse()
-        .map_err(|_| "Failed to parse Y coordinate")?;
-
-    Ok((x, y))
 }
 
 /// Capture specific window using macOS native screencapture
