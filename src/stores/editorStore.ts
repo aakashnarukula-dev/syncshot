@@ -112,9 +112,9 @@ const DEFAULT_SETTINGS: EditorSettings = {
   gradientId: "",
   gradientSrc: "",
   gradientColors: ["#000000", "#000000"],
-  noiseAmount: 0,
+  noiseAmount: 20,
   borderRadius: 0,
-  padding: 0,
+  padding: 100,
   shadow: {
     blur: 0,
     offsetX: 0,
