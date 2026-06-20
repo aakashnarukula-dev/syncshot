@@ -190,7 +190,17 @@ async function showThumbnailWindow(count: number, mouseX?: number, mouseY?: numb
   let placed = false;
   try {
     const monitors = await monitorsPromise;
-    const target = monitorForCursor(monitors, mouseX, mouseY);
+    let target: Monitor | undefined;
+    if (mouseX !== undefined && mouseY !== undefined) {
+      target = monitorForCursor(monitors, mouseX, mouseY);
+    } else {
+      try {
+        const [mx, my] = await invoke<[number, number]>("get_mouse_position");
+        target = monitorForCursor(monitors, mx, my);
+      } catch {
+        target = monitorForCursor(monitors, undefined, undefined);
+      }
+    }
 
     if (target) {
       cacheMonitor(target);
