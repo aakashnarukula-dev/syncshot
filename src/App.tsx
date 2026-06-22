@@ -507,20 +507,21 @@ function MainApp() {
     };
   }, []);
 
-  // Open a small, pairing-only decorated window (reuses the main window, like
-  // Preferences). Just the QR + 6-digit code + enter-code field — no Library.
-  // `autoStart` (tray "Sign in & Sync") makes SignInView open the browser
-  // immediately instead of showing the "Sign in with phone" button. Launch
-  // auto-present and post-logout reopen leave it off (normal CTA).
-  const [pairingAutoStart, setPairingAutoStart] = useState(false);
-  const openPairing = useCallback(async (autoStart = false) => {
-    setPairingAutoStart(autoStart);
-    await showNormalWindow(getCurrentWindow(), 420, 300, {
-      title: "Sign in",
-      resizable: false,
-      alwaysOnTop: false,
-    });
-    setMode("pairing");
+  // Single-window sign-in. The hosted phone-auth window (a real https origin —
+  // required for reCAPTCHA) is the ONLY sign-in surface: number → OTP → done all
+  // happen in that one window. There is NO separate in-app launcher. Dynamic
+  // import keeps the Firebase SDK off the startup-critical entry chunk. If the
+  // window is dismissed or times out without a token we stay signed out — the
+  // tray "Sign in & Sync" (and relaunch) re-open it. (Kept the openPairing name
+  // for its existing call sites: launch, tray, capture-gate, post-logout.)
+  const [pairingAutoStart] = useState(false);
+  const openPairing = useCallback(async () => {
+    try {
+      const { startBrowserSignIn } = await import("@/lib/sync/firebase");
+      await startBrowserSignIn(true);
+    } catch {
+      /* dismissed / timed out — stay signed out; tray re-triggers sign-in */
+    }
   }, []);
 
   // Closing a modal-style reuse of the shared window (pairing/preferences)
@@ -992,6 +993,15 @@ function MainApp() {
   const handleCapture = useCallback(async (captureMode: CaptureMode = "region") => {
     if (isCapturing) return;
 
+    // Sign-in gate: SyncShot is sync-first, so capturing is blocked until the user
+    // has an account. Read the live store (not a closure) so stale auth can't slip
+    // a shot through; bounce to the sign-in window instead of capturing.
+    if (useSyncStore.getState().authState !== "signedIn") {
+      toast.error("Sign in to SyncShot to capture");
+      void openPairing();
+      return;
+    }
+
     if (licenseStatusRef.current?.state === "expired") {
       setShowPaywall(true);
       await showNormalWindow(getCurrentWindow(), 520, 640, {
@@ -1119,7 +1129,7 @@ function MainApp() {
     } finally {
       setIsCapturing(false);
     }
-  }, [isCapturing, updateThumbs, reportError]);
+  }, [isCapturing, updateThumbs, reportError, openPairing]);
 
   // Setup hotkeys whenever settings change
   useEffect(() => {
@@ -1242,9 +1252,9 @@ function MainApp() {
           setIsCollapsed(true);
         }
       });
-      // Tray "Sign in & Sync" opens the small sign-in window AND immediately
-      // launches the browser sign-in (autoStart) — no intermediate button click.
-      const unlisten9 = await listen("open-library", () => { openPairing(true); });
+      // Tray "Sign in & Sync" → straight into the single hosted auth window
+      // (same one-window flow as launch); no intermediate launcher card.
+      const unlisten9 = await listen("open-library", () => { void openPairing(); });
       // Tray "Log Out" signs this device out (engine is code-split off the
       // critical path, so pull it in lazily). authState → signedOut then flips
       // the tray menu back via the bridge effect above.

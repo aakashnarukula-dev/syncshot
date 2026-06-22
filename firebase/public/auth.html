@@ -5,74 +5,135 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Sign in · SyncShot</title>
     <style>
-      :root { color-scheme: light dark; }
+      :root {
+        color-scheme: dark;
+        --bg: #000000;
+        --panel: #070707;
+        --line: #181818;
+        --line-2: #242424;
+        --fg: #e6e6e6;
+        --dim: #6b6b6b;
+        --accent: #3ddc97;
+        --accent-dim: #1f6f53;
+        --err: #ff6b6b;
+        --field: #0b0b0b;
+        --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Code",
+          Menlo, Consolas, "Liberation Mono", monospace;
+      }
       * { box-sizing: border-box; }
+      html, body { height: 100%; }
       body {
-        font: 15px/1.5 system-ui, -apple-system, sans-serif;
-        margin: 0; min-height: 100dvh;
-        display: grid; place-items: center;
-        background: Canvas; color: CanvasText;
+        margin: 0; background: var(--bg); color: var(--fg);
+        font: 13px/1.55 var(--mono);
+        -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility;
+        display: grid; place-items: center; padding: 22px;
+        background-image:
+          radial-gradient(130% 70% at 50% -15%, rgba(61, 220, 151, 0.07), transparent 62%);
+        background-repeat: no-repeat;
       }
-      .card {
-        width: min(92vw, 360px);
-        display: flex; flex-direction: column; gap: 14px;
-        padding: 28px;
+      .panel {
+        width: min(100%, 358px);
+        border: 1px solid var(--line); border-radius: 13px;
+        background: linear-gradient(180deg, var(--panel), #020202);
+        box-shadow: 0 0 0 1px #000, 0 30px 70px -34px rgba(0, 0, 0, 0.95);
+        overflow: hidden;
       }
-      h1 { font-size: 18px; margin: 0; }
-      p.sub { margin: 0; opacity: 0.65; }
-      label { font-size: 13px; opacity: 0.8; }
+      .bar {
+        display: flex; align-items: center; gap: 7px;
+        padding: 10px 14px; border-bottom: 1px solid var(--line);
+        color: var(--dim); font-size: 11px; letter-spacing: 0.03em;
+      }
+      .dot { width: 9px; height: 9px; border-radius: 50%; background: #1c1c1c; }
+      .dot.live { background: var(--accent); box-shadow: 0 0 9px var(--accent); }
+      .bar .path { margin-left: 5px; }
+      .body { padding: 20px 18px 22px; display: flex; flex-direction: column; gap: 16px; }
+      h1 {
+        margin: 0; font-size: 16px; font-weight: 600; letter-spacing: -0.01em;
+        display: flex; align-items: center; gap: 9px;
+      }
+      h1 .caret {
+        width: 8px; height: 15px; background: var(--accent); border-radius: 1px;
+        display: inline-block; animation: blink 1.1s steps(1) infinite;
+      }
+      @keyframes blink { 50% { opacity: 0; } }
+      p.sub { margin: 0; color: var(--dim); font-size: 12.5px; }
+      label {
+        display: block; font-size: 11px; letter-spacing: 0.13em;
+        text-transform: uppercase; color: var(--dim); margin-bottom: 8px;
+      }
       form { margin: 0; }
       .row { display: flex; gap: 8px; align-items: stretch; }
       .prefix {
-        display: grid; place-items: center; padding: 0 10px;
-        border: 1px solid color-mix(in srgb, CanvasText 25%, transparent);
-        border-radius: 8px; font-variant-numeric: tabular-nums; opacity: 0.7;
+        display: grid; place-items: center; padding: 0 12px;
+        border: 1px solid var(--line-2); border-radius: 9px; background: var(--field);
+        color: var(--dim); font-variant-numeric: tabular-nums;
       }
       input {
-        flex: 1; width: 100%; padding: 10px 12px; font: inherit;
-        border: 1px solid color-mix(in srgb, CanvasText 25%, transparent);
-        border-radius: 8px; background: Field; color: FieldText;
+        flex: 1; width: 100%; padding: 11px 13px; font: inherit; color: var(--fg);
+        border: 1px solid var(--line-2); border-radius: 9px; background: var(--field);
+        outline: none; transition: border-color 0.15s, box-shadow 0.15s;
       }
-      input#code { letter-spacing: 0.3em; font-variant-numeric: tabular-nums; }
-      input:disabled { opacity: 0.6; }
+      input::placeholder { color: #353535; }
+      input:focus {
+        border-color: var(--accent-dim);
+        box-shadow: 0 0 0 3px rgba(61, 220, 151, 0.13);
+      }
+      input#code {
+        letter-spacing: 0.42em; text-align: center; font-size: 18px;
+        font-variant-numeric: tabular-nums;
+      }
+      input:disabled { opacity: 0.5; }
       button {
-        padding: 10px 14px; font: inherit; font-weight: 600; cursor: pointer;
-        border: 0; border-radius: 8px; background: AccentColor; color: AccentColorText;
+        padding: 11px 16px; font: inherit; font-weight: 600; cursor: pointer;
+        border: 0; border-radius: 9px; background: var(--accent); color: #04140d;
+        white-space: nowrap; transition: filter 0.15s, transform 0.02s;
       }
-      button:disabled { opacity: 0.5; cursor: default; }
-      .msg { font-size: 13px; min-height: 1.2em; }
-      .msg.err { color: #d33; }
-      .msg.ok { color: #2a8; }
+      button:hover:not(:disabled) { filter: brightness(1.08); }
+      button:active:not(:disabled) { transform: translateY(0.5px); }
+      button:disabled { opacity: 0.45; cursor: default; }
+      .msg { font-size: 12px; min-height: 1.2em; color: var(--dim); }
+      .msg::before { content: "› "; color: var(--accent-dim); }
+      .msg:empty::before { content: ""; }
+      .msg.err { color: var(--err); }
+      .msg.err::before { content: "✗ "; color: var(--err); }
+      .msg.ok { color: var(--accent); }
+      .msg.ok::before { content: "✓ "; color: var(--accent); }
       .hidden { display: none; }
     </style>
   </head>
   <body>
-    <main class="card">
-      <div>
-        <h1>Sign in to SyncShot</h1>
-        <p class="sub">We'll text a 6-digit code to your phone.</p>
+    <main class="panel">
+      <div class="bar">
+        <span class="dot live"></span><span class="dot"></span><span class="dot"></span>
+        <span class="path">syncshot — secure sign-in</span>
       </div>
-
-      <form id="phoneForm" novalidate>
-        <label for="phone">Mobile number</label>
-        <div class="row" style="margin-top: 6px">
-          <span class="prefix">+91</span>
-          <input id="phone" type="tel" inputmode="numeric" autocomplete="tel-national"
-                 placeholder="98765 43210" maxlength="10" />
-          <button id="send" type="submit">Send code</button>
+      <div class="body">
+        <div>
+          <h1>Sign in<span class="caret"></span></h1>
+          <p class="sub">We'll text a 6-digit code to your phone.</p>
         </div>
-      </form>
 
-      <form id="codeForm" class="hidden" novalidate>
-        <label for="code">6-digit code</label>
-        <div class="row" style="margin-top: 6px">
-          <input id="code" type="text" inputmode="numeric" autocomplete="one-time-code"
-                 placeholder="123456" maxlength="6" aria-label="6-digit verification code" />
-        </div>
-      </form>
+        <form id="phoneForm" novalidate>
+          <label for="phone">Mobile number</label>
+          <div class="row">
+            <span class="prefix">+91</span>
+            <input id="phone" type="tel" inputmode="numeric" autocomplete="tel-national"
+                   placeholder="98765 43210" maxlength="10" />
+            <button id="send" type="submit">Send code</button>
+          </div>
+        </form>
 
-      <p id="msg" class="msg" role="status" aria-live="polite"></p>
-      <div id="recaptcha"></div>
+        <form id="codeForm" class="hidden" novalidate>
+          <label for="code">Verification code</label>
+          <div class="row">
+            <input id="code" type="text" inputmode="numeric" autocomplete="one-time-code"
+                   placeholder="••••••" maxlength="6" aria-label="6-digit verification code" />
+          </div>
+        </form>
+
+        <p id="msg" class="msg" role="status" aria-live="polite"></p>
+        <div id="recaptcha"></div>
+      </div>
     </main>
 
     <script type="module">

@@ -36,7 +36,7 @@ const AUTH_PAGE_URL: &str = "https://syncshot-v2.web.app/auth.html";
 const AUTH_WINDOW_LABEL: &str = "auth";
 
 /// How long to wait for the sign-in round-trip before giving up.
-const AUTH_TIMEOUT: Duration = Duration::from_secs(300);
+const AUTH_TIMEOUT: Duration = Duration::from_secs(1800);
 
 // Dark, minimal "code-like" pages for the SYSTEM-BROWSER fallback (the embedded
 // path never renders these — it cancels the callback navigation). Best-effort
@@ -254,8 +254,8 @@ async fn embedded_auth(app: tauri::AppHandle) -> Result<String, String> {
 
     WebviewWindowBuilder::new(&app, AUTH_WINDOW_LABEL, WebviewUrl::External(parsed))
         .title("Sign in to SyncShot")
-        .inner_size(440.0, 520.0)
-        .min_inner_size(400.0, 460.0)
+        .inner_size(440.0, 440.0)
+        .min_inner_size(400.0, 400.0)
         .resizable(true)
         .center()
         .focused(true)
