@@ -1,5 +1,5 @@
 //! Sign-in handoff: run Firebase phone-auth (reCAPTCHA + OTP) on the real
-//! `https://screenshot-x-v1.web.app` origin, mint a Firebase custom token there,
+//! `https://syncshot-v2.web.app` origin, mint a Firebase custom token there,
 //! and hand it back to the app.
 //!
 //! Firebase phone-auth's reCAPTCHA rejects the Tauri *app* webview origin
@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 
 /// Hosted sign-in page (Firebase Hosting; an auto-authorized Firebase Auth
 /// domain, so reCAPTCHA/phone work there with no extra config).
-const AUTH_PAGE_URL: &str = "https://screenshot-x-v1.web.app/auth.html";
+const AUTH_PAGE_URL: &str = "https://syncshot-v2.web.app/auth.html";
 
 /// Label of the embedded sign-in `WebviewWindow`. Not listed in any capability
 /// (it only loads a remote page + navigates to the loopback callback — it never
@@ -254,8 +254,8 @@ async fn embedded_auth(app: tauri::AppHandle) -> Result<String, String> {
 
     WebviewWindowBuilder::new(&app, AUTH_WINDOW_LABEL, WebviewUrl::External(parsed))
         .title("Sign in to SyncShot")
-        .inner_size(460.0, 760.0)
-        .min_inner_size(380.0, 560.0)
+        .inner_size(440.0, 520.0)
+        .min_inner_size(400.0, 460.0)
         .resizable(true)
         .center()
         .focused(true)
