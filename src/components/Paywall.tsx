@@ -20,7 +20,7 @@ export function Paywall({ reason, onActivated, onClose }: PaywallProps) {
     const result = await activateLicense(key);
     setSubmitting(false);
     if (result.ok) {
-      toast.success("ScreenshotX activated");
+      toast.success("SyncShot activated");
       onActivated(result.key);
     } else {
       setError(result.error);
@@ -35,7 +35,7 @@ export function Paywall({ reason, onActivated, onClose }: PaywallProps) {
             {reason === "expired" ? "trial ended" : "activate"}
           </div>
           <h1 className="text-2xl text-white tracking-tight">
-            {reason === "expired" ? "Your trial has ended." : "Activate ScreenshotX"}
+            {reason === "expired" ? "Your trial has ended." : "Activate SyncShot"}
           </h1>
           <p className="text-xs text-zinc-500 leading-relaxed">
             One-time purchase. Lifetime updates. Use on one Mac at a time.

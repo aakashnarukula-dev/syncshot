@@ -68,21 +68,21 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tagName: ${{ github.ref_name }}
-          releaseName: 'Better Shot ${{ github.ref_name }}'
+          releaseName: 'SyncShot ${{ github.ref_name }}'
           releaseBody: |
             ## Downloads
             
             | Platform | Architecture | Download |
             |----------|--------------|----------|
-            | macOS | Apple Silicon (M1/M2/M3) | `bettershot_*_aarch64.dmg` |
-            | macOS | Intel | `bettershot_*_x64.dmg` |
+            | macOS | Apple Silicon (M1/M2/M3) | `syncshot_*_aarch64.dmg` |
+            | macOS | Intel | `syncshot_*_x64.dmg` |
             
             ## Installation
             
             1. Download the `.dmg` file for your Mac
                - **Apple Silicon** (M1, M2, M3): Download the `aarch64` version
                - **Intel Mac**: Download the `x64` version
-            2. Open the DMG and drag Better Shot to Applications
+            2. Open the DMG and drag SyncShot to Applications
             3. **First Launch** - Choose one method (recommended):
             
                **Option A: Right-Click Method** (Easiest)
@@ -90,7 +90,7 @@ jobs:
                
                **Option B: Terminal Method** (One command, no dialogs) (recommended)
                ```bash
-               xattr -d com.apple.quarantine /Applications/bettershot.app
+               xattr -d com.apple.quarantine /Applications/SyncShot.app
                ```
                
             4. Grant Screen Recording permission when prompted in System Settings

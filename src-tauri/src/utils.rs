@@ -13,17 +13,17 @@ pub fn get_desktop_path() -> AppResult<String> {
     Ok(desktop.to_string_lossy().into_owned())
 }
 
-/// Get the ScreenshotX local screenshot directory. Created if missing.
+/// Get the SyncShot local screenshot directory. Created if missing.
 ///
 /// Firebase Storage is the source of truth for synced screenshots; this is a
 /// hidden, app-private cache (NOT a user-visible Desktop folder) under
 /// ~/Library/Application Support so the pill column, the editor and
 /// clipboard-paste have fast local access to recently captured/synced bytes.
 /// Falls back to a temp-dir subfolder if the data dir can't be resolved.
-pub fn get_screenshotx_dir() -> AppResult<String> {
+pub fn get_syncshot_dir() -> AppResult<String> {
     let base = dirs::data_dir().unwrap_or_else(std::env::temp_dir);
     let dir = base
-        .join("com.aakashnarukula.screenshotx")
+        .join("com.aakashnarukula.syncshot")
         .join("Screenshots");
     ensure_dir(&dir)?;
     Ok(dir.to_string_lossy().into_owned())
@@ -98,8 +98,8 @@ mod tests {
     }
 
     #[test]
-    fn test_screenshotx_dir_is_hidden_cache_not_desktop() {
-        let dir = get_screenshotx_dir().expect("screenshotx dir");
+    fn test_syncshot_dir_is_hidden_cache_not_desktop() {
+        let dir = get_syncshot_dir().expect("syncshot dir");
         // Source of truth is Firebase Storage; the local dir must be a hidden
         // app cache, never the user-visible Desktop.
         assert!(dir.ends_with("Screenshots"), "got: {dir}");
@@ -109,13 +109,13 @@ mod tests {
     #[test]
     fn test_ensure_dir_creates_nested_directories() {
         let temp_dir = std::env::temp_dir();
-        let test_path = temp_dir.join("screenshotx_test").join("nested").join("dir");
+        let test_path = temp_dir.join("syncshot_test").join("nested").join("dir");
 
         let result = ensure_dir(&test_path);
         assert!(result.is_ok());
         assert!(test_path.exists());
 
         // Cleanup
-        let _ = std::fs::remove_dir_all(temp_dir.join("screenshotx_test"));
+        let _ = std::fs::remove_dir_all(temp_dir.join("syncshot_test"));
     }
 }

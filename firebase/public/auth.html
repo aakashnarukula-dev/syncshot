@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Sign in · ScreenshotX</title>
+    <title>Sign in · SyncShot</title>
     <style>
       :root { color-scheme: light dark; }
       * { box-sizing: border-box; }
@@ -49,7 +49,7 @@
   <body>
     <main class="card">
       <div>
-        <h1>Sign in to ScreenshotX</h1>
+        <h1>Sign in to SyncShot</h1>
         <p class="sub">We'll text a 6-digit code to your phone.</p>
       </div>
 
@@ -111,7 +111,7 @@
 
       if (!cbPort || !state) {
         $("phoneForm").classList.add("hidden");
-        setMsg("Open sign-in from the ScreenshotX app.", "err");
+        setMsg("Open sign-in from the SyncShot app.", "err");
         throw new Error("missing callback params");
       }
 
@@ -173,7 +173,7 @@
           if (!data || !data.token) {
             throw new Error("Sign-in succeeded but no token was returned.");
           }
-          setMsg("Signed in. Returning to ScreenshotX…", "ok");
+          setMsg("Signed in. Returning to SyncShot…", "ok");
           const url =
             "http://127.0.0.1:" + cbPort + "/?token=" +
             encodeURIComponent(data.token) + "&state=" + encodeURIComponent(state);

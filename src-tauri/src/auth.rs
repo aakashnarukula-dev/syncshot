@@ -51,7 +51,7 @@ font:14px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace;display:grid;place-ite
 .card{text-align:center;padding:2rem}.ok{color:#3ecf8e}\
 .muted{color:#8a8a93;margin-top:.5rem;font-size:13px}</style></head>\
 <body><div class=card><div><span class=ok>●</span> Signed in</div>\
-<div class=muted>You can close this tab and return to ScreenshotX.</div></div>\
+<div class=muted>You can close this tab and return to SyncShot.</div></div>\
 <script>try{window.open('','_self');window.close();}catch(e){}\
 setTimeout(function(){try{window.open('','_self');window.close();}catch(e){}},50);</script>\
 </body></html>";
@@ -63,7 +63,7 @@ font:14px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace;display:grid;place-ite
 .card{text-align:center;padding:2rem}.warn{color:#f0a35e}\
 .muted{color:#8a8a93;margin-top:.5rem;font-size:13px}</style></head>\
 <body><div class=card><div><span class=warn>●</span> Sign-in couldn't be verified</div>\
-<div class=muted>Return to ScreenshotX and try again.</div></div></body></html>";
+<div class=muted>Return to SyncShot and try again.</div></div></body></html>";
 
 /// Validate the `state` nonce and lift the Firebase custom token out of a
 /// callback query string (`token=…&state=…`). Pure — unit-tested.
@@ -189,7 +189,7 @@ fn wait_for_intercepted_token(
     Ok(guard.take().unwrap())
 }
 
-/// Raise the ScreenshotX app (and its main window) back to the foreground after
+/// Raise the SyncShot app (and its main window) back to the foreground after
 /// a successful sign-in.
 fn focus_app(app: &tauri::AppHandle) {
     use tauri::Manager;
@@ -253,7 +253,7 @@ async fn embedded_auth(app: tauri::AppHandle) -> Result<String, String> {
     close_auth_window_impl(&app);
 
     WebviewWindowBuilder::new(&app, AUTH_WINDOW_LABEL, WebviewUrl::External(parsed))
-        .title("Sign in to ScreenshotX")
+        .title("Sign in to SyncShot")
         .inner_size(460.0, 760.0)
         .min_inner_size(380.0, 560.0)
         .resizable(true)

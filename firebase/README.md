@@ -1,4 +1,4 @@
-# ScreenshotX / ClipboardX — Firebase backend
+# SyncShot / ClipboardX — Firebase backend
 
 Realtime backend for the multi-device screenshot + clipboard sync: **Firestore**
 (library data + realtime listeners), **Cloud Storage** (blobs), and **Cloud
@@ -104,7 +104,7 @@ Functions, Cloud Build, Artifact Registry, and Cloud Scheduler APIs — accept.
 ## Web app config the Mac client needs
 
 The Mac (and Android) clients initialize the Firebase Web SDK with these values
-(captured from the registered `screenshotx-web` app — these are public client
+(captured from the registered `syncshot-web` app — these are public client
 config, not secrets):
 
 ```js
@@ -133,7 +133,7 @@ default in the client.)
 
 | Platform | App ID | Package / nickname |
 |---|---|---|
-| Web | `1:428592678377:web:9e202fb9f86ecd9710b778` | `screenshotx-web` |
+| Web | `1:428592678377:web:9e202fb9f86ecd9710b778` | `syncshot-web` |
 | Android | `1:428592678377:android:eeae517abb21732410b778` | `com.aakash.ssx` |
 
 `google-services.json` for the Android app has been written to

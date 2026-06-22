@@ -1,6 +1,6 @@
-# Contributing to Better Shot
+# Contributing to SyncShot
 
-Thank you for your interest in contributing to Better Shot! This document provides guidelines and instructions for contributing to the project.
+Thank you for your interest in contributing to SyncShot! This document provides guidelines and instructions for contributing to the project.
 
 ## Table of Contents
 
@@ -22,8 +22,8 @@ Be respectful, constructive, and professional in all interactions. Focus on the 
 1. **Fork the repository** and clone your fork:
 
    ```bash
-   git clone https://github.com/YOUR_USERNAME/better-shot.git
-   cd better-shot
+   git clone https://github.com/YOUR_USERNAME/syncshot.git
+   cd syncshot
    ```
 
 2. **Install dependencies:**
@@ -86,7 +86,7 @@ pnpm test:rust
 ## Project Structure
 
 ```text
-bettershot/
+syncshot/
 ├── src/                    # Frontend React application
 │   ├── components/         # React components
 │   │   ├── editor/         # Image editor components
@@ -462,4 +462,4 @@ By contributing, you agree that your contributions will be licensed under the sa
 
 ---
 
-Thank you for contributing to Better Shot! 🎉
+Thank you for contributing to SyncShot! 🎉

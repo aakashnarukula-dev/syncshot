@@ -1,6 +1,6 @@
 {
   "name": "functions",
-  "description": "ScreenshotX / ClipboardX realtime backend — library + device pairing Cloud Functions",
+  "description": "SyncShot / ClipboardX realtime backend — library + device pairing Cloud Functions",
   "private": true,
   "engines": {
     "node": "20"

@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "ScreenshotX",
+  "productName": "SyncShot",
   "version": "0.2.4",
-  "identifier": "com.aakashnarukula.screenshotx",
+  "identifier": "com.aakashnarukula.syncshot",
   "build": {
     "beforeDevCommand": "pnpm dev",
     "devUrl": "http://localhost:1420",
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "ScreenshotX",
+        "title": "SyncShot",
         "width": 1200,
         "height": 800,
         "minWidth": 800,
@@ -56,7 +56,7 @@
       "icons/icon.ico"
     ],
     "macOS": {
-      "signingIdentity": "ScreenshotX Local Dev"
+      "signingIdentity": "SyncShot Local Dev"
     }
   }
 }

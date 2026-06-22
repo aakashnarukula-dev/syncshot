@@ -11,7 +11,7 @@ use std::fs;
 use crate::screenshot::{
     capture_all_monitors as capture_monitors, capture_primary_monitor, MonitorShot,
 };
-use crate::utils::{generate_filename, get_desktop_path, get_screenshotx_dir};
+use crate::utils::{generate_filename, get_desktop_path, get_syncshot_dir};
 
 static SCREENCAPTURE_LOCK: Mutex<()> = Mutex::new(());
 
@@ -175,7 +175,7 @@ fn synced_filename_for(name: &str, bytes: &[u8]) -> Result<String, String> {
 /// Shared by `save_synced_image` (bytes over IPC) and `download_synced_image`
 /// (bytes fetched in Rust).
 fn persist_synced_image(bytes: &[u8], name: &str) -> Result<String, String> {
-    let dir = get_screenshotx_dir()?;
+    let dir = get_syncshot_dir()?;
     let filename = synced_filename_for(name, bytes)?;
     let path = PathBuf::from(&dir).join(&filename);
     fs::write(&path, bytes).map_err(|e| format!("Failed to save synced image: {}", e))?;
@@ -328,7 +328,7 @@ pub async fn save_edited_image(
 ) -> Result<String, String> {
     let saved_path = match overwrite_path {
         Some(ref p) if !p.is_empty() => save_base64_image_to_path(&image_data, p)?,
-        _ => save_base64_image(&image_data, &save_dir, "screenshotx")?,
+        _ => save_base64_image(&image_data, &save_dir, "syncshot")?,
     };
 
     if copy_to_clip {
@@ -344,7 +344,7 @@ pub async fn save_edited_image(
 /// missing. (Command name kept for IPC compatibility with the frontend.)
 #[tauri::command]
 pub async fn get_desktop_directory() -> Result<String, String> {
-    get_screenshotx_dir()
+    get_syncshot_dir()
 }
 
 /// Get the raw user Desktop path (no subfolder). Used to detect legacy save dirs.

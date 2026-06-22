@@ -1,6 +1,6 @@
 use std::process::Command;
 
-const KEYCHAIN_SERVICE: &str = "com.aakashnarukula.screenshotx";
+const KEYCHAIN_SERVICE: &str = "com.aakashnarukula.syncshot";
 
 #[tauri::command]
 pub fn get_machine_id() -> Result<String, String> {

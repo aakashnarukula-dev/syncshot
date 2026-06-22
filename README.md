@@ -1,4 +1,4 @@
-# Better Shot
+# SyncShot
 
 <img width="3600" height="2025" alt="stage-1768238789948" src="https://github.com/user-attachments/assets/3051266a-5179-440f-a747-7980abd7bac3" />
 
@@ -8,11 +8,11 @@
 
 > An open-source alternative to CleanShot X for macOS. Capture, edit, and enhance your screenshots with professional quality.
 
-Better Shot is a fast, lightweight screenshot tool built with Tauri + React. It provides a powerful yet simple workflow for capturing screenshots, editing them with backgrounds/effects/annotations, and exporting quickly.
+SyncShot is a fast, lightweight screenshot tool built with Tauri + React. It provides a powerful yet simple workflow for capturing screenshots, editing them with backgrounds/effects/annotations, and exporting quickly.
 
 ## Table of contents
 
-- [Better Shot](#better-shot)
+- [SyncShot](#syncshot)
   - [Table of contents](#table-of-contents)
   - [Background](#background)
   - [Features](#features)
@@ -41,7 +41,7 @@ Better Shot is a fast, lightweight screenshot tool built with Tauri + React. It 
 
 ## Background
 
-Clean screenshot workflows usually need three things: capture fast, polish fast (background/shadow/roundness), and annotate fast (arrows, labels). Better Shot is a macOS-native app that keeps everything local and lightweight.
+Clean screenshot workflows usually need three things: capture fast, polish fast (background/shadow/roundness), and annotate fast (arrows, labels). SyncShot is a macOS-native app that keeps everything local and lightweight.
 
 ## Features
 
@@ -89,26 +89,26 @@ Clean screenshot workflows usually need three things: capture fast, polish fast 
 
 ### Download a release (recommended)
 
-1. Go to [Releases](https://github.com/KartikLabhshetwar/better-shot/releases)
+1. Go to [Releases](https://github.com/aakashnarukula-dev/syncshot/releases)
 2. Download the appropriate DMG file:
-   - **Apple Silicon** (M1/M2/M3): `bettershot_*_aarch64.dmg`
-   - **Intel**: `bettershot_*_x64.dmg`
-3. Open the DMG and drag Better Shot to Applications
+   - **Apple Silicon** (M1/M2/M3): `syncshot_*_aarch64.dmg`
+   - **Intel**: `syncshot_*_x64.dmg`
+3. Open the DMG and drag SyncShot to Applications
 4. First launch (recommended):
 
 ```bash
-xattr -d com.apple.quarantine /Applications/bettershot.app
+xattr -d com.apple.quarantine /Applications/SyncShot.app
 ```
 
 5. Grant Screen Recording permission when prompted
 
-> Note: Better Shot is ad-hoc signed. macOS Gatekeeper may warn for apps that aren’t notarized. You can inspect the source and build it yourself.
+> Note: SyncShot is ad-hoc signed. macOS Gatekeeper may warn for apps that aren’t notarized. You can inspect the source and build it yourself.
 
 ### Build from source
 
 ```bash
-git clone https://github.com/KartikLabhshetwar/better-shot.git
-cd better-shot
+git clone https://github.com/aakashnarukula-dev/syncshot.git
+cd syncshot
 
 pnpm install
 
@@ -128,7 +128,7 @@ The installer will be located in `src-tauri/target/release/bundle/`
 On first launch, macOS will request **Screen Recording** permission:
 
 1. Go to **System Settings → Privacy & Security → Screen Recording**
-2. Enable **Better Shot**
+2. Enable **SyncShot**
 3. Restart the application if needed
 
 This permission is required for the app to capture screenshots of your screen.
@@ -137,7 +137,7 @@ This permission is required for the app to capture screenshots of your screen.
 
 ### Quick Start
 
-1. Launch Better Shot from Applications (or use the menu bar icon)
+1. Launch SyncShot from Applications (or use the menu bar icon)
 2. Capture:
    - Default: `⌘⇧2` (region)
    - Optional (enable in Preferences): `⌘⇧F` (fullscreen), `⌘⇧D` (window)
@@ -184,7 +184,7 @@ Capture shortcuts are customizable in Preferences.
 This repo contains:
 
 - The **desktop app** (Tauri + Vite) at the repo root
-- The **landing site** (Next.js) in `bettershot-landing/`
+- The **landing site** (Next.js) in `syncshot-landing/`
 
 ### Desktop app (Tauri)
 
@@ -203,7 +203,7 @@ pnpm tauri build
 ### Landing site (Next.js)
 
 ```bash
-cd bettershot-landing
+cd syncshot-landing
 pnpm install
 pnpm dev
 ```
@@ -218,10 +218,10 @@ This project is licensed under the BSD 3-Clause License - see the [LICENSE](LICE
 
 ## Star history
 
-<a href="https://www.star-history.com/#KartikLabhshetwar/better-shot&type=date&legend=top-left">
+<a href="https://www.star-history.com/#aakashnarukula-dev/syncshot&type=date&legend=top-left">
  <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=KartikLabhshetwar/better-shot&type=date&theme=dark&legend=top-left" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=KartikLabhshetwar/better-shot&type=date&legend=top-left" />
-   <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=KartikLabhshetwar/better-shot&type=date&legend=top-left" />
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=aakashnarukula-dev/syncshot&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=aakashnarukula-dev/syncshot&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=aakashnarukula-dev/syncshot&type=date&legend=top-left" />
  </picture>
 </a>

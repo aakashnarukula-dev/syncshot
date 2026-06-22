@@ -9,13 +9,13 @@ import { SignInView } from "@/components/Pairing/SignInView";
 type Section = "screenshots" | "clipboard" | "pairing";
 
 const NAV: { id: Section; label: string; icon: typeof ImageIcon }[] = [
-  { id: "screenshots", label: "ScreenshotX", icon: ImageIcon },
+  { id: "screenshots", label: "SyncShot", icon: ImageIcon },
   { id: "clipboard", label: "ClipboardX", icon: ClipboardList },
   { id: "pairing", label: "Devices", icon: Link2 },
 ];
 
 const TITLES: Record<Section, string> = {
-  screenshots: "ScreenshotX",
+  screenshots: "SyncShot",
   clipboard: "ClipboardX",
   pairing: "Devices & Pairing",
 };
@@ -36,7 +36,7 @@ export function LibraryView({ onClose }: LibraryViewProps) {
       <nav className="flex w-56 shrink-0 flex-col gap-1 border-r border-border bg-sidebar p-3">
         <div className="px-2 pb-3 pt-1">
           <h1 className="text-balance text-sm font-semibold text-sidebar-foreground">
-            ScreenshotX
+            SyncShot
           </h1>
           <p className="mt-0.5 flex items-center gap-1.5 text-xs text-muted-foreground">
             <span

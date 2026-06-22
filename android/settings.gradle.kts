@@ -19,5 +19,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "ScreenshotX"
+rootProject.name = "SyncShot"
 include(":app")

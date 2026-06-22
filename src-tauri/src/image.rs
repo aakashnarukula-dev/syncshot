@@ -234,7 +234,7 @@ pub fn screenshot_thumbnail(source_path: &str, max_px: u32) -> AppResult<String>
     max_px.hash(&mut hasher);
     let key = hasher.finish();
 
-    let cache_dir = std::env::temp_dir().join("screenshotx-thumbnails");
+    let cache_dir = std::env::temp_dir().join("syncshot-thumbnails");
     ensure_dir(&cache_dir)?;
     let thumb_path = cache_dir.join(format!("thumb-{:016x}.png", key));
     if thumb_path.exists() {

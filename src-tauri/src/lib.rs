@@ -1,4 +1,4 @@
-//! ScreenshotX - A screenshot capture and editing application
+//! SyncShot - A screenshot capture and editing application
 //!
 //! This crate provides the Tauri backend for capturing, editing,
 //! and saving screenshots with various features like region selection
@@ -229,7 +229,7 @@ pub fn run() {
                 .menu(&menu)
                 .icon(tray_icon)
                 .icon_as_template(true)
-                .tooltip("ScreenshotX")
+                .tooltip("SyncShot")
                 .on_menu_event(move |app, event| {
                     use tauri::Emitter;
                     match event.id().as_ref() {

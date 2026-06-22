@@ -1,25 +1,25 @@
 /**
- * Firebase Web App client configuration for the ScreenshotX Mac app.
+ * Firebase Web App client configuration for the SyncShot Mac app.
  *
- * These are the PUBLIC web-app config values for the `screenshot-x-v1`
- * Firebase project (project number 428592678377, parent org gyftalala.com,
+ * These are the PUBLIC web-app config values for the `syncshot-v2`
+ * Firebase project (project number 424325660516, parent org gyftalala.com,
  * account mail@gyftalala.com). Safe to commit — access is gated by
  * Firestore/Storage security rules + the `libId` custom auth claim, NOT by
  * keeping these strings secret.
  *
- * Web app: screenshotx-web (1:428592678377:web:9e202fb9f86ecd9710b778).
+ * Web app: SyncShot Web (1:424325660516:web:f839ae266e68a32ffec471).
  * VITE_FB_API_KEY / VITE_FB_APP_ID env vars still override apiKey/appId if set.
  */
 
-const DEFAULT_API_KEY = "AIzaSyDM8WuSfhIkQg4NkDLXLoN_KCMKROUbnvM";
-const DEFAULT_APP_ID = "1:428592678377:web:9e202fb9f86ecd9710b778";
+const DEFAULT_API_KEY = "AIzaSyApIWE3umXq6BDvxiB7fCm6NHgsZZfB4nE";
+const DEFAULT_APP_ID = "1:424325660516:web:f839ae266e68a32ffec471";
 
 export const firebaseConfig = {
   apiKey: import.meta.env.VITE_FB_API_KEY ?? DEFAULT_API_KEY,
-  authDomain: "screenshot-x-v1.firebaseapp.com",
-  projectId: "screenshot-x-v1",
-  storageBucket: "screenshot-x-v1.firebasestorage.app",
-  messagingSenderId: "428592678377",
+  authDomain: "syncshot-v2.firebaseapp.com",
+  projectId: "syncshot-v2",
+  storageBucket: "syncshot-v2.firebasestorage.app",
+  messagingSenderId: "424325660516",
   appId: import.meta.env.VITE_FB_APP_ID ?? DEFAULT_APP_ID,
 } as const;
 
@@ -28,7 +28,7 @@ export const FUNCTIONS_REGION = "us-central1";
 
 /**
  * True once real web-app credentials are present (always true now that the
- * live screenshot-x-v1 values are the defaults). The UI uses this to decide
+ * live syncshot-v2 values are the defaults). The UI uses this to decide
  * whether to show a "config missing" notice.
  */
 export const hasRealFirebaseConfig =

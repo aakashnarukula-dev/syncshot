@@ -35,7 +35,7 @@
         android:label="@string/app_name"
         android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
-        android:theme="@style/Theme.ScreenshotX">
+        android:theme="@style/Theme.SyncShot">
 
         <!-- Truecaller partner key (pluggable via the TRUECALLER_PARTNER_KEY
              gradle property). Empty until the partner app is registered. The
@@ -106,7 +106,7 @@
         <service
             android:name=".sync.ClipboardCaptureService"
             android:exported="false"
-            android:label="ScreenshotX Clipboard"
+            android:label="SyncShot Clipboard"
             android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
             <intent-filter>
                 <action android:name="android.accessibilityservice.AccessibilityService" />

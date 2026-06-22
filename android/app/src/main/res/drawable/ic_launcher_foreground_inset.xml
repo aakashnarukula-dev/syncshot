@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Insets the launcher foreground so the ScreenshotX logo has breathing space
+<!-- Insets the launcher foreground so the SyncShot logo has breathing space
      inside the adaptive-icon safe zone instead of filling edge-to-edge. -->
 <inset xmlns:android="http://schemas.android.com/apk/res/android"
     android:drawable="@mipmap/ic_launcher_foreground"

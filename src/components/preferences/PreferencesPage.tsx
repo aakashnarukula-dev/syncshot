@@ -106,7 +106,7 @@ export function PreferencesPage({ onBack, onSettingsChange, onLoggedOut }: Prefe
       <div className="max-w-2xl mx-auto px-8 pt-10 pb-16 space-y-10">
         <header className="space-y-1">
           <h1 className="text-xl text-white tracking-tight">preferences</h1>
-          <p className="text-xs text-zinc-500">{"~/.screenshotx"}</p>
+          <p className="text-xs text-zinc-500">{"~/.syncshot"}</p>
         </header>
 
         <Section label="general">

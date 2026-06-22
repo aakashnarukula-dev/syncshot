@@ -1,5 +1,5 @@
 /**
- * ScreenshotX / ClipboardX realtime backend — Cloud Functions (v2, callable).
+ * SyncShot / ClipboardX realtime backend — Cloud Functions (v2, callable).
  *
  * Authorization model: every device is a Firebase Auth user whose custom claim
  * `libId` names the one library it belongs to. Firestore + Storage rules gate on

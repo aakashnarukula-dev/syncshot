@@ -1,4 +1,4 @@
-# CLAUDE.md — ScreenshotX / Better Shot
+# CLAUDE.md — SyncShot
 
 Open-source CleanShot X alternative for macOS. Capture → edit (backgrounds/effects/annotations) → export. Local + lightweight. Tauri 2 (Rust) + React 19.
 
@@ -8,13 +8,13 @@ Open-source CleanShot X alternative for macOS. Capture → edit (backgrounds/eff
 |------|------|-------|
 | `src/` | Desktop app frontend | React 19, Vite 7, TS, Tailwind v4, Zustand, Radix, motion, tesseract.js (OCR) |
 | `src-tauri/` | Desktop app backend | Rust, Tauri 2 (macOS-focused) |
-| `bettershot-landing/` | Marketing site | Next.js (separate pnpm workspace, own lockfile) |
+| `syncshot-landing/` | Marketing site | Next.js (separate pnpm workspace, own lockfile) |
 | `hub/` | Multi-device sync hub (FastAPI) | **empty placeholder in this checkout** — see note below |
 | `android/` | Android sync client (Kotlin/Compose) | **empty placeholder in this checkout** |
 | `docs/superpowers/` | Specs + plans (specs/, plans/) | markdown |
 | `scripts/` | release-notes helpers | bash |
 
-App identity: `com.aakashnarukula.screenshotx`, productName `ScreenshotX`. Version lives in `package.json` AND `src-tauri/Cargo.toml` + `tauri.conf.json` — keep in sync.
+App identity: `com.aakashnarukula.syncshot`, productName `SyncShot`. Version lives in `package.json` AND `src-tauri/Cargo.toml` + `tauri.conf.json` — keep in sync.
 
 ## Commands (pnpm, root)
 
@@ -27,7 +27,7 @@ App identity: `com.aakashnarukula.screenshotx`, productName `ScreenshotX`. Versi
 - `pnpm test:rust` — `cd src-tauri && cargo test`
 - `pnpm lint:ci` — `tsc --noEmit` (typecheck, the CI gate)
 
-Landing site (`cd bettershot-landing`): `pnpm dev` / `pnpm build` / `pnpm lint` (eslint). Its own workspace — install/run from inside that dir.
+Landing site (`cd syncshot-landing`): `pnpm dev` / `pnpm build` / `pnpm lint` (eslint). Its own workspace — install/run from inside that dir.
 
 Package manager is **pnpm** (10.28). Root `pnpm-lock.yaml`; landing has its own.
 
@@ -36,7 +36,7 @@ Package manager is **pnpm** (10.28). Root `pnpm-lock.yaml`; landing has its own.
 1. `pnpm lint:ci` (typecheck) — must pass.
 2. `pnpm test` — frontend tests (vitest, jsdom). Store logic tested e.g. `src/stores/editorStore.test.ts`.
 3. If Rust touched: `pnpm test:rust`.
-4. Landing touched: `cd bettershot-landing && pnpm build`.
+4. Landing touched: `cd syncshot-landing && pnpm build`.
 No special cache-bust step.
 
 ## Frontend conventions

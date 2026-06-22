@@ -1,16 +1,16 @@
 [package]
-name = "screenshotx"
+name = "syncshot"
 version = "0.2.4"
-description = "ScreenshotX — fast screenshot capture, edit, and share"
+description = "SyncShot — fast screenshot capture, edit, and share"
 authors = ["kartik labhshetwar"]
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [lib]
-# The lib name matches the package name to allow `screenshotx::run()` usage
+# The lib name matches the package name to allow `syncshot::run()` usage
 # On Windows, if there's a conflict with bin name, we can add `_lib` suffix
-name = "screenshotx"
+name = "syncshot"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]

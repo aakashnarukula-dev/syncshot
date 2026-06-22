@@ -1,5 +1,5 @@
 /**
- * ScreenshotX sync — Firestore listener + thumbnail-first publisher.
+ * SyncShot sync — Firestore listener + thumbnail-first publisher.
  *
  * Publish path (capturing device):
  *   read PNG bytes -> sha256 -> dedupe query -> 320px WebP thumb (canvas)
@@ -645,7 +645,7 @@ export async function deleteLocalCacheById(id: string): Promise<void> {
  * a received shot AND a published own-device capture, which is renamed from its
  * capture name to `{docId}.<ext>` once it has a backing cloud doc (see
  * `adoptDocIdFilename`). An UNpublished local file — `shot_…` straight from
- * capture, plus `screenshot_…`, `region_…`, `screenshotx_…`, `synced_…` — always
+ * capture, plus `screenshot_…`, `region_…`, `syncshot_…`, `synced_…` — always
  * carries an underscore, so it never matches. The full-set reconcile uses this to
  * delete only files that DO have a cloud doc (and so should follow a cloud
  * delete), never an unpublished local-only capture.

@@ -38,7 +38,7 @@ default browser**, then hand the signed-in session back to the desktop app.
 3. Page calls callable `mintDesktopToken` → gets a custom token.
 4. Page redirects to `http://127.0.0.1:<port>/?token=<customToken>&state=<nonce>`.
 5. Rust listener accepts one request, validates `state`, returns `{token}` to
-   the awaiting JS, and serves a "return to ScreenshotX" page. Times out ~5 min.
+   the awaiting JS, and serves a "return to SyncShot" page. Times out ~5 min.
 6. App calls `signInWithCustomToken(auth, token)` → `onAuthStateChanged` fires
    → existing engine starts listeners. No engine logic change required.
 

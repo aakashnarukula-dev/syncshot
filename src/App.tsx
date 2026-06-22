@@ -598,7 +598,7 @@ function MainApp() {
   // Idle-based auto-hide: restarts a 10s countdown on every pointer signal. There
   // is NO sticky "hovering" flag — a flag wedges open forever if a mouseleave is
   // missed (e.g. the window moves out from under a stationary cursor on open).
-  // Instead, any activity re-arms the timer, and 10s of no activity collapses it.
+  // Instead, any activity re-arms the timer, and 5s of no activity collapses it.
   const startAutoHide = useCallback(() => {
     if (autoHideTimerRef.current) clearTimeout(autoHideTimerRef.current);
     autoHideTimerRef.current = null;
@@ -641,7 +641,7 @@ function MainApp() {
       // Play the slide-out animation (same as the manual collapse button)
       // rather than snapping straight to the collapsed pill.
       setCollapseSignal((n) => n + 1);
-    }, 10_000);
+    }, 5_000);
   }, []);
 
   const pauseAutoHide = useCallback(() => {
@@ -707,7 +707,7 @@ function MainApp() {
     })();
   }, [syncAuthState, updateThumbs]);
 
-  // Auto-present the sign-in screen on launch when signed out. ScreenshotX is a
+  // Auto-present the sign-in screen on launch when signed out. SyncShot is a
   // local-first tool and sync is additive, so this gate is DISMISSIBLE: the
   // pairing window's titlebar close (onCloseRequested -> closePairing) hands the
   // shared window back to the column / hides it, dropping the user into the
@@ -995,7 +995,7 @@ function MainApp() {
     if (licenseStatusRef.current?.state === "expired") {
       setShowPaywall(true);
       await showNormalWindow(getCurrentWindow(), 520, 640, {
-        title: "Activate ScreenshotX",
+        title: "Activate SyncShot",
       });
       setMode("main");
       return;
@@ -1110,7 +1110,7 @@ function MainApp() {
       ) {
         toast.error("Screen Recording permission required", {
           description:
-            "System Settings → Privacy & Security → Screen Recording → enable ScreenshotX, then restart.",
+            "System Settings → Privacy & Security → Screen Recording → enable SyncShot, then restart.",
           duration: 8000,
         });
       } else {
@@ -1212,7 +1212,7 @@ function MainApp() {
       });
       const unlisten7 = await listen("open-license", async () => {
         await showNormalWindow(getCurrentWindow(), 520, 640, {
-          title: "Activate ScreenshotX",
+          title: "Activate SyncShot",
         });
         setMode("main");
         setShowPaywall(true);
@@ -1285,7 +1285,7 @@ function MainApp() {
     if (licenseStatusRef.current?.state === "expired") {
       setShowPaywall(true);
       await showNormalWindow(getCurrentWindow(), 520, 640, {
-        title: "Activate ScreenshotX",
+        title: "Activate SyncShot",
       });
       setMode("main");
       return;

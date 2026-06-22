@@ -1,6 +1,6 @@
 rules_version = '2';
 
-// ScreenshotX / ClipboardX realtime backend.
+// SyncShot / ClipboardX realtime backend.
 // Identity = email-link sign-in; every device signs in to the same account.
 // All data lives under users/{uid} and is gated on the caller's auth uid.
 service cloud.firestore {

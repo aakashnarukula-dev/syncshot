@@ -14,7 +14,7 @@ if (file("google-services.json").exists()) {
 // Truecaller partner key is pluggable: set it via a gradle property
 // (-PTRUECALLER_PARTNER_KEY=..., gradle.properties, or the
 // ORG_GRADLE_PROJECT_TRUECALLER_PARTNER_KEY / TRUECALLER_PARTNER_KEY env var).
-// It arrives after the partner app for com.app.screenshotx is registered; until
+// It arrives after the partner app for com.app.syncshot is registered; until
 // then it stays empty and the Truecaller button greys out (server /init also
 // returns an empty partnerKey, which the app treats the same way).
 val truecallerPartnerKey: String =
@@ -23,11 +23,11 @@ val truecallerPartnerKey: String =
         ?: ""
 
 android {
-    namespace = "com.app.screenshotx"
+    namespace = "com.app.syncshot"
     compileSdk = 34
 
     defaultConfig {
-        applicationId = "com.app.screenshotx"
+        applicationId = "com.app.syncshot"
         minSdk = 26
         targetSdk = 34
         versionCode = 2

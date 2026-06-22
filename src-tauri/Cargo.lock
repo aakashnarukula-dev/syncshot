@@ -4158,31 +4158,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
-name = "screenshotx"
-version = "0.2.4"
-dependencies = [
- "base64 0.22.1",
- "dirs 5.0.1",
- "image 0.24.9",
- "objc2 0.5.2",
- "reqwest",
- "serde",
- "serde_json",
- "tauri",
- "tauri-build",
- "tauri-plugin-autostart",
- "tauri-plugin-drag",
- "tauri-plugin-global-shortcut",
- "tauri-plugin-localhost",
- "tauri-plugin-opener",
- "tauri-plugin-screenshots",
- "tauri-plugin-single-instance",
- "tauri-plugin-store",
- "urlencoding",
- "xcap 0.8.1",
-]
-
-[[package]]
 name = "security-framework"
 version = "3.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4647,6 +4622,31 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0bf256ce5efdfa370213c1dabab5935a12e49f2c58d15e9eac2870d3b4f27263"
 dependencies = [
  "futures-core",
+]
+
+[[package]]
+name = "syncshot"
+version = "0.2.4"
+dependencies = [
+ "base64 0.22.1",
+ "dirs 5.0.1",
+ "image 0.24.9",
+ "objc2 0.5.2",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-autostart",
+ "tauri-plugin-drag",
+ "tauri-plugin-global-shortcut",
+ "tauri-plugin-localhost",
+ "tauri-plugin-opener",
+ "tauri-plugin-screenshots",
+ "tauri-plugin-single-instance",
+ "tauri-plugin-store",
+ "urlencoding",
+ "xcap 0.8.1",
 ]
 
 [[package]]
