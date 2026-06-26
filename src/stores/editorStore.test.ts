@@ -11,21 +11,21 @@ describe("editorStore - padding feature", () => {
   });
 
   describe("initial state", () => {
-    it("should have default padding of 100px", () => {
+    it("should have default padding of 0px", () => {
       const state = useEditorStore.getState();
-      expect(state.settings.padding).toBe(100);
+      expect(state.settings.padding).toBe(0);
     });
 
     it("should include padding in settings", () => {
       const { result } = renderHook(() => useSettings());
-      expect(result.current.padding).toBe(100);
+      expect(result.current.padding).toBe(0);
     });
   });
 
   describe("usePadding selector", () => {
     it("should return current padding value", () => {
       const { result } = renderHook(() => usePadding());
-      expect(result.current).toBe(100);
+      expect(result.current).toBe(0);
     });
 
     it("should update when padding changes", () => {
@@ -127,7 +127,7 @@ describe("editorStore - padding feature", () => {
         editorActions.undo();
       });
 
-      expect(useEditorStore.getState().settings.padding).toBe(100);
+      expect(useEditorStore.getState().settings.padding).toBe(0);
     });
 
     it("should redo padding changes", () => {
@@ -136,7 +136,7 @@ describe("editorStore - padding feature", () => {
         editorActions.undo();
       });
 
-      expect(useEditorStore.getState().settings.padding).toBe(100);
+      expect(useEditorStore.getState().settings.padding).toBe(0);
 
       act(() => {
         editorActions.redo();
@@ -183,7 +183,7 @@ describe("editorStore - padding feature", () => {
         editorActions.reset();
       });
 
-      expect(useEditorStore.getState().settings.padding).toBe(100);
+      expect(useEditorStore.getState().settings.padding).toBe(0);
     });
   });
 
