@@ -5,8 +5,8 @@ use image::DynamicImage;
 use std::collections::hash_map::DefaultHasher;
 use std::fs;
 use std::hash::{Hash, Hasher};
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::utils::{ensure_dir, generate_filename, AppResult};
 
@@ -166,16 +166,19 @@ pub fn save_image(img: &DynamicImage, save_dir: &str, prefix: &str) -> AppResult
     Ok(file_path.to_string_lossy().into_owned())
 }
 
-/// Save base64-encoded image data to a file
-pub fn save_base64_image(image_data: &str, save_dir: &str, prefix: &str) -> AppResult<String> {
+/// Decode a `data:image/png;base64,` data URL into raw PNG bytes.
+fn decode_base64_png(image_data: &str) -> AppResult<Vec<u8>> {
     let base64_data = image_data
         .strip_prefix("data:image/png;base64,")
         .ok_or("Invalid image data format: expected data:image/png;base64, prefix")?;
 
-    let image_bytes = general_purpose::STANDARD
+    general_purpose::STANDARD
         .decode(base64_data)
-        .map_err(|e| format!("Failed to decode base64: {}", e))?;
+        .map_err(|e| format!("Failed to decode base64: {}", e))
+}
 
+/// Save raw image bytes to a directory with a generated filename
+pub fn save_image_bytes(image_bytes: &[u8], save_dir: &str, prefix: &str) -> AppResult<String> {
     let dest_path = PathBuf::from(save_dir);
     ensure_dir(&dest_path)?;
 
@@ -187,16 +190,8 @@ pub fn save_base64_image(image_data: &str, save_dir: &str, prefix: &str) -> AppR
     Ok(file_path.to_string_lossy().into_owned())
 }
 
-/// Save base64-encoded image data to an exact file path (overwriting it)
-pub fn save_base64_image_to_path(image_data: &str, file_path: &str) -> AppResult<String> {
-    let base64_data = image_data
-        .strip_prefix("data:image/png;base64,")
-        .ok_or("Invalid image data format: expected data:image/png;base64, prefix")?;
-
-    let image_bytes = general_purpose::STANDARD
-        .decode(base64_data)
-        .map_err(|e| format!("Failed to decode base64: {}", e))?;
-
+/// Save raw image bytes to an exact file path (overwriting it)
+pub fn save_image_bytes_to_path(image_bytes: &[u8], file_path: &str) -> AppResult<String> {
     let path = PathBuf::from(file_path);
     if let Some(parent) = path.parent() {
         ensure_dir(&PathBuf::from(parent))?;
@@ -207,17 +202,35 @@ pub fn save_base64_image_to_path(image_data: &str, file_path: &str) -> AppResult
     Ok(path.to_string_lossy().into_owned())
 }
 
+/// Save base64-encoded image data to a file
+pub fn save_base64_image(image_data: &str, save_dir: &str, prefix: &str) -> AppResult<String> {
+    save_image_bytes(&decode_base64_png(image_data)?, save_dir, prefix)
+}
+
+/// Save base64-encoded image data to an exact file path (overwriting it)
+pub fn save_base64_image_to_path(image_data: &str, file_path: &str) -> AppResult<String> {
+    save_image_bytes_to_path(&decode_base64_png(image_data)?, file_path)
+}
+
 /// Sequence for unique temp filenames so concurrent thumbnail generations of
 /// the same source never write to the same file.
 static THUMB_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// Cap on SIMULTANEOUS thumbnail generations. Each generation decodes a
-/// full-res screenshot (a retina PNG expands to ~60–130MB of bitmap), and
-/// tokio's blocking pool happily runs hundreds of spawn_blocking tasks at
-/// once — so a cold-cache column open plus a fast scroll used to fire dozens
-/// of full-res decodes concurrently: the memory/CPU storm behind the app (and
-/// whole-system) hangs. Cache hits never take a slot.
-const MAX_CONCURRENT_THUMB_DECODES: u32 = 3;
+/// Cap on SIMULTANEOUS thumbnail generations. The macOS CGImageSource path
+/// decodes straight to thumbnail size (memory-light), so the gate is sized to
+/// max(2, cores/2) — enough parallelism to paint a cold rail fast, while
+/// leaving cores for the webview and capture pipeline. (The old cap of 3
+/// guarded full-res `image`-crate decodes at ~60–130MB of bitmap each; that
+/// path is now only the non-macOS/error fallback.) Cache hits never take a slot.
+fn max_concurrent_thumb_decodes() -> u32 {
+    static CAP: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get() as u32)
+            .unwrap_or(4);
+        (cores / 2).max(2)
+    })
+}
 
 static THUMB_DECODE_SLOTS: std::sync::Mutex<u32> = std::sync::Mutex::new(0);
 static THUMB_DECODE_CVAR: std::sync::Condvar = std::sync::Condvar::new();
@@ -231,7 +244,7 @@ impl ThumbDecodeSlot {
         let mut in_flight = THUMB_DECODE_SLOTS
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        while *in_flight >= MAX_CONCURRENT_THUMB_DECODES {
+        while *in_flight >= max_concurrent_thumb_decodes() {
             in_flight = THUMB_DECODE_CVAR
                 .wait(in_flight)
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -252,6 +265,73 @@ impl Drop for ThumbDecodeSlot {
     }
 }
 
+/// Count of INTERACTIVE thumbnail requests currently queued or decoding
+/// (frontend-driven, via the `get_screenshot_thumbnail*` commands). The launch
+/// backfill polls this to stay out of the way: it pauses whenever the user is
+/// actually waiting on a thumbnail.
+static INTERACTIVE_THUMBS_PENDING: AtomicU32 = AtomicU32::new(0);
+
+struct InteractiveThumbGuard;
+
+impl InteractiveThumbGuard {
+    fn new() -> Self {
+        INTERACTIVE_THUMBS_PENDING.fetch_add(1, Ordering::SeqCst);
+        InteractiveThumbGuard
+    }
+}
+
+impl Drop for InteractiveThumbGuard {
+    fn drop(&mut self) {
+        INTERACTIVE_THUMBS_PENDING.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+fn interactive_thumbs_pending() -> bool {
+    INTERACTIVE_THUMBS_PENDING.load(Ordering::SeqCst) > 0
+}
+
+/// Cache keys currently being GENERATED. A burst of tiles requesting the same
+/// fresh file used to fire up to `max_concurrent_thumb_decodes()` identical
+/// full decodes; now the first request generates while the rest wait on the
+/// key and return the fresh cache entry.
+static THUMB_INFLIGHT_KEYS: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+static THUMB_INFLIGHT_CVAR: std::sync::Condvar = std::sync::Condvar::new();
+
+/// RAII marker that `key` is being generated; `acquire` blocks while another
+/// thread holds the same key. Distinct keys never wait on each other here
+/// (overall parallelism is bounded separately by ThumbDecodeSlot).
+struct ThumbInflightGuard {
+    key: u64,
+}
+
+impl ThumbInflightGuard {
+    fn acquire(key: u64) -> Self {
+        let mut keys = THUMB_INFLIGHT_KEYS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while keys.contains(&key) {
+            keys = THUMB_INFLIGHT_CVAR
+                .wait(keys)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        keys.push(key);
+        ThumbInflightGuard { key }
+    }
+}
+
+impl Drop for ThumbInflightGuard {
+    fn drop(&mut self) {
+        let mut keys = THUMB_INFLIGHT_KEYS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(i) = keys.iter().position(|k| *k == self.key) {
+            keys.swap_remove(i);
+        }
+        drop(keys);
+        THUMB_INFLIGHT_CVAR.notify_all();
+    }
+}
+
 /// Where cached thumbnails live: a PERSISTENT cache dir (~/Library/Caches on
 /// macOS), not the temp dir. macOS purges TMPDIR periodically, and every purge
 /// meant the next column open regenerated the whole library's thumbnails — a
@@ -264,15 +344,13 @@ fn thumbnail_cache_dir() -> PathBuf {
         .join("thumbnails")
 }
 
-/// Return the path to a cached, downscaled thumbnail of the screenshot at
-/// `source_path` (longest side ≈ `max_px`). The cache key covers the source
-/// path, its mtime and size, so an edited/replaced file regenerates while an
-/// unchanged one reuses the cached encode. Concurrent calls are safe: each
-/// writes to a unique temp file and atomically renames it into place.
-pub fn screenshot_thumbnail(source_path: &str, max_px: u32) -> AppResult<String> {
-    let src = PathBuf::from(source_path);
+/// Compute the cache path (and its raw key) for `source_path`'s thumbnail.
+/// The key covers the source path, its mtime and size, so an edited/replaced
+/// file regenerates while an unchanged one reuses the cached encode. Errors
+/// if the source can't be stat'd (missing file).
+fn thumb_cache_path(source_path: &str, max_px: u32) -> AppResult<(PathBuf, u64)> {
     let meta =
-        fs::metadata(&src).map_err(|e| format!("Failed to stat screenshot: {}", e))?;
+        fs::metadata(source_path).map_err(|e| format!("Failed to stat screenshot: {}", e))?;
     let mtime = meta
         .modified()
         .ok()
@@ -289,28 +367,49 @@ pub fn screenshot_thumbnail(source_path: &str, max_px: u32) -> AppResult<String>
 
     let cache_dir = thumbnail_cache_dir();
     ensure_dir(&cache_dir)?;
-    let thumb_path = cache_dir.join(format!("thumb-{:016x}.png", key));
+    Ok((cache_dir.join(format!("thumb-{:016x}.png", key)), key))
+}
+
+/// Return the path to a cached, downscaled thumbnail of the screenshot at
+/// `source_path` (longest side ≈ `max_px`), generating it if missing.
+/// INTERACTIVE entry point (the launch backfill pauses while any of these are
+/// pending). Concurrent calls are safe: each generation writes to a unique
+/// temp file and atomically renames it into place, and same-file bursts
+/// decode exactly once (see ThumbInflightGuard).
+pub fn screenshot_thumbnail(source_path: &str, max_px: u32) -> AppResult<String> {
+    let _interactive = InteractiveThumbGuard::new();
+    thumbnail_impl(source_path, max_px)
+}
+
+fn thumbnail_impl(source_path: &str, max_px: u32) -> AppResult<String> {
+    let (thumb_path, key) = thumb_cache_path(source_path, max_px)?;
     if thumb_path.exists() {
         return Ok(thumb_path.to_string_lossy().into_owned());
     }
 
-    // Bound concurrent full-res decodes (see MAX_CONCURRENT_THUMB_DECODES) and
-    // re-check the cache after the wait: a sibling call for the same file may
-    // have just generated it, and skipping the duplicate decode matters when a
-    // burst of tiles requests the same fresh capture.
+    // Serialize same-key generations, then re-check the cache: if another
+    // thread was already generating this exact thumbnail, it's on disk now.
+    let _inflight = ThumbInflightGuard::acquire(key);
+    if thumb_path.exists() {
+        return Ok(thumb_path.to_string_lossy().into_owned());
+    }
+
+    // Bound overall decode parallelism (see max_concurrent_thumb_decodes).
     let _slot = ThumbDecodeSlot::acquire();
-    if thumb_path.exists() {
-        return Ok(thumb_path.to_string_lossy().into_owned());
-    }
+    generate_thumbnail(Path::new(source_path), &thumb_path, key, max_px)?;
+    Ok(thumb_path.to_string_lossy().into_owned())
+}
 
-    let img = image::open(&src).map_err(|e| format!("Failed to open screenshot: {}", e))?;
+/// Decode `src` to a ≤`max_px` PNG at `thumb_path` (via unique temp file +
+/// atomic rename). macOS uses CGImageSource thumbnailing — decodes straight to
+/// target size, ~10x faster and memory-light versus a full `image`-crate
+/// decode of a retina PNG — falling back to the portable path on any failure
+/// (e.g. a format ImageIO can't read). Non-macOS always uses the portable path.
+fn generate_thumbnail(src: &Path, thumb_path: &Path, key: u64, max_px: u32) -> AppResult<()> {
+    let cache_dir = thumb_path
+        .parent()
+        .ok_or_else(|| "Thumbnail path has no parent directory".to_string())?;
     let max_px = max_px.max(1);
-    let thumb = if img.width() <= max_px && img.height() <= max_px {
-        img
-    } else {
-        img.thumbnail(max_px, max_px)
-    };
-
     let seq = THUMB_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
     let tmp_path = cache_dir.join(format!(
         "thumb-{:016x}.{}-{}.tmp.png",
@@ -318,15 +417,293 @@ pub fn screenshot_thumbnail(source_path: &str, max_px: u32) -> AppResult<String>
         std::process::id(),
         seq
     ));
+
+    #[cfg(target_os = "macos")]
+    {
+        match cg_thumb::write_thumbnail_png(src, &tmp_path, max_px) {
+            Ok(()) => return finalize_thumb(&tmp_path, thumb_path),
+            Err(e) => {
+                let _ = fs::remove_file(&tmp_path);
+                eprintln!(
+                    "[thumb] CGImageSource failed for {} ({}); using image-crate fallback",
+                    src.display(),
+                    e
+                );
+            }
+        }
+    }
+
+    let img = image::open(src).map_err(|e| format!("Failed to open screenshot: {}", e))?;
+    let thumb = if img.width() <= max_px && img.height() <= max_px {
+        img
+    } else {
+        img.thumbnail(max_px, max_px)
+    };
     thumb
         .save_with_format(&tmp_path, image::ImageFormat::Png)
         .map_err(|e| format!("Failed to save thumbnail: {}", e))?;
-    fs::rename(&tmp_path, &thumb_path).map_err(|e| {
-        let _ = fs::remove_file(&tmp_path);
-        format!("Failed to finalize thumbnail: {}", e)
-    })?;
+    finalize_thumb(&tmp_path, thumb_path)
+}
 
-    Ok(thumb_path.to_string_lossy().into_owned())
+fn finalize_thumb(tmp_path: &Path, thumb_path: &Path) -> AppResult<()> {
+    fs::rename(tmp_path, thumb_path).map_err(|e| {
+        let _ = fs::remove_file(tmp_path);
+        format!("Failed to finalize thumbnail: {}", e)
+    })
+}
+
+/// The `max_px` the launch-time thumbnail backfill generates at. MUST match
+/// `THUMB_MAX_PX` in `src/components/ScreenshotThumbnail.tsx` — a different
+/// value keys a different cache entry and the rail would still cold-decode.
+pub const BACKFILL_THUMB_MAX_PX: u32 = 512;
+
+/// One LOW-PRIORITY pass over the image files in `dir`, generating any
+/// missing/stale thumbnail cache entries. Strictly serial (one decode at a
+/// time), sleeps between files, and pauses whenever an interactive thumbnail
+/// request is pending — interactive work always wins; the backfill is starved
+/// by design. Returns (generated, skipped, failed) counts.
+pub fn backfill_thumbnails(dir: &str, max_px: u32) -> (usize, usize, usize) {
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return (0, 0, 0),
+    };
+    let mut files: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            let ext = p
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|s| s.to_lowercase())
+                .unwrap_or_default();
+            matches!(
+                ext.as_str(),
+                "png" | "jpg" | "jpeg" | "gif" | "webp" | "heic"
+            ) && p.is_file()
+        })
+        .collect();
+    files.sort();
+
+    let (mut generated, mut skipped, mut failed) = (0, 0, 0);
+    for file in files {
+        while interactive_thumbs_pending() {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        let path_str = file.to_string_lossy().into_owned();
+        match thumb_cache_path(&path_str, max_px) {
+            Ok((thumb_path, _)) if thumb_path.exists() => {
+                skipped += 1;
+                continue;
+            }
+            Ok(_) => {}
+            Err(_) => {
+                // File vanished between the listing and the stat.
+                failed += 1;
+                continue;
+            }
+        }
+        match thumbnail_impl(&path_str, max_px) {
+            Ok(_) => generated += 1,
+            Err(e) => {
+                failed += 1;
+                eprintln!("[thumb-backfill] {} failed: {}", path_str, e);
+            }
+        }
+        // Yield between files so the pass never monopolizes I/O or a core.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    (generated, skipped, failed)
+}
+
+/// macOS fast thumbnailing via ImageIO's CGImageSource: decodes STRAIGHT to a
+/// bounded-size thumbnail (kCGImageSourceCreateThumbnailFromImageAlways +
+/// kCGImageSourceThumbnailMaxPixelSize) instead of materializing the full-res
+/// bitmap, using the OS's hardware-accelerated decoders. Raw C FFI — same
+/// pattern as commands.rs's cg_cursor — to avoid pulling in binding crates.
+#[cfg(target_os = "macos")]
+mod cg_thumb {
+    use std::ffi::c_void;
+    use std::os::raw::{c_char, c_long};
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Path;
+
+    type Boolean = u8;
+    type CFIndex = c_long;
+    type CFTypeRef = *const c_void;
+    type CFStringRef = *const c_void;
+    type CFURLRef = *const c_void;
+    type CFNumberRef = *const c_void;
+    type CFDictionaryRef = *const c_void;
+    type CFAllocatorRef = *const c_void;
+    type CGImageRef = *const c_void;
+    type CGImageSourceRef = *const c_void;
+    type CGImageDestinationRef = *const c_void;
+
+    const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
+    const K_CF_NUMBER_SINT32_TYPE: CFIndex = 3;
+
+    /// Opaque callback tables — only their ADDRESSES are passed to
+    /// CFDictionaryCreate.
+    #[repr(C)]
+    struct CFDictionaryCallBacks {
+        _opaque: [u8; 0],
+    }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        static kCFTypeDictionaryKeyCallBacks: CFDictionaryCallBacks;
+        static kCFTypeDictionaryValueCallBacks: CFDictionaryCallBacks;
+        static kCFBooleanTrue: CFTypeRef;
+        fn CFStringCreateWithCString(
+            alloc: CFAllocatorRef,
+            s: *const c_char,
+            encoding: u32,
+        ) -> CFStringRef;
+        fn CFURLCreateFromFileSystemRepresentation(
+            alloc: CFAllocatorRef,
+            buffer: *const u8,
+            buf_len: CFIndex,
+            is_directory: Boolean,
+        ) -> CFURLRef;
+        fn CFNumberCreate(
+            alloc: CFAllocatorRef,
+            number_type: CFIndex,
+            value_ptr: *const c_void,
+        ) -> CFNumberRef;
+        fn CFDictionaryCreate(
+            alloc: CFAllocatorRef,
+            keys: *const CFTypeRef,
+            values: *const CFTypeRef,
+            num_values: CFIndex,
+            key_callbacks: *const CFDictionaryCallBacks,
+            value_callbacks: *const CFDictionaryCallBacks,
+        ) -> CFDictionaryRef;
+        fn CFRelease(cf: CFTypeRef);
+    }
+
+    #[link(name = "ImageIO", kind = "framework")]
+    extern "C" {
+        static kCGImageSourceCreateThumbnailFromImageAlways: CFStringRef;
+        static kCGImageSourceCreateThumbnailWithTransform: CFStringRef;
+        static kCGImageSourceThumbnailMaxPixelSize: CFStringRef;
+        fn CGImageSourceCreateWithURL(
+            url: CFURLRef,
+            options: CFDictionaryRef,
+        ) -> CGImageSourceRef;
+        fn CGImageSourceCreateThumbnailAtIndex(
+            src: CGImageSourceRef,
+            index: usize,
+            options: CFDictionaryRef,
+        ) -> CGImageRef;
+        fn CGImageDestinationCreateWithURL(
+            url: CFURLRef,
+            ty: CFStringRef,
+            count: usize,
+            options: CFDictionaryRef,
+        ) -> CGImageDestinationRef;
+        fn CGImageDestinationAddImage(
+            dest: CGImageDestinationRef,
+            image: CGImageRef,
+            properties: CFDictionaryRef,
+        );
+        fn CGImageDestinationFinalize(dest: CGImageDestinationRef) -> Boolean;
+    }
+
+    /// Owned CF object released on drop. Never wrap the extern constants.
+    struct CF(CFTypeRef);
+
+    impl CF {
+        fn new(r: CFTypeRef, what: &str) -> Result<Self, String> {
+            if r.is_null() {
+                Err(format!("{} returned null", what))
+            } else {
+                Ok(CF(r))
+            }
+        }
+    }
+
+    impl Drop for CF {
+        fn drop(&mut self) {
+            unsafe { CFRelease(self.0) }
+        }
+    }
+
+    fn file_url(path: &Path, what: &str) -> Result<CF, String> {
+        let bytes = path.as_os_str().as_bytes();
+        let url = unsafe {
+            CFURLCreateFromFileSystemRepresentation(
+                std::ptr::null(),
+                bytes.as_ptr(),
+                bytes.len() as CFIndex,
+                0,
+            )
+        };
+        CF::new(url, what)
+    }
+
+    /// Decode `src` straight to a ≤`max_px` thumbnail (EXIF orientation
+    /// applied, never upscaled) and write it as PNG to `dest`.
+    pub fn write_thumbnail_png(src: &Path, dest: &Path, max_px: u32) -> Result<(), String> {
+        unsafe {
+            let src_url = file_url(src, "CFURL(src)")?;
+            let image_source = CF::new(
+                CGImageSourceCreateWithURL(src_url.0, std::ptr::null()),
+                "CGImageSourceCreateWithURL",
+            )?;
+
+            let max_px = max_px.min(i32::MAX as u32) as i32;
+            let max_px_num = CF::new(
+                CFNumberCreate(
+                    std::ptr::null(),
+                    K_CF_NUMBER_SINT32_TYPE,
+                    &max_px as *const i32 as *const c_void,
+                ),
+                "CFNumberCreate",
+            )?;
+
+            let keys: [CFTypeRef; 3] = [
+                kCGImageSourceCreateThumbnailFromImageAlways,
+                kCGImageSourceCreateThumbnailWithTransform,
+                kCGImageSourceThumbnailMaxPixelSize,
+            ];
+            let values: [CFTypeRef; 3] = [kCFBooleanTrue, kCFBooleanTrue, max_px_num.0];
+            let options = CF::new(
+                CFDictionaryCreate(
+                    std::ptr::null(),
+                    keys.as_ptr(),
+                    values.as_ptr(),
+                    keys.len() as CFIndex,
+                    &kCFTypeDictionaryKeyCallBacks,
+                    &kCFTypeDictionaryValueCallBacks,
+                ),
+                "CFDictionaryCreate",
+            )?;
+
+            let thumb = CF::new(
+                CGImageSourceCreateThumbnailAtIndex(image_source.0, 0, options.0),
+                "CGImageSourceCreateThumbnailAtIndex",
+            )?;
+
+            let png_type = CF::new(
+                CFStringCreateWithCString(
+                    std::ptr::null(),
+                    b"public.png\0".as_ptr() as *const c_char,
+                    K_CF_STRING_ENCODING_UTF8,
+                ),
+                "CFString(public.png)",
+            )?;
+            let dest_url = file_url(dest, "CFURL(dest)")?;
+            let destination = CF::new(
+                CGImageDestinationCreateWithURL(dest_url.0, png_type.0, 1, std::ptr::null()),
+                "CGImageDestinationCreateWithURL",
+            )?;
+            CGImageDestinationAddImage(destination.0, thumb.0, std::ptr::null());
+            if CGImageDestinationFinalize(destination.0) == 0 {
+                return Err("CGImageDestinationFinalize failed".to_string());
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Like `screenshot_thumbnail`, but returns the thumbnail's PNG BYTES rather than
@@ -519,9 +896,11 @@ mod tests {
 
         #[test]
         fn decode_slots_bound_concurrency() {
+            let cap = max_concurrent_thumb_decodes();
+            assert!(cap >= 2, "cap must allow at least 2 decodes, got {cap}");
             let live = Arc::new(AtomicU32::new(0));
             let peak = Arc::new(AtomicU32::new(0));
-            let handles: Vec<_> = (0..16)
+            let handles: Vec<_> = (0..32)
                 .map(|_| {
                     let live = live.clone();
                     let peak = peak.clone();
@@ -538,11 +917,107 @@ mod tests {
                 h.join().unwrap();
             }
             assert!(
-                peak.load(Ordering::SeqCst) <= MAX_CONCURRENT_THUMB_DECODES,
+                peak.load(Ordering::SeqCst) <= cap,
                 "peak {} exceeded cap {}",
                 peak.load(Ordering::SeqCst),
-                MAX_CONCURRENT_THUMB_DECODES
+                cap
             );
+        }
+
+        #[test]
+        fn inflight_guard_serializes_same_key() {
+            let live = Arc::new(AtomicU32::new(0));
+            let peak = Arc::new(AtomicU32::new(0));
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let live = live.clone();
+                    let peak = peak.clone();
+                    std::thread::spawn(move || {
+                        let _guard = ThumbInflightGuard::acquire(0xD00D_u64);
+                        let now = live.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(now, Ordering::SeqCst);
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        live.fetch_sub(1, Ordering::SeqCst);
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.join().unwrap();
+            }
+            assert_eq!(
+                peak.load(Ordering::SeqCst),
+                1,
+                "same-key generations must never overlap"
+            );
+        }
+
+        #[test]
+        fn inflight_guard_distinct_keys_do_not_block() {
+            // Holding key A must not block an acquire of key B: if it did,
+            // this test would deadlock (joined thread waits forever).
+            let _a = ThumbInflightGuard::acquire(0xAAA0_0001);
+            let t = std::thread::spawn(|| {
+                let _b = ThumbInflightGuard::acquire(0xBBB0_0002);
+            });
+            t.join().unwrap();
+        }
+
+        #[test]
+        fn cg_unsupported_format_falls_back_to_image_crate() {
+            // PPM: written by the image crate, unreadable by macOS ImageIO —
+            // exercises the CGImageSource-error → portable-decode fallback.
+            // On non-macOS this is simply the portable path.
+            let dir = std::env::temp_dir().join(format!(
+                "syncshot_thumb_fallback_test_{}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let src = dir.join("src.ppm");
+            let img = DynamicImage::new_rgb8(64, 48);
+            img.save_with_format(&src, image::ImageFormat::Pnm)
+                .expect("write ppm");
+            let src_str = src.to_string_lossy().into_owned();
+
+            let thumb_path = screenshot_thumbnail(&src_str, 32).expect("fallback thumbnail");
+            let thumb = image::open(&thumb_path).expect("decodable thumb");
+            assert!(thumb.width() <= 32 && thumb.height() <= 32);
+
+            let _ = std::fs::remove_file(std::path::Path::new(&thumb_path));
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn backfill_generates_missing_and_skips_fresh() {
+            let dir = std::env::temp_dir().join(format!(
+                "syncshot_backfill_test_{}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let a = dir.join("a.png");
+            let b = dir.join("b.png");
+            DynamicImage::new_rgba8(64, 48).save(&a).unwrap();
+            DynamicImage::new_rgba8(48, 64).save(&b).unwrap();
+            // Non-image files must be ignored entirely.
+            std::fs::write(dir.join("notes.txt"), b"not an image").unwrap();
+
+            // Pre-generate a's thumbnail: backfill must skip it, generate b's.
+            let a_thumb = screenshot_thumbnail(&a.to_string_lossy(), 32).unwrap();
+
+            let (generated, skipped, failed) =
+                backfill_thumbnails(&dir.to_string_lossy(), 32);
+            assert_eq!((generated, skipped, failed), (1, 1, 0));
+
+            let b_thumb = thumb_cache_path(&b.to_string_lossy(), 32).unwrap().0;
+            assert!(b_thumb.exists(), "backfill must generate b's thumbnail");
+
+            // A second pass is a full skip.
+            let (generated2, skipped2, failed2) =
+                backfill_thumbnails(&dir.to_string_lossy(), 32);
+            assert_eq!((generated2, skipped2, failed2), (0, 2, 0));
+
+            let _ = std::fs::remove_file(std::path::Path::new(&a_thumb));
+            let _ = std::fs::remove_file(&b_thumb);
+            let _ = std::fs::remove_dir_all(&dir);
         }
 
         #[test]
