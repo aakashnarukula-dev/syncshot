@@ -73,6 +73,22 @@ export function screenshotsSignature(
   return sig;
 }
 
+/**
+ * Cheap identity signature for a clipboard snapshot — the clipboard twin of
+ * `screenshotsSignature`. Covers everything a card renders or reorders on:
+ * membership + order (id), the pinned flag, and createdAt (null while the
+ * server timestamp resolves). `text` needs no hashing: a doc's text is
+ * immutable, so the id already pins it. The engine skips the store write for
+ * echo snapshots, avoiding a full re-render of every clipboard card.
+ */
+export function clipboardSignature(items: ClipboardDoc[]): string {
+  let sig = "";
+  for (const i of items) {
+    sig += `|${i.id}:${i.pinned ? 1 : 0}:${i.createdAt ?? ""}`;
+  }
+  return sig;
+}
+
 /** Max clipboard text size synced (spec: 100 KB cap to stay well under 1 MB). */
 export const CLIPBOARD_MAX_BYTES = 100 * 1024;
 

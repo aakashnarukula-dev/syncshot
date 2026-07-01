@@ -29,7 +29,7 @@ import {
 import {
   initializeFirestore,
   persistentLocalCache,
-  persistentMultipleTabManager,
+  persistentSingleTabManager,
   type Firestore,
 } from "firebase/firestore";
 import { getStorage, type FirebaseStorage } from "firebase/storage";
@@ -40,11 +40,14 @@ export const app: FirebaseApp = initializeApp(firebaseConfig);
 export const auth: Auth = getAuth(app);
 
 // IndexedDB offline persistence (zero-latency cold render + offline writes).
-// persistentMultipleTabManager keeps multiple webviews (main + any future
-// windows) coherent without throwing the single-tab "failed-precondition".
+// persistentSingleTabManager: ONLY the main webview ever initializes Firestore
+// (the editor window renders EditorOnlyApp and never imports the sync layer),
+// so the multi-tab manager's periodic IndexedDB lease writes were pure
+// overhead. If a second Firestore-holding webview ever appears, persistence
+// activation fails soft (in-memory cache + console warning), not a crash.
 export const db: Firestore = initializeFirestore(app, {
   localCache: persistentLocalCache({
-    tabManager: persistentMultipleTabManager(),
+    tabManager: persistentSingleTabManager(undefined),
   }),
 });
 

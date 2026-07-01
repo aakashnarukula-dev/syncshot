@@ -18,7 +18,13 @@ import { logout, watchAuth } from "./firebase";
 import { loadSyncPrefs, saveDeviceId, saveDeviceName, savePaused } from "./persistence";
 import { publishScreenshot, reconcileLocalCache, saveReceivedScreenshot, subscribeScreenshots } from "./screenshots";
 import { subscribeClipboard, writeClipboardEntry } from "./clipboard";
-import { screenshotsSignature, type ClipboardDoc, type DeviceRef, type ScreenshotDoc } from "./types";
+import {
+  clipboardSignature,
+  screenshotsSignature,
+  type ClipboardDoc,
+  type DeviceRef,
+  type ScreenshotDoc,
+} from "./types";
 
 let started = false;
 let device: DeviceRef | null = null;
@@ -37,9 +43,39 @@ const savedFullIds = new Set<string>();
 // rendered content is identical; skipping the store write for those avoids a
 // full App re-render per echo while uploads/downloads churn.
 let lastScreenshotsSig: string | null = null;
+// Same skip for clipboard snapshots — without it every echo snapshot replaced
+// the store array identity and re-rendered all ~200 clipboard cards.
+let lastClipboardSig: string | null = null;
 // Newest clipboard hash seen (any device) — suppresses echo when we re-copy a
 // remote entry (set_clipboard_text would otherwise bounce back via the poller).
 let recentClipHash: string | null = null;
+
+/**
+ * Debounced local-cache reconcile. One upload produces ≥3 authoritative
+ * snapshots, and each reconcile costs get_desktop_directory + list_screenshots
+ * + delete IPCs — so snapshots within the debounce window collapse into ONE
+ * trailing reconcile, and a doc-id set identical to the last completed
+ * reconcile is skipped outright.
+ */
+const RECONCILE_DEBOUNCE_MS = 2000;
+let reconcileTimer: ReturnType<typeof setTimeout> | null = null;
+let lastReconcileSig: string | null = null;
+let pendingReconcile: { ids: Set<string>; sig: string } | null = null;
+
+function scheduleReconcile(ids: Set<string>): void {
+  const sig = [...ids].sort().join("|");
+  if (reconcileTimer === null && sig === lastReconcileSig) return;
+  pendingReconcile = { ids, sig };
+  if (reconcileTimer !== null) clearTimeout(reconcileTimer);
+  reconcileTimer = setTimeout(() => {
+    reconcileTimer = null;
+    const p = pendingReconcile;
+    pendingReconcile = null;
+    if (!p) return;
+    lastReconcileSig = p.sig;
+    void reconcileLocalCache(p.ids);
+  }, RECONCILE_DEBOUNCE_MS);
+}
 
 function store() {
   return useSyncStore.getState();
@@ -70,12 +106,12 @@ function handleScreenshots(
   //     cache snapshot can replay a stale/empty set.
   //   • !hasMore   — the window holds the WHOLE collection (came back short of
   //     the limit); while capped, a missing id may have merely scrolled past it.
-  const currentIds = new Set(items.map((i) => i.id));
   if (!fromCache && !hasMore) {
+    const currentIds = new Set(items.map((i) => i.id));
     for (const id of savedFullIds) {
       if (!currentIds.has(id)) savedFullIds.delete(id);
     }
-    void reconcileLocalCache(currentIds);
+    scheduleReconcile(currentIds);
   }
 
   for (const item of items) {
@@ -95,7 +131,11 @@ function handleScreenshots(
 }
 
 function handleClipboard(items: ClipboardDoc[]): void {
-  store().setClipboard(items);
+  const sig = clipboardSignature(items);
+  if (sig !== lastClipboardSig) {
+    lastClipboardSig = sig;
+    store().setClipboard(items);
+  }
   if (items.length > 0) recentClipHash = items[0].hash;
 }
 
@@ -109,6 +149,15 @@ function stopListeners(): void {
   // the new account's shots instead of skipping ids the previous account saw.
   savedFullIds.clear();
   lastScreenshotsSig = null;
+  lastClipboardSig = null;
+  // Cancel any pending reconcile and forget the last reconciled set — a stale
+  // keep-set must never fire after sign-out / into the next account's cache.
+  if (reconcileTimer !== null) {
+    clearTimeout(reconcileTimer);
+    reconcileTimer = null;
+  }
+  pendingReconcile = null;
+  lastReconcileSig = null;
 }
 
 function startListeners(uid: string): void {

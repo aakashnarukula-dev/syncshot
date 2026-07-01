@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import type { ScreenshotDoc } from "./types";
-import { screenshotsSignature } from "./types";
+import type { ClipboardDoc, ScreenshotDoc } from "./types";
+import { clipboardSignature, screenshotsSignature } from "./types";
 
 function makeDoc(overrides: Partial<ScreenshotDoc> = {}): ScreenshotDoc {
   return {
@@ -46,5 +46,46 @@ describe("screenshotsSignature", () => {
     expect(screenshotsSignature(two, true)).not.toBe(
       screenshotsSignature([...two].reverse(), true),
     );
+  });
+});
+
+function makeClip(overrides: Partial<ClipboardDoc> = {}): ClipboardDoc {
+  return {
+    id: "Clip0000000000000001",
+    text: "hello",
+    hash: "h1",
+    createdAt: 1000,
+    device: { uid: "u", deviceId: "d", name: "Mac", platform: "mac" },
+    pinned: false,
+    charCount: 5,
+    ...overrides,
+  };
+}
+
+describe("clipboardSignature", () => {
+  it("is stable for identical doc sets (echo snapshots can be skipped)", () => {
+    const a = [makeClip(), makeClip({ id: "Clip0000000000000002" })];
+    const b = [makeClip(), makeClip({ id: "Clip0000000000000002" })];
+    expect(clipboardSignature(a)).toBe(clipboardSignature(b));
+  });
+
+  it("changes when the pinned flag toggles", () => {
+    expect(clipboardSignature([makeClip({ pinned: false })])).not.toBe(
+      clipboardSignature([makeClip({ pinned: true })]),
+    );
+  });
+
+  it("changes when createdAt resolves from null to a server timestamp", () => {
+    expect(clipboardSignature([makeClip({ createdAt: null })])).not.toBe(
+      clipboardSignature([makeClip({ createdAt: 123 })]),
+    );
+  });
+
+  it("changes with order and membership", () => {
+    const one = [makeClip()];
+    const two = [makeClip(), makeClip({ id: "Clip0000000000000002" })];
+    expect(clipboardSignature(one)).not.toBe(clipboardSignature(two));
+    expect(clipboardSignature(two)).not.toBe(clipboardSignature([...two].reverse()));
+    expect(clipboardSignature([])).not.toBe(clipboardSignature(one));
   });
 });
