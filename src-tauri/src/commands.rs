@@ -82,9 +82,9 @@ pub async fn save_native_screenshot(
 }
 
 /// Save a screenshot received via Firebase sync into the local screenshot cache
-/// (hidden app-data dir, NOT the Desktop) and copy it to the clipboard. Returns
-/// the saved file path. The existing save-dir poll then surfaces it in the
-/// thumbnail column.
+/// (hidden app-data dir, NOT the Desktop). Returns the saved file path. The
+/// existing save-dir poll then surfaces it in the thumbnail column (and copies
+/// a FRESH arrival to the clipboard per the user's auto-copy setting).
 #[tauri::command]
 pub async fn save_synced_image(bytes: Vec<u8>, name: String) -> Result<String, String> {
     persist_synced_image(&bytes, &name)
@@ -171,18 +171,22 @@ fn synced_filename_for(name: &str, bytes: &[u8]) -> Result<String, String> {
 }
 
 /// Persist raw image bytes into the local screenshot cache (hidden app-data dir,
-/// NOT the Desktop) and copy them to the clipboard. Returns the saved path.
-/// Shared by `save_synced_image` (bytes over IPC) and `download_synced_image`
-/// (bytes fetched in Rust).
+/// NOT the Desktop). Returns the saved path. Shared by `save_synced_image`
+/// (bytes over IPC) and `download_synced_image` (bytes fetched in Rust).
+///
+/// Deliberately does NOT touch the clipboard: the post-sign-in catch-up can
+/// download dozens of shots back-to-back, and the old unconditional
+/// copy-per-download slammed NSPasteboard once per file (clobbering whatever
+/// the user had copied, ignoring the auto-copy preference, and burning CPU on
+/// multi-MB pasteboard writes for a backlog). The webview's save-dir poll owns
+/// the copy now — it copies only a genuinely FRESH arrival, gated by the
+/// user's auto-copy setting.
 fn persist_synced_image(bytes: &[u8], name: &str) -> Result<String, String> {
     let dir = get_syncshot_dir()?;
     let filename = synced_filename_for(name, bytes)?;
     let path = PathBuf::from(&dir).join(&filename);
     fs::write(&path, bytes).map_err(|e| format!("Failed to save synced image: {}", e))?;
-    let path_str = path.to_string_lossy().into_owned();
-    // Mirror local-capture behavior: place the received image on the clipboard.
-    let _ = copy_image_to_clipboard(&path_str);
-    Ok(path_str)
+    Ok(path.to_string_lossy().into_owned())
 }
 
 /// Download a synced screenshot's bytes over HTTP from a Firebase Storage

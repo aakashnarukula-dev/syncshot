@@ -59,6 +59,42 @@ export function findDocForCachePath(path: string): ScreenshotDoc | null {
 }
 
 /**
+ * A SYNCED shot's cache file is named `{firestoreDocId}.<ext>`, and a Firestore
+ * auto id is exactly 20 chars of [A-Za-z0-9] — no separators. Matches BOTH a
+ * received shot and a published own capture (renamed to `{docId}.<ext>` after
+ * publish). Unpublished local files (`shot_…`, `screenshot_…`, `region_…`,
+ * `syncshot_…`, `synced_…`) always carry an underscore, so they never match.
+ */
+const SYNCED_CACHE_ID = /^[A-Za-z0-9]{20}$/;
+
+/** True when `path` is a synced-shot cache file (`{docId}.<ext>`) — i.e. it
+ *  PROVABLY already has a cloud doc, so backfill can skip re-hashing it. */
+export function isSyncedCacheFile(path: string): boolean {
+  const id = cacheDocId(path);
+  return id !== null && SYNCED_CACHE_ID.test(id);
+}
+
+/**
+ * True when the screenshot at `path` was created within `maxAgeMs` of `nowMs`
+ * (per its TRUE creation time — doc createdAt or shot_{ts} epoch). Files whose
+ * creation time can't be resolved count as recent: an editor save
+ * (`syncshot_…`) must keep today's copy/reveal behavior. Used by the save-dir
+ * poll to react (clipboard copy / toast / window reveal) ONLY to genuinely
+ * fresh arrivals — a backlog page-in of old synced shots updates the list
+ * silently instead of re-copying the clipboard and re-surfacing the window on
+ * every poll tick.
+ */
+export function isRecentScreenshot(
+  path: string,
+  nowMs: number,
+  maxAgeMs: number,
+): boolean {
+  const ts = screenshotCreatedAt(path);
+  if (ts == null) return true;
+  return nowMs - ts <= maxAgeMs;
+}
+
+/**
  * The capture epoch (ms-since-epoch) embedded in an own-capture cache filename
  * `shot_{ts}.png`. `ts` is epoch MILLISECONDS — see Rust `generate_filename`
  * (`get_timestamp().as_millis()`), so it shares one scale with a doc's

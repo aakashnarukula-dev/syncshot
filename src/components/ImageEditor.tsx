@@ -146,8 +146,11 @@ export function ImageEditor({ imagePath, onSave, onCancel, onExport }: ImageEdit
       return;
     }
 
+    let cancelled = false;
+    let objectUrl: string | null = null;
     const img = new Image();
     img.onload = async () => {
+      if (cancelled) return;
       setScreenshotImage(img);
       setImageLoaded(true);
 
@@ -173,16 +176,38 @@ export function ImageEditor({ imagePath, onSave, onCancel, onExport }: ImageEdit
       }
     };
     img.onerror = () => {
+      if (cancelled) return;
       setLoadError(`Failed to load image from: ${imagePath}`);
     };
 
-    const assetUrl = convertFileSrc(imagePath);
-    img.crossOrigin = "anonymous";
-    img.src = assetUrl;
+    // PRIMARY: read the file's bytes over IPC and load a same-origin `blob:`
+    // URL. The old `convertFileSrc` + crossOrigin="anonymous" load needs a
+    // CORS-approved `asset://` response, which the RELEASE webview's
+    // `http://localhost:38217` origin never gets — the editor's image load was
+    // slow/broken in release builds (same root cause as the sync layer's old
+    // fetch(convertFileSrc), fixed with read_image_bytes). A blob URL decodes
+    // origin-independently AND leaves the canvas untainted (same-origin), so
+    // save/copy/crop/OCR all keep working. Asset URL kept as a dev fallback.
+    (async () => {
+      try {
+        const buf = await invoke<ArrayBuffer>("read_image_bytes", { path: imagePath });
+        if (cancelled) return;
+        objectUrl = URL.createObjectURL(new Blob([buf]));
+        img.src = objectUrl;
+      } catch {
+        if (cancelled) return;
+        img.crossOrigin = "anonymous";
+        img.src = convertFileSrc(imagePath);
+      }
+    })();
 
     return () => {
+      cancelled = true;
       img.onload = null;
       img.onerror = null;
+      // The decoded HTMLImageElement keeps its bitmap after revoke; only a
+      // fresh load of the dead URL would fail, which never happens here.
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
   }, [imagePath, actions]);
 
