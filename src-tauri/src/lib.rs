@@ -16,11 +16,12 @@ use commands::{
     capture_all_monitors, capture_once, capture_region, copy_to_clipboard, cursor_display_bounds,
     delete_file,
     download_synced_image, get_desktop_directory, get_desktop_root, get_mouse_position,
-    file_exists, get_screenshot_thumbnail, get_temp_directory,
+    file_exists, get_screenshot_thumbnail, get_screenshot_thumbnail_path, get_temp_directory,
     list_screenshots, native_capture_fullscreen, native_capture_interactive,
     read_image_bytes,
     native_capture_window, open_editor_window, play_screenshot_sound, save_edited_image,
-    rename_screenshot_to_doc_id, save_native_screenshot, save_synced_image, set_clipboard_text,
+    save_edited_image_bytes,
+    rename_screenshot_to_doc_id, save_native_screenshot, set_clipboard_text,
 };
 use auth::{browser_auth_listen, close_auth_window};
 use license::{get_machine_id, keychain_delete, keychain_get, keychain_set};
@@ -196,6 +197,28 @@ pub fn run() {
             // emits `clipboard-changed` so the webview can sync copies.
             crate::clipboard::start_clipboard_watcher(app.handle().clone());
 
+            // Thumbnail backfill: one LOW-PRIORITY pass ~5s after launch that
+            // generates every missing cache thumbnail, so any later rail open
+            // over the whole library is a 100% cache hit instead of a cold
+            // decode storm. Own OS thread (not the tokio pool): the pass
+            // sleeps/yields for minutes and must never occupy a runtime
+            // worker. Serial, and starved by interactive requests by design.
+            std::thread::spawn(|| {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                match crate::utils::get_syncshot_dir() {
+                    Ok(dir) => {
+                        let (generated, skipped, failed) = crate::image::backfill_thumbnails(
+                            &dir,
+                            crate::image::BACKFILL_THUMB_MAX_PX,
+                        );
+                        eprintln!(
+                            "[thumb-backfill] pass complete: {generated} generated, {skipped} already cached, {failed} failed"
+                        );
+                    }
+                    Err(e) => eprintln!("[thumb-backfill] skipped: {e}"),
+                }
+            });
+
             if let Some(window) = app.get_webview_window("main") {
                 let window_clone = window.clone();
                 window.on_window_event(move |event| {
@@ -257,6 +280,7 @@ pub fn run() {
             capture_all_monitors,
             capture_region,
             save_edited_image,
+            save_edited_image_bytes,
             save_native_screenshot,
             copy_to_clipboard,
             delete_file,
@@ -266,13 +290,13 @@ pub fn run() {
             list_screenshots,
             get_temp_directory,
             get_screenshot_thumbnail,
+            get_screenshot_thumbnail_path,
             read_image_bytes,
             file_exists,
             native_capture_interactive,
             native_capture_fullscreen,
             native_capture_window,
             play_screenshot_sound,
-            save_synced_image,
             rename_screenshot_to_doc_id,
             download_synced_image,
             set_clipboard_text,

@@ -25,13 +25,17 @@ pub async fn capture_once(
     let screenshot_path = capture_primary_monitor(app_handle).await?;
     let screenshot_path_str = screenshot_path.to_string_lossy().to_string();
 
-    let saved_path = copy_screenshot_to_dir(&screenshot_path_str, &save_dir)?;
-
-    if copy_to_clip {
-        copy_image_to_clipboard(&saved_path)?;
-    }
-
-    Ok(saved_path)
+    // Multi-MB file copy + (optionally) a full read + pasteboard write —
+    // blocking work, off the async runtime.
+    tauri::async_runtime::spawn_blocking(move || {
+        let saved_path = copy_screenshot_to_dir(&screenshot_path_str, &save_dir)?;
+        if copy_to_clip {
+            copy_image_to_clipboard(&saved_path)?;
+        }
+        Ok(saved_path)
+    })
+    .await
+    .map_err(|e| format!("Capture task failed: {}", e))?
 }
 
 /// Capture all monitors with geometry info
@@ -40,7 +44,10 @@ pub async fn capture_all_monitors(
     _app_handle: AppHandle,
     save_dir: String,
 ) -> Result<Vec<MonitorShot>, String> {
-    capture_monitors(&save_dir)
+    // xcap capture + PNG encode per monitor: seconds of CPU on retina displays.
+    tauri::async_runtime::spawn_blocking(move || capture_monitors(&save_dir))
+        .await
+        .map_err(|e| format!("Capture task failed: {}", e))?
 }
 
 /// Crop a region from a screenshot
@@ -59,7 +66,10 @@ pub async fn capture_region(
         width,
         height,
     };
-    crop_image(&screenshot_path, region, &save_dir)
+    // Full-res decode + crop + encode: 1–3s on a retina screenshot.
+    tauri::async_runtime::spawn_blocking(move || crop_image(&screenshot_path, region, &save_dir))
+        .await
+        .map_err(|e| format!("Crop task failed: {}", e))?
 }
 
 /// Save a native screenshot file to the user's save dir and optionally copy to clipboard
@@ -70,24 +80,20 @@ pub async fn save_native_screenshot(
     save_dir: String,
     copy_to_clip: bool,
 ) -> Result<String, String> {
-    let saved_path = copy_screenshot_to_dir(&source_path, &save_dir)?;
-    if copy_to_clip {
-        copy_image_to_clipboard(&saved_path)?;
-    }
+    let saved_path = tauri::async_runtime::spawn_blocking(move || {
+        let saved_path = copy_screenshot_to_dir(&source_path, &save_dir)?;
+        if copy_to_clip {
+            copy_image_to_clipboard(&saved_path)?;
+        }
+        Ok::<String, String>(saved_path)
+    })
+    .await
+    .map_err(|e| format!("Save task failed: {}", e))??;
     // Notify the webview so the Firebase sync engine can upload this capture.
     // (The publisher dedupes by sha256, so a spurious emit is harmless.)
     use tauri::Emitter;
     let _ = app.emit("new-screenshot", saved_path.clone());
     Ok(saved_path)
-}
-
-/// Save a screenshot received via Firebase sync into the local screenshot cache
-/// (hidden app-data dir, NOT the Desktop). Returns the saved file path. The
-/// existing save-dir poll then surfaces it in the thumbnail column (and copies
-/// a FRESH arrival to the clipboard per the user's auto-copy setting).
-#[tauri::command]
-pub async fn save_synced_image(bytes: Vec<u8>, name: String) -> Result<String, String> {
-    persist_synced_image(&bytes, &name)
 }
 
 /// Rename a locally-captured screenshot cache file so it carries its Firestore
@@ -171,8 +177,10 @@ fn synced_filename_for(name: &str, bytes: &[u8]) -> Result<String, String> {
 }
 
 /// Persist raw image bytes into the local screenshot cache (hidden app-data dir,
-/// NOT the Desktop). Returns the saved path. Shared by `save_synced_image`
-/// (bytes over IPC) and `download_synced_image` (bytes fetched in Rust).
+/// NOT the Desktop). Returns the saved path. Used by `download_synced_image`
+/// (bytes fetched in Rust). (The old `save_synced_image` command — the same
+/// bytes shipped as a JSON number array over IPC — was unused by the frontend
+/// and has been removed.)
 ///
 /// Deliberately does NOT touch the clipboard: the post-sign-in catch-up can
 /// download dozens of shots back-to-back, and the old unconditional
@@ -215,7 +223,9 @@ pub async fn download_synced_image(url: String, name: String) -> Result<String, 
         .bytes()
         .await
         .map_err(|e| format!("Failed to read synced image body: {}", e))?;
-    persist_synced_image(&bytes, &name)
+    tauri::async_runtime::spawn_blocking(move || persist_synced_image(&bytes, &name))
+        .await
+        .map_err(|e| format!("Persist task failed: {}", e))?
 }
 
 #[cfg(test)]
@@ -286,7 +296,12 @@ pub async fn set_clipboard_text(text: String) -> Result<(), String> {
 /// Used when a screenshot arrives via folder sync from another Mac.
 #[tauri::command]
 pub async fn copy_to_clipboard(path: String) -> Result<(), String> {
-    copy_image_to_clipboard(&path)
+    // Multi-MB fs::read + NSPasteboard write; auto-fires on every fresh
+    // arrival, so it must never run inline on a runtime worker. NSPasteboard
+    // off-main matches the existing clipboard watcher thread.
+    tauri::async_runtime::spawn_blocking(move || copy_image_to_clipboard(&path))
+        .await
+        .map_err(|e| format!("Clipboard task failed: {}", e))?
 }
 
 /// Delete a file (used to remove the temp capture once saved)
@@ -330,16 +345,78 @@ pub async fn save_edited_image(
     copy_to_clip: bool,
     overwrite_path: Option<String>,
 ) -> Result<String, String> {
-    let saved_path = match overwrite_path {
-        Some(ref p) if !p.is_empty() => save_base64_image_to_path(&image_data, p)?,
-        _ => save_base64_image(&image_data, &save_dir, "syncshot")?,
+    // Base64 decode of a multi-MB export + file write + pasteboard: blocking.
+    tauri::async_runtime::spawn_blocking(move || {
+        let saved_path = match overwrite_path {
+            Some(ref p) if !p.is_empty() => save_base64_image_to_path(&image_data, p)?,
+            _ => save_base64_image(&image_data, &save_dir, "syncshot")?,
+        };
+
+        if copy_to_clip {
+            copy_image_to_clipboard(&saved_path)?;
+        }
+
+        Ok(saved_path)
+    })
+    .await
+    .map_err(|e| format!("Save task failed: {}", e))?
+}
+
+/// Save an edited image from RAW PNG bytes (the `tauri::ipc::Request` body).
+/// Faster sibling of `save_edited_image`: skips the base64 data-URL round-trip
+/// (~33% larger payload plus a multi-MB JSON string parse) — the webview ships
+/// the ArrayBuffer straight through the IPC raw-body path. Invoke with the
+/// bytes as the request body and the options as headers:
+///
+///   invoke('save_edited_image_bytes', new Uint8Array(bytes), { headers: {
+///     'save-dir': encodeURIComponent(saveDir),     // required unless overwrite-path set
+///     'copy-to-clip': '1',                         // optional: '1' or 'true'
+///     'overwrite-path': encodeURIComponent(path),  // optional: exact path to overwrite
+///   }})
+///
+/// Header values are percent-encoded so non-ASCII paths survive HTTP header
+/// transport. `save_edited_image` (data-URL string) keeps working unchanged.
+#[tauri::command]
+pub async fn save_edited_image_bytes(
+    request: tauri::ipc::Request<'_>,
+) -> Result<String, String> {
+    let bytes: Vec<u8> = match request.body() {
+        tauri::ipc::InvokeBody::Raw(b) => b.clone(),
+        _ => return Err("save_edited_image_bytes expects a raw byte body".to_string()),
     };
+    let header = |name: &str| -> Result<Option<String>, String> {
+        match request.headers().get(name) {
+            None => Ok(None),
+            Some(v) => {
+                let s = v
+                    .to_str()
+                    .map_err(|e| format!("invalid {} header: {}", name, e))?;
+                let decoded = urlencoding::decode(s)
+                    .map_err(|e| format!("invalid {} header: {}", name, e))?;
+                Ok(Some(decoded.into_owned()))
+            }
+        }
+    };
+    let save_dir = header("save-dir")?;
+    let overwrite_path = header("overwrite-path")?.filter(|p| !p.is_empty());
+    let copy_to_clip = matches!(header("copy-to-clip")?.as_deref(), Some("1") | Some("true"));
 
-    if copy_to_clip {
-        copy_image_to_clipboard(&saved_path)?;
-    }
-
-    Ok(saved_path)
+    tauri::async_runtime::spawn_blocking(move || {
+        let saved_path = match overwrite_path {
+            Some(ref p) => crate::image::save_image_bytes_to_path(&bytes, p)?,
+            None => {
+                let dir =
+                    save_dir.ok_or("save-dir header required when overwrite-path is not set")?;
+                crate::image::save_image_bytes(&bytes, &dir, "syncshot")?
+            }
+        };
+        if copy_to_clip {
+            copy_image_to_clipboard(&saved_path)?;
+        }
+        Ok(saved_path)
+    })
+    .await
+    .map_err(|e| format!("Save task failed: {}", e))?
 }
 
 /// Get the default screenshot directory: a hidden app-data cache (NOT the
@@ -360,39 +437,48 @@ pub async fn get_desktop_root() -> Result<String, String> {
 /// List screenshot files in a directory, newest first.
 #[tauri::command]
 pub async fn list_screenshots(dir: String) -> Result<Vec<String>, String> {
-    let path = std::path::Path::new(&dir);
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let entries = fs::read_dir(path).map_err(|e| format!("Failed to read dir: {}", e))?;
-    let mut files: Vec<(std::path::PathBuf, std::time::SystemTime)> = Vec::new();
-    for entry in entries.flatten() {
-        let p = entry.path();
-        if !p.is_file() {
-            continue;
+    // A 565-file dir listing with a stat per entry — blocking I/O.
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = std::path::Path::new(&dir);
+        if !path.exists() {
+            return Ok(Vec::new());
         }
-        let ext = p
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|s| s.to_lowercase())
-            .unwrap_or_default();
-        if !matches!(
-            ext.as_str(),
-            "png" | "jpg" | "jpeg" | "gif" | "webp" | "heic"
-        ) {
-            continue;
+        let entries = fs::read_dir(path).map_err(|e| format!("Failed to read dir: {}", e))?;
+        let mut files: Vec<(std::path::PathBuf, std::time::SystemTime)> = Vec::new();
+        for entry in entries.flatten() {
+            let p = entry.path();
+            let ext = p
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|s| s.to_lowercase())
+                .unwrap_or_default();
+            if !matches!(
+                ext.as_str(),
+                "png" | "jpg" | "jpeg" | "gif" | "webp" | "heic"
+            ) {
+                continue;
+            }
+            // One metadata() call answers both is_file and mtime (the old
+            // p.is_file() was a second redundant stat per entry).
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            if !meta.is_file() {
+                continue;
+            }
+            let mtime = meta
+                .modified()
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            files.push((p, mtime));
         }
-        let mtime = entry
-            .metadata()
-            .and_then(|m| m.modified())
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-        files.push((p, mtime));
-    }
-    files.sort_by(|a, b| b.1.cmp(&a.1));
-    Ok(files
-        .into_iter()
-        .map(|(p, _)| p.to_string_lossy().into_owned())
-        .collect())
+        files.sort_by(|a, b| b.1.cmp(&a.1));
+        Ok(files
+            .into_iter()
+            .map(|(p, _)| p.to_string_lossy().into_owned())
+            .collect())
+    })
+    .await
+    .map_err(|e| format!("List task failed: {}", e))?
 }
 
 /// Get the system temp directory path (cross-platform)
@@ -430,6 +516,20 @@ pub async fn get_screenshot_thumbnail(
     Ok(tauri::ipc::Response::new(bytes))
 }
 
+/// Return the on-disk PATH of the cached thumbnail for `path` (generating it
+/// if missing — same cache and pipeline as `get_screenshot_thumbnail`). The
+/// frontend hands this path to the OS as a native drag icon: the drag plugin
+/// reads the file directly, so no bytes cross IPC. The bytes contract of
+/// `get_screenshot_thumbnail` is unchanged.
+#[tauri::command]
+pub async fn get_screenshot_thumbnail_path(path: String, max_px: u32) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::image::screenshot_thumbnail(&path, max_px)
+    })
+    .await
+    .map_err(|e| format!("Thumbnail task failed: {}", e))?
+}
+
 /// Return a LOCAL file's raw, FULL-RES bytes as `tauri::ipc::Response` (the
 /// frontend receives an ArrayBuffer, not a JSON number array).
 ///
@@ -454,8 +554,10 @@ pub async fn read_image_bytes(path: String) -> Result<tauri::ipc::Response, Stri
 /// "is the local cache file still present?" without a CORS `asset://` fetch
 /// (which always fails from the release localhost origin) and without reading
 /// the whole file's bytes. Returns false on a missing file or any stat error.
+/// Async so the stat runs on a runtime worker, not the main thread (a sync
+/// command body executes on main — one slow/network volume stat = UI hitch).
 #[tauri::command]
-pub fn file_exists(path: String) -> bool {
+pub async fn file_exists(path: String) -> bool {
     std::path::Path::new(&path).is_file()
 }
 
@@ -472,52 +574,51 @@ fn is_screencapture_running() -> bool {
     }
 }
 
-/// Check screen recording permission by attempting a minimal test
-/// This helps macOS recognize the permission is already granted
+/// Screen-recording permission gate. The old implementation ran a THROWAWAY
+/// full-screen `screencapture -T 0` grab to a temp file on EVERY capture call
+/// (~0.5–1s + disk churn) while holding SCREENCAPTURE_LOCK. Now: an instant
+/// TCC lookup via CGPreflightScreenCaptureAccess, requesting access (one
+/// system prompt) when not yet granted. A granted result is cached for the
+/// app run; a denial is re-checked each call so granting in System Settings
+/// mid-run is picked up without restart.
+#[cfg(target_os = "macos")]
 fn check_and_activate_permission() -> Result<(), String> {
-    let test_path = std::env::temp_dir().join(format!("bs_test_{}.png", std::process::id()));
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static GRANTED: AtomicBool = AtomicBool::new(false);
+    if GRANTED.load(Ordering::Relaxed) {
+        return Ok(());
+    }
 
-    let output = Command::new("screencapture")
-        .arg("-x")
-        .arg("-T")
-        .arg("0")
-        .arg(&test_path)
-        .stderr(Stdio::piped())
-        .stdout(Stdio::piped())
-        .output();
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGPreflightScreenCaptureAccess() -> bool;
+        fn CGRequestScreenCaptureAccess() -> bool;
+    }
 
-    match output {
-        Ok(o) => {
-            let stderr = String::from_utf8_lossy(&o.stderr);
-            let _ = std::fs::remove_file(&test_path);
-
-            if stderr.contains("permission")
-                || stderr.contains("denied")
-                || stderr.contains("not authorized")
-            {
-                return Err("Screen Recording permission not granted".to_string());
-            }
-
-            Ok(())
-        }
-        Err(e) => {
-            let err_msg = e.to_string();
-            if err_msg.contains("permission")
-                || err_msg.contains("denied")
-                || err_msg.contains("not authorized")
-            {
-                Err("Screen Recording permission not granted".to_string())
-            } else {
-                Ok(())
-            }
-        }
+    let granted =
+        unsafe { CGPreflightScreenCaptureAccess() } || unsafe { CGRequestScreenCaptureAccess() };
+    if granted {
+        GRANTED.store(true, Ordering::Relaxed);
+        Ok(())
+    } else {
+        Err("Screen Recording permission not granted".to_string())
     }
 }
 
-/// Capture screenshot using macOS native screencapture with interactive selection
-/// This properly handles Screen Recording permissions through the system
-#[tauri::command]
-pub async fn native_capture_interactive(save_dir: String) -> Result<String, String> {
+#[cfg(not(target_os = "macos"))]
+fn check_and_activate_permission() -> Result<(), String> {
+    Ok(())
+}
+
+/// Blocking body shared by the interactive (`-i`) and window (`-w`) captures.
+/// Runs on the blocking pool: the screencapture session lasts as long as the
+/// user takes to drag a selection / pick a window (minutes, possibly), and the
+/// old inline `wait_with_output()` parked a tokio worker for the whole session
+/// — with workers = core count, a couple of captures plus other inline
+/// blocking exhausted the runtime and EVERY async command queued for seconds.
+/// SCREENCAPTURE_LOCK is held for the session by design (one capture UI at a
+/// time); a std Mutex is fine now that waiters park blocking-pool threads.
+fn native_capture_blocking(save_dir: &str, mode_flag: &str) -> Result<String, String> {
     let _lock = SCREENCAPTURE_LOCK
         .lock()
         .map_err(|e| format!("Failed to acquire lock: {}", e))?;
@@ -531,12 +632,11 @@ pub async fn native_capture_interactive(save_dir: String) -> Result<String, Stri
     })?;
 
     let filename = generate_filename("screenshot", "png")?;
-    let save_path = PathBuf::from(&save_dir);
-    let screenshot_path = save_path.join(&filename);
+    let screenshot_path = PathBuf::from(save_dir).join(&filename);
     let path_str = screenshot_path.to_string_lossy().to_string();
 
     let child = Command::new("screencapture")
-        .arg("-i")
+        .arg(mode_flag)
         .arg("-x")
         .arg(&path_str)
         .stdin(Stdio::null())
@@ -568,6 +668,15 @@ pub async fn native_capture_interactive(save_dir: String) -> Result<String, Stri
     } else {
         Err("Screenshot was cancelled or failed".to_string())
     }
+}
+
+/// Capture screenshot using macOS native screencapture with interactive selection
+/// This properly handles Screen Recording permissions through the system
+#[tauri::command]
+pub async fn native_capture_interactive(save_dir: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || native_capture_blocking(&save_dir, "-i"))
+        .await
+        .map_err(|e| format!("Capture task failed: {}", e))?
 }
 
 /// Minimal CoreGraphics FFI used to find which display the cursor is on so a
@@ -701,6 +810,14 @@ mod cg_cursor {
 /// whole screen, identical to the old behavior.
 #[tauri::command]
 pub async fn native_capture_fullscreen(save_dir: String) -> Result<String, String> {
+    // Blocking subprocess wait + lock: run on the blocking pool (see
+    // native_capture_blocking for why).
+    tauri::async_runtime::spawn_blocking(move || native_capture_fullscreen_blocking(&save_dir))
+        .await
+        .map_err(|e| format!("Capture task failed: {}", e))?
+}
+
+fn native_capture_fullscreen_blocking(save_dir: &str) -> Result<String, String> {
     let _lock = SCREENCAPTURE_LOCK
         .lock()
         .map_err(|e| format!("Failed to acquire lock: {}", e))?;
@@ -714,8 +831,7 @@ pub async fn native_capture_fullscreen(save_dir: String) -> Result<String, Strin
     })?;
 
     let filename = generate_filename("screenshot", "png")?;
-    let save_path = PathBuf::from(&save_dir);
-    let screenshot_path = save_path.join(&filename);
+    let screenshot_path = PathBuf::from(save_dir).join(&filename);
     let path_str = screenshot_path.to_string_lossy().to_string();
 
     // `-x` = do not play sound (the frontend plays it separately); preserved.
@@ -813,54 +929,7 @@ pub async fn cursor_display_bounds(x: Option<f64>, y: Option<f64>) -> Option<(i6
 /// Capture specific window using macOS native screencapture
 #[tauri::command]
 pub async fn native_capture_window(save_dir: String) -> Result<String, String> {
-    let _lock = SCREENCAPTURE_LOCK
-        .lock()
-        .map_err(|e| format!("Failed to acquire lock: {}", e))?;
-
-    if is_screencapture_running() {
-        return Err("Another screenshot capture is already in progress".to_string());
-    }
-
-    check_and_activate_permission().map_err(|e| {
-        format!("Permission check failed: {}. Please ensure Screen Recording permission is granted in System Settings > Privacy & Security > Screen Recording.", e)
-    })?;
-
-    let filename = generate_filename("screenshot", "png")?;
-    let save_path = PathBuf::from(&save_dir);
-    let screenshot_path = save_path.join(&filename);
-    let path_str = screenshot_path.to_string_lossy().to_string();
-
-    let child = Command::new("screencapture")
-        .arg("-w")
-        .arg("-x")
-        .arg(&path_str)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("Failed to run screencapture: {}", e))?;
-
-    let output = child
-        .wait_with_output()
-        .map_err(|e| format!("Failed to wait for screencapture: {}", e))?;
-
-    if !output.status.success() {
-        if screenshot_path.exists() {
-            let _ = std::fs::remove_file(&screenshot_path);
-        }
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if stderr.contains("permission")
-            || stderr.contains("denied")
-            || stderr.contains("not authorized")
-        {
-            return Err("Screen Recording permission required. Please grant permission in System Settings > Privacy & Security > Screen Recording and restart the app.".to_string());
-        }
-        return Err("Screenshot was cancelled or failed".to_string());
-    }
-
-    if screenshot_path.exists() {
-        Ok(path_str)
-    } else {
-        Err("Screenshot was cancelled or failed".to_string())
-    }
+    tauri::async_runtime::spawn_blocking(move || native_capture_blocking(&save_dir, "-w"))
+        .await
+        .map_err(|e| format!("Capture task failed: {}", e))?
 }
