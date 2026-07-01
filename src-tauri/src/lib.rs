@@ -18,7 +18,7 @@ use commands::{
     download_synced_image, get_desktop_directory, get_desktop_root, get_mouse_position,
     file_exists, get_screenshot_thumbnail, get_temp_directory,
     list_screenshots, native_capture_fullscreen, native_capture_interactive,
-    read_image_bytes,
+    read_image_bytes, take_editor_pending_path,
     native_capture_window, open_editor_window, play_screenshot_sound, save_edited_image,
     rename_screenshot_to_doc_id, save_native_screenshot, save_synced_image, set_clipboard_text,
 };
@@ -220,6 +220,29 @@ pub fn run() {
                 }
             }
 
+            // Pre-warm the singleton editor window (hidden) so the first
+            // "edit" click doesn't pay the full webview + React boot (~1-3s).
+            // Delayed a few seconds to keep launch itself snappy; the cost is
+            // roughly one idle webview of extra RSS. Skipped if an open beat
+            // the timer and already built it.
+            {
+                let handle = app.handle().clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_secs(3));
+                    let app_handle = handle.clone();
+                    let _ = handle.run_on_main_thread(move || {
+                        if app_handle
+                            .get_webview_window(commands::EDITOR_WINDOW_LABEL)
+                            .is_none()
+                        {
+                            if let Err(e) = commands::build_editor_window(&app_handle, false) {
+                                eprintln!("Failed to pre-warm editor window: {}", e);
+                            }
+                        }
+                    });
+                });
+            }
+
             // Start signed-out; the webview calls `update_tray_menu` once auth
             // resolves and on every later change to flip the menu.
             let menu = build_tray_menu(app.handle(), false)?;
@@ -261,6 +284,7 @@ pub fn run() {
             copy_to_clipboard,
             delete_file,
             open_editor_window,
+            take_editor_pending_path,
             get_desktop_directory,
             get_desktop_root,
             list_screenshots,

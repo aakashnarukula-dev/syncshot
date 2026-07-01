@@ -298,27 +298,77 @@ pub async fn delete_file(path: String) -> Result<(), String> {
     Ok(())
 }
 
-/// Open a borderless editor window for the given screenshot path.
+/// The editor is a pre-warmed SINGLETON window: built once (hidden at app
+/// startup, or on first open), then reused — open = show + deliver the new
+/// image path, close = the frontend hides instead of destroying. The label
+/// must keep the "editor-" prefix: the main window's auto-hide guard
+/// reconciles its open-editor counter against windows whose label starts
+/// with "editor-", and the capability files scope IPC to "editor-*".
+pub const EDITOR_WINDOW_LABEL: &str = "editor-main";
+
+/// Image path waiting for the editor webview. Events emitted while the
+/// webview is still booting are silently dropped, so opens park the path
+/// here and the editor pulls it on mount AND on every "editor-open" ping
+/// (take semantics — each request is consumed exactly once).
+static EDITOR_PENDING_PATH: Mutex<Option<String>> = Mutex::new(None);
+
+#[tauri::command]
+pub fn take_editor_pending_path() -> Option<String> {
+    EDITOR_PENDING_PATH.lock().ok().and_then(|mut g| g.take())
+}
+
+/// Build the singleton editor webview. The URL carries a sentinel instead of
+/// a real path — the image is always delivered through the pending-path slot
+/// so first open and reuse share one code path.
+pub fn build_editor_window(
+    app: &tauri::AppHandle,
+    visible: bool,
+) -> Result<tauri::WebviewWindow, String> {
+    use tauri::{TitleBarStyle, WebviewUrl, WebviewWindowBuilder};
+    WebviewWindowBuilder::new(
+        app,
+        EDITOR_WINDOW_LABEL,
+        WebviewUrl::App("?editor=__pending__".into()),
+    )
+    .inner_size(900.0, 700.0)
+    .decorations(true)
+    .title_bar_style(TitleBarStyle::Overlay)
+    .hidden_title(true)
+    .title("")
+    .resizable(true)
+    .center()
+    .visible(visible)
+    .focused(visible)
+    .build()
+    .map_err(|e| format!("Failed to open editor window: {}", e))
+}
+
+/// Open the editor for the given screenshot path. An empty `image_path`
+/// means "surface the editor in its loading state now, path follows" —
+/// the frontend calls it that way before resolving a possibly-remote file.
 #[tauri::command]
 pub async fn open_editor_window(
     app: tauri::AppHandle,
     label: String,
     image_path: String,
 ) -> Result<(), String> {
-    use tauri::{TitleBarStyle, WebviewUrl, WebviewWindowBuilder};
-    let encoded = urlencoding::encode(&image_path);
-    let url_path = format!("?editor={}", encoded);
-    let _win = WebviewWindowBuilder::new(&app, &label, WebviewUrl::App(url_path.into()))
-        .inner_size(900.0, 700.0)
-        .decorations(true)
-        .title_bar_style(TitleBarStyle::Overlay)
-        .hidden_title(true)
-        .title("")
-        .resizable(true)
-        .center()
-        .focused(true)
-        .build()
-        .map_err(|e| format!("Failed to open editor window: {}", e))?;
+    use tauri::{Emitter, Manager};
+    let _ = label; // singleton now; parameter kept for IPC compatibility
+    if !image_path.is_empty() {
+        if let Ok(mut pending) = EDITOR_PENDING_PATH.lock() {
+            *pending = Some(image_path);
+        }
+    }
+    if let Some(win) = app.get_webview_window(EDITOR_WINDOW_LABEL) {
+        let _ = win.unminimize();
+        let _ = win.show();
+        let _ = win.set_focus();
+        // Ping only — the webview pulls the path via take_editor_pending_path,
+        // which also covers pings that land while it is still booting.
+        let _ = app.emit("editor-open", ());
+        return Ok(());
+    }
+    build_editor_window(&app, true)?;
     Ok(())
 }
 

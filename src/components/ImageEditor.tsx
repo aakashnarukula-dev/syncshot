@@ -1,7 +1,8 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow, LogicalSize, availableMonitors } from "@tauri-apps/api/window";
-import { emit } from "@tauri-apps/api/event";
+import { emit, listen } from "@tauri-apps/api/event";
+import { Store } from "@tauri-apps/plugin-store";
 import { toast } from "sonner";
 import { AnnotationToolbar } from "./editor/AnnotationToolbar";
 import { AnnotationCanvas } from "./editor/AnnotationCanvas";
@@ -34,19 +35,52 @@ function offsetAnnotation(a: Annotation, dx: number, dy: number): Annotation {
 
 interface ImageEditorProps {
   imagePath: string;
+  /**
+   * The editor window is now a reused singleton (hidden on close, shown on
+   * the next open), so save/cancel/export are handled INTERNALLY — the shell
+   * callbacks below would destroy the window and are intentionally unused.
+   * Kept so the EditorOnlyApp call site keeps compiling.
+   */
   onSave: (editedImageData: string) => void;
   onCancel: () => void;
-  /** Persist an image to the save dir + clipboard without closing the editor. */
   onExport?: (dataUrl: string) => void;
 }
 
-export function ImageEditor({ imagePath, onSave, onCancel, onExport }: ImageEditorProps) {
+/** URL sentinel the singleton window boots with before any image is chosen. */
+const PENDING_SENTINEL = "__pending__";
+
+/** Where saves land — read fresh on every save so pref changes apply to a reused window. */
+async function loadSaveDir(): Promise<string> {
+  try {
+    const store = await Store.load("settings.json");
+    const sd = await store.get<string>("saveDir");
+    if (sd) return sd;
+  } catch {}
+  try {
+    return await invoke<string>("get_desktop_directory");
+  } catch {}
+  return "";
+}
+
+export function ImageEditor({ imagePath }: ImageEditorProps) {
   // Use Zustand store with selectors for optimized re-renders
   const settings = useSettings();
   const annotations = useAnnotations();
   // Use stable actions object (not a hook, doesn't cause re-renders)
   const actions = editorActions;
   
+  // The image currently open. `nonce` forces a fresh load + AnnotationCanvas
+  // remount even when the SAME path is reopened (a crop may have replaced the
+  // in-memory base image, and canvas-local zoom/pan must reset per session).
+  const [openReq, setOpenReq] = useState(() => ({
+    path: imagePath && imagePath !== PENDING_SENTINEL ? imagePath : "",
+    nonce: 0,
+  }));
+  // True from "new image requested" until the preview for it lands — the hook
+  // keeps the PREVIOUS session's previewUrl until it regenerates, so render a
+  // loading state instead of flashing the old screenshot.
+  const [awaitingPreview, setAwaitingPreview] = useState(false);
+
   // Screenshot image state
   const [screenshotImage, setScreenshotImage] = useState<HTMLImageElement | null>(null);
   const [imageLoaded, setImageLoaded] = useState(false);
@@ -74,6 +108,10 @@ export function ImageEditor({ imagePath, onSave, onCancel, onExport }: ImageEdit
   // Crop undo stack — base image isn't in the store, so crops undo locally.
   const cropUndoRef = useRef<Array<{ image: HTMLImageElement; annotations: Annotation[]; settings: EditorSettings }>>([]);
 
+  // Crop exports overwrite the same file within ONE editing session; reset
+  // per open so a reused window never clobbers a previous session's crop.
+  const lastCropPathRef = useRef<string | null>(null);
+
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
   // Preview generator hook
@@ -95,26 +133,87 @@ export function ImageEditor({ imagePath, onSave, onCancel, onExport }: ImageEdit
     annotationsCountRef.current = annotations.length;
   }, [annotations.length]);
 
+  // Wipe everything a previous editing session could leave behind. Runs on
+  // every open AND close so a reused window always starts clean.
+  const resetEditorSession = useCallback(() => {
+    editorActions.reset();
+    cropUndoRef.current = [];
+    lastCropPathRef.current = null;
+    setSelectedAnnotation(null);
+    setSelectedTool("select");
+    setShowCloseConfirm(false);
+    setShowOCRDialog(false);
+    setOcrResults("");
+    setScreenshotImage(null);
+    setImageLoaded(false);
+    setLoadError(null);
+  }, []);
+
+  const openImage = useCallback((path: string) => {
+    resetEditorSession();
+    editorActions.initialize();
+    setAwaitingPreview(true);
+    setOpenReq((prev) => ({ path, nonce: prev.nonce + 1 }));
+  }, [resetEditorSession]);
+
+  // Close = reset + HIDE (never destroy) so the webview stays warm for the
+  // next open. "editor-closed" must go out before the hide so the main
+  // window's open-editor counter and auto-hide resume reliably.
+  const closeEditor = useCallback(async () => {
+    resetEditorSession();
+    setOpenReq((prev) => ({ path: "", nonce: prev.nonce + 1 }));
+    try { await emit("editor-closed"); } catch {}
+    try { await getCurrentWindow().hide(); } catch {}
+  }, [resetEditorSession]);
+
+  // Image delivery: opens park the path in a Rust slot and ping "editor-open".
+  // Pulling (take semantics) instead of reading event payloads makes delivery
+  // race-free across webview boot — a ping that fired mid-boot is covered by
+  // the take on mount, and each request is consumed exactly once.
+  const consumePendingOpen = useCallback(async () => {
+    try {
+      const pending = await invoke<string | null>("take_editor_pending_path");
+      if (pending) openImage(pending);
+    } catch (e) {
+      console.error("take_editor_pending_path failed:", e);
+    }
+  }, [openImage]);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | null = null;
+    (async () => {
+      try {
+        unlisten = await listen("editor-open", () => { void consumePendingOpen(); });
+      } catch {}
+      if (!disposed) void consumePendingOpen();
+    })();
+    return () => { disposed = true; unlisten?.(); };
+  }, [consumePendingOpen]);
+
   useEffect(() => {
     const w = getCurrentWindow();
     let unlistenClose: (() => void) | null = null;
     (async () => {
       try {
         unlistenClose = await w.onCloseRequested(async (event) => {
+          // Always intercept: the singleton window hides instead of closing.
+          event.preventDefault();
           if (annotationsCountRef.current > 0) {
-            event.preventDefault();
             setShowCloseConfirm(true);
             return;
           }
-          try { await emit("editor-closed"); } catch {}
+          await closeEditor();
         });
       } catch {}
     })();
     return () => { unlistenClose?.(); };
-  }, []);
+  }, [closeEditor]);
 
-  // Restore window state on mount
+  // Restore window state on every open (a reused window may have been left
+  // fullscreen by the previous session).
   useEffect(() => {
+    if (!openReq.path) return;
     const restoreWindowState = async () => {
       try {
         const appWindow = getCurrentWindow();
@@ -128,27 +227,36 @@ export function ImageEditor({ imagePath, onSave, onCancel, onExport }: ImageEdit
       }
     };
     restoreWindowState();
+  }, [openReq]);
 
-    // Get the system temp directory
+  // Get the system temp directory (once — it never changes)
+  useEffect(() => {
     invoke<string>("get_temp_directory")
       .then((dir) => setTempDir(dir))
       .catch((err) => console.error("Failed to get temp directory:", err));
   }, []);
 
+  // The preview hook keeps the previous previewUrl until it regenerates for
+  // the new image; any change after an open means the fresh one landed.
+  useEffect(() => {
+    if (previewUrl) setAwaitingPreview(false);
+  }, [previewUrl]);
+
   // Load main screenshot image
   useEffect(() => {
+    const imagePath = openReq.path;
     setLoadError(null);
     setImageLoaded(false);
     setScreenshotImage(null);
 
-    if (!imagePath) {
-      setLoadError("No image path provided");
-      return;
-    }
+    // No image yet — pre-warmed window (or between sessions). Idle quietly in
+    // the loading state until an open delivers a path.
+    if (!imagePath) return;
 
     let cancelled = false;
     let objectUrl: string | null = null;
     const img = new Image();
+    img.decoding = "async";
     img.onload = async () => {
       if (cancelled) return;
       setScreenshotImage(img);
@@ -209,46 +317,49 @@ export function ImageEditor({ imagePath, onSave, onCancel, onExport }: ImageEdit
       // fresh load of the dead URL would fail, which never happens here.
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
-  }, [imagePath, actions]);
+  }, [openReq]);
 
-  // Save handler
+  // Save handler — persists to the save dir + clipboard, notifies the main
+  // window, then hides this one (was EditorOnlyApp's onSave + destroy).
   const handleSave = useCallback(async () => {
     if (!screenshotImage || isSaving || isCopying) return;
-    
+
     setIsSaving(true);
     try {
       const highQualityCanvas = await renderHighQualityCanvas(annotations);
-      
-      if (!highQualityCanvas) {
-        setIsSaving(false);
+      if (!highQualityCanvas) return;
+
+      const blob = await new Promise<Blob | null>((resolve) =>
+        highQualityCanvas.toBlob(resolve, "image/png", 1.0),
+      );
+      if (!blob) return;
+      const dataUrl = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onloadend = () => resolve(reader.result as string);
+        reader.onerror = () => reject(new Error("Failed to read image data"));
+        reader.readAsDataURL(blob);
+      });
+
+      const saveDir = await loadSaveDir();
+      if (!saveDir) {
+        toast.error("Save directory not set");
         return;
       }
-
-      highQualityCanvas.toBlob(
-        (blob) => {
-          if (blob) {
-            const reader = new FileReader();
-            reader.onloadend = () => {
-              onSave(reader.result as string);
-              setIsSaving(false);
-            };
-            reader.onerror = () => {
-              setLoadError("Failed to read image data");
-              setIsSaving(false);
-            };
-            reader.readAsDataURL(blob);
-          } else {
-            setIsSaving(false);
-          }
-        },
-        "image/png",
-        1.0
-      );
+      const newPath = await invoke<string>("save_edited_image", {
+        imageData: dataUrl,
+        saveDir,
+        copyToClip: true,
+      });
+      try { await emit("editor-saved", { originalPath: openReq.path, newPath }); } catch {}
+      await closeEditor();
     } catch (err) {
-      setLoadError(`Failed to save: ${err instanceof Error ? err.message : String(err)}`);
+      const msg = err instanceof Error ? err.message : String(err);
+      setLoadError(`Failed to save: ${msg}`);
+      toast.error("Failed to save image", { description: msg, duration: 5000 });
+    } finally {
       setIsSaving(false);
     }
-  }, [screenshotImage, annotations, renderHighQualityCanvas, onSave, isSaving, isCopying]);
+  }, [screenshotImage, annotations, renderHighQualityCanvas, isSaving, isCopying, openReq.path, closeEditor]);
 
   // Copy handler
   const handleCopy = useCallback(async () => {
@@ -350,6 +461,30 @@ export function ImageEditor({ imagePath, onSave, onCancel, onExport }: ImageEdit
     }
   }, [selectedAnnotation, actions]);
 
+  // Persist a crop without closing — overwrites the same file across crops in
+  // one session (was EditorOnlyApp's onExport; internal now that the window
+  // is reused and the shell's callbacks would destroy it).
+  const exportCrop = useCallback(async (dataUrl: string) => {
+    const saveDir = await loadSaveDir();
+    if (!saveDir) {
+      toast.error("Save directory not set");
+      return;
+    }
+    try {
+      const path = await invoke<string>("save_edited_image", {
+        imageData: dataUrl,
+        saveDir,
+        copyToClip: true,
+        overwritePath: lastCropPathRef.current,
+      });
+      lastCropPathRef.current = path;
+      toast.success("Cropped screenshot saved & copied", { duration: 2000 });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      toast.error("Failed to save crop", { description: msg, duration: 5000 });
+    }
+  }, []);
+
   // Crop — rect is in preview-pixel coordinates. Two outputs from the same rect:
   //   1. EXPORT: composite WITH annotations baked → saved to folder + clipboard.
   //   2. BASE:   composite WITHOUT annotations → the new editing image, with the
@@ -402,12 +537,12 @@ export function ImageEditor({ imagePath, onSave, onCancel, onExport }: ImageEdit
         setSelectedAnnotation(null);
         setSelectedTool("select");
         // Save to the screenshots folder + clipboard, like a normal capture.
-        onExport?.(exportDataUrl);
+        void exportCrop(exportDataUrl);
       };
       newBase.src = baseDataUrl;
     };
     baseSrc.src = previewUrl;
-  }, [previewUrl, screenshotImage, annotations, settings, actions, renderHighQualityCanvas, onExport]);
+  }, [previewUrl, screenshotImage, annotations, settings, actions, renderHighQualityCanvas, exportCrop]);
 
   const handleCropUndo = useCallback((): boolean => {
     const snap = cropUndoRef.current.pop();
@@ -423,14 +558,14 @@ export function ImageEditor({ imagePath, onSave, onCancel, onExport }: ImageEdit
     if (annotations.length > 0) {
       setShowCloseConfirm(true);
     } else {
-      onCancel();
+      void closeEditor();
     }
-  }, [annotations.length, onCancel]);
+  }, [annotations.length, closeEditor]);
 
   const handleDiscardAndClose = useCallback(() => {
     setShowCloseConfirm(false);
-    onCancel();
-  }, [onCancel]);
+    void closeEditor();
+  }, [closeEditor]);
 
   const handleSaveAndClose = useCallback(() => {
     setShowCloseConfirm(false);
@@ -528,8 +663,9 @@ export function ImageEditor({ imagePath, onSave, onCancel, onExport }: ImageEdit
       </div>
 
       <div className="flex-1 flex items-center justify-center min-w-0 min-h-0 overflow-hidden">
-        {previewUrl ? (
+        {previewUrl && !awaitingPreview ? (
           <AnnotationCanvas
+            key={openReq.nonce}
             annotations={annotations}
             selectedAnnotation={selectedAnnotation}
             selectedTool={selectedTool}

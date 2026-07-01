@@ -1316,14 +1316,22 @@ function MainApp() {
       setMode("main");
       return;
     }
-    const label = `editor-${Date.now()}`;
+    // The editor is a reused singleton window (pre-warmed hidden at startup),
+    // so at most ONE editor is ever open — set the counter, don't increment,
+    // or open→open→close would wedge it above zero forever (the auto-hide
+    // guard sees the hidden singleton as "an editor window exists").
+    const label = "editor-main";
     try {
-      openEditorsRef.current += 1;
+      openEditorsRef.current = 1;
       pauseAutoHide();
-      // Make sure a local file is actually present before opening. Own-device
-      // captures normally have their local capture file, but if it's been
-      // evicted (the same gap that strands the tile on "Unavailable") this
-      // re-downloads the cloud copy so the editor always has bytes to open.
+      // Surface the (pre-warmed) editor IMMEDIATELY in its loading state; the
+      // real path follows via the pending-path slot once resolved, so even a
+      // cloud re-download never delays the window appearing.
+      await invoke("open_editor_window", { label, imagePath: "" });
+      // Make sure a local file is actually present. Own-device captures
+      // normally have their local capture file, but if it's been evicted (the
+      // same gap that strands the tile on "Unavailable") this re-downloads
+      // the cloud copy so the editor always has bytes to open.
       let openPath = path;
       try {
         const { ensureLocalScreenshot } = await import("@/lib/sync/screenshots");
@@ -1341,7 +1349,7 @@ function MainApp() {
         imagePath: openPath,
       });
     } catch (err) {
-      openEditorsRef.current = Math.max(0, openEditorsRef.current - 1);
+      openEditorsRef.current = 0;
       startAutoHide();
       console.error("open_editor_window failed:", err);
       toast.error("Failed to open editor");
