@@ -34,16 +34,10 @@ function offsetAnnotation(a: Annotation, dx: number, dy: number): Annotation {
 }
 
 interface ImageEditorProps {
+  // The editor window is a reused singleton (hidden on close, shown on the
+  // next open), so save/cancel/export are handled INTERNALLY — no shell
+  // callbacks.
   imagePath: string;
-  /**
-   * The editor window is now a reused singleton (hidden on close, shown on
-   * the next open), so save/cancel/export are handled INTERNALLY — the shell
-   * callbacks below would destroy the window and are intentionally unused.
-   * Kept so the EditorOnlyApp call site keeps compiling.
-   */
-  onSave: (editedImageData: string) => void;
-  onCancel: () => void;
-  onExport?: (dataUrl: string) => void;
 }
 
 /** URL sentinel the singleton window boots with before any image is chosen. */

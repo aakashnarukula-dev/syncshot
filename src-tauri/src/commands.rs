@@ -233,6 +233,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn file_stat_serializes_camel_case() {
+        // The frontend backfill ledger expects EXACTLY { "mtimeMs", "size" }.
+        let stat = FileStat {
+            mtime_ms: 1234,
+            size: 42,
+        };
+        let json = serde_json::to_value(&stat).unwrap();
+        assert_eq!(json, serde_json::json!({ "mtimeMs": 1234, "size": 42 }));
+    }
+
+    #[test]
     fn safe_synced_filename_keeps_valid_names() {
         assert_eq!(safe_synced_filename("abc123.png").unwrap(), "abc123.png");
         assert_eq!(
@@ -609,6 +620,40 @@ pub async fn read_image_bytes(path: String) -> Result<tauri::ipc::Response, Stri
 #[tauri::command]
 pub async fn file_exists(path: String) -> bool {
     std::path::Path::new(&path).is_file()
+}
+
+/// File metadata for the sync backfill ledger: mtime (ms since epoch) + size.
+/// Serializes as `{ "mtimeMs": <number>, "size": <number> }` — the exact shape
+/// the frontend `FileStat` interface (src/lib/sync/backfillLedger.ts) expects.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileStat {
+    pub mtime_ms: u64,
+    pub size: u64,
+}
+
+/// Stat a LOCAL file (mtime + size) for the sync layer's backfill ledger,
+/// without reading any bytes and without a CORS `asset://` fetch (impossible
+/// from the release localhost origin). Like `file_exists`, but returns real
+/// metadata; the stat runs on a blocking thread so a slow/network volume never
+/// stalls the async runtime.
+#[tauri::command]
+pub async fn stat_file(path: String) -> Result<FileStat, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let meta = std::fs::metadata(&path).map_err(|e| format!("Failed to stat {}: {}", path, e))?;
+        let mtime_ms = meta
+            .modified()
+            .map_err(|e| format!("Failed to read mtime of {}: {}", path, e))?
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| format!("mtime of {} predates epoch: {}", path, e))?
+            .as_millis() as u64;
+        Ok(FileStat {
+            mtime_ms,
+            size: meta.len(),
+        })
+    })
+    .await
+    .map_err(|e| format!("Stat task failed: {}", e))?
 }
 
 /// Check if screencapture is already running

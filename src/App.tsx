@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { emit, listen } from "@tauri-apps/api/event";
+import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow, LogicalPosition, LogicalSize } from "@tauri-apps/api/window";
 import { getAllWebviewWindows } from "@tauri-apps/api/webviewWindow";
 import { register, unregister } from "@tauri-apps/plugin-global-shortcut";
@@ -7,7 +7,6 @@ import { Store } from "@tauri-apps/plugin-store";
 import type { KeyboardShortcut } from "./components/preferences/KeyboardShortcutManager";
 import { toast } from "sonner";
 import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
-import { editorActions } from "@/stores/editorStore";
 import { loadLicenseStatus, type LicenseStatus } from "@/lib/license";
 import { Paywall } from "@/components/Paywall";
 // Light module (zustand + types only — no Firebase): safe in the entry chunk.
@@ -290,10 +289,9 @@ function getEditorPathFromHash(): string | null {
   return m ? decodeURIComponent(m[1]) : null;
 }
 
+// ImageEditor handles save/close/export internally now that the editor window
+// is a reused singleton — this shell only titles the window and mounts it.
 function EditorOnlyApp({ imagePath }: { imagePath: string }) {
-  const [saveDir, setSaveDir] = useState<string>("");
-  const lastCropPathRef = useRef<string | null>(null);
-
   useEffect(() => {
     (async () => {
       const w = getCurrentWindow();
@@ -301,78 +299,9 @@ function EditorOnlyApp({ imagePath }: { imagePath: string }) {
     })();
   }, []);
 
-  useEffect(() => {
-    (async () => {
-      try {
-        const store = await Store.load("settings.json");
-        const sd = await store.get<string>("saveDir");
-        if (sd) setSaveDir(sd);
-        else {
-          try { setSaveDir(await invoke<string>("get_desktop_directory")); } catch {}
-        }
-      } catch (e) {
-        try { setSaveDir(await invoke<string>("get_desktop_directory")); } catch {}
-      }
-    })();
-  }, []);
-
-  const onSave = async (editedImageData: string) => {
-    try {
-      if (!saveDir) {
-        toast.error("Save directory not set");
-        return;
-      }
-      const newPath = await invoke<string>("save_edited_image", {
-        imageData: editedImageData,
-        saveDir,
-        copyToClip: true,
-      });
-      await emit("editor-saved", { originalPath: imagePath, newPath });
-      editorActions.reset();
-      try { await emit("editor-closed"); } catch {}
-      // Let the event reach the main window before tearing this one down —
-      // destroy() right after emit() can drop it (the auto-hide guard also
-      // reconciles against real windows, this just avoids the 5s wait).
-      await new Promise((r) => setTimeout(r, 60));
-      try { await getCurrentWindow().destroy(); } catch (e) { console.error("destroy failed:", e); }
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      toast.error("Failed to save image", { description: msg, duration: 5000 });
-    }
-  };
-
-  const onCancel = async () => {
-    editorActions.reset();
-    try { await emit("editor-closed"); } catch {}
-    await new Promise((r) => setTimeout(r, 60));
-    try { await getCurrentWindow().destroy(); } catch (e) { console.error("destroy failed:", e); }
-  };
-
-  // Persist without closing — used by crop. Main window's folder poll picks it up.
-  // Reuse the same file across crops in this editor session (overwrite, no pile-up).
-  const onExport = async (dataUrl: string) => {
-    if (!saveDir) {
-      toast.error("Save directory not set");
-      return;
-    }
-    try {
-      const path = await invoke<string>("save_edited_image", {
-        imageData: dataUrl,
-        saveDir,
-        copyToClip: true,
-        overwritePath: lastCropPathRef.current,
-      });
-      lastCropPathRef.current = path;
-      toast.success("Cropped screenshot saved & copied", { duration: 2000 });
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      toast.error("Failed to save crop", { description: msg, duration: 5000 });
-    }
-  };
-
   return (
     <Suspense fallback={<LoadingFallback />}>
-      <ImageEditor imagePath={imagePath} onSave={onSave} onCancel={onCancel} onExport={onExport} />
+      <ImageEditor imagePath={imagePath} />
     </Suspense>
   );
 }

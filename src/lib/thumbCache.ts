@@ -112,14 +112,12 @@ export function clearThumbs(): void {
 }
 
 // ---------------------------------------------------------------------------
-// Drag icon: reuse the already-fetched thumbnail bytes instead of the old
-// canvas-draw → toDataURL → get_temp_directory → save round-trip against the
-// full-res decoded <img> on every drag start. The blob behind the cached URL
-// is fetched (no image decode), written once to a stable per-path temp file,
-// and the path memoized — a repeat drag of the same shot costs nothing.
-// TODO(rust sibling): a path-returning get_screenshot_thumbnail variant would
-// drop the save_edited_image round-trip entirely (the Rust cache already has
-// the PNG on disk).
+// Drag icon: ask Rust for the on-disk PATH of the cached thumbnail
+// (get_screenshot_thumbnail_path — same cache/pipeline as the bytes command),
+// so no bytes cross IPC and nothing is re-encoded. If that command fails, fall
+// back to the older blob → dataURL → save_edited_image round-trip against the
+// already-fetched thumbnail bytes. Either way the path is memoized per shot —
+// a repeat drag of the same shot costs nothing.
 // ---------------------------------------------------------------------------
 
 let tempDirPromise: Promise<string> | null = null;
@@ -139,6 +137,14 @@ export function ensureDragIconPath(path: string): Promise<string | null> {
   let pending = dragIcons.get(path);
   if (!pending) {
     pending = (async () => {
+      try {
+        return await invoke<string>("get_screenshot_thumbnail_path", {
+          path,
+          maxPx: THUMB_MAX_PX,
+        });
+      } catch {
+        // Rust path variant failed — fall back to the byte round-trip below.
+      }
       const url = cache.peek(path);
       if (!url) return null;
       const blob = await fetch(url).then((r) => r.blob());
