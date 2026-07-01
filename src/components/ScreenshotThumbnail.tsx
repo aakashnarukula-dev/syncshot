@@ -1,18 +1,20 @@
-import { lazy, memo, Suspense, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { lazy, memo, Suspense, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { animate } from "motion";
 import { startDrag } from "@crabnebula/tauri-plugin-drag";
 import { Check, ChevronLeft, ChevronRight, ClipboardList, Copy, Image as ImageIcon, ImageOff, Link2, Loader2, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 import { useSyncStore } from "@/stores/syncStore";
+import { ensureDragIconPath, getCachedThumbUrl, requestThumbUrl } from "@/lib/thumbCache";
+import { computeWindowRange, windowItemTop, windowTotalHeight, type WindowRange } from "@/lib/railWindow";
 import type { ColumnView } from "@/App";
 
 // Lazy: the clipboard list transitively pulls Firebase (~715KB) via
 // lib/sync/clipboard — keep it out of the startup-critical column chunk and
 // only fetch it the first time the user switches to the Text view.
-const ClipboardColumnList = lazy(() =>
-  import("./ClipboardX/ClipboardColumnList").then((m) => ({ default: m.ClipboardColumnList })),
-);
+const loadClipboardColumnList = () =>
+  import("./ClipboardX/ClipboardColumnList").then((m) => ({ default: m.ClipboardColumnList }));
+const ClipboardColumnList = lazy(loadClipboardColumnList);
 
 // Genie-style open/close for the column, driven by motion's imperative animate()
 // on a STABLE element (no remount → thumbnails don't reload, no flash). The
@@ -49,7 +51,11 @@ interface ScreenshotThumbnailProps {
   onHoverChange?: (hovered: boolean) => void;
 }
 
-export function ScreenshotThumbnail({
+// Memoized: the parent (MainApp) re-renders on auth/license/poll churn; the
+// column's props are stable (paths array identity only changes on a real
+// add/remove/reorder, handlers are useCallbacks), so none of that churn
+// reconciles the column subtree anymore.
+export const ScreenshotThumbnail = memo(function ScreenshotThumbnail({
   paths,
   isCollapsed,
   collapseSignal = 0,
@@ -68,6 +74,27 @@ export function ScreenshotThumbnail({
   useEffect(() => {
     if (columnView === "clipboard") setClipboardLoaded(true);
   }, [columnView]);
+
+  // Warm the Text-view chunk during idle once the rail is up, so the FIRST
+  // toggle doesn't parse 715KB of Firebase on the main thread mid-click. This
+  // only fetches+parses the module (browser-cached after that); nothing mounts
+  // until the user actually switches views.
+  useEffect(() => {
+    const warm = () => {
+      loadClipboardColumnList().catch(() => {});
+    };
+    const w = window as Window & {
+      requestIdleCallback?: (cb: () => void, opts?: { timeout: number }) => number;
+      cancelIdleCallback?: (id: number) => void;
+    };
+    if (w.requestIdleCallback) {
+      const id = w.requestIdleCallback(warm, { timeout: 5000 });
+      return () => w.cancelIdleCallback?.(id);
+    }
+    const t = setTimeout(warm, 2000);
+    return () => clearTimeout(t);
+  }, []);
+
   const colRef = useRef<HTMLDivElement>(null);
   const animRef = useRef<ReturnType<typeof animate> | null>(null);
   const prevOpenRef = useRef(openSignal);
@@ -128,158 +155,256 @@ export function ScreenshotThumbnail({
     return () => window.removeEventListener("keydown", onKey);
   }, [paths, onRemove, isCollapsed, columnView]);
 
-  if (isCollapsed) {
-    return (
-      <button
-        type="button"
-        onClick={onToggleCollapsed}
-        aria-label="Show screenshots"
-        className="h-dvh w-dvw flex items-center justify-center bg-neutral-900/90 text-white cursor-pointer rounded-r-md bs-pill-in"
-      >
-        <ChevronRight className="size-4" aria-hidden="true" />
-      </button>
-    );
-  }
-
+  // The column stays MOUNTED while collapsed (display:none), so re-expanding is
+  // pure CSS + the genie-in: no remount, no thumbnail IPC/decode replay. That
+  // remount cycle — auto-hide collapses after 5s idle, every re-expand rebuilt
+  // ~371 tiles and re-decoded everything — was the core "still laggy" loop.
   return (
-    <div
-      ref={colRef}
-      className="h-dvh w-dvw overflow-hidden select-none flex flex-row"
-      style={{ background: "transparent", transformOrigin: "left center", opacity: 0 }}
-      onMouseEnter={() => onHoverChange?.(true)}
-      onMouseMove={() => onHoverChange?.(true)}
-      onMouseLeave={() => onHoverChange?.(false)}
-      onWheel={() => onHoverChange?.(true)}
-    >
-      {/* Same edge pill as the collapsed handle, vertically centered on the left,
-          flipped arrow — click to close. */}
-      <div className="shrink-0 flex items-center">
+    <>
+      {isCollapsed ? (
         <button
           type="button"
-          onClick={triggerCollapse}
-          aria-label="Hide screenshots"
-          className="h-[90px] w-[18px] flex items-center justify-center bg-neutral-900/90 hover:bg-neutral-800 text-white cursor-pointer rounded-r-md"
+          onClick={onToggleCollapsed}
+          aria-label="Show screenshots"
+          className="h-dvh w-dvw flex items-center justify-center bg-neutral-900/90 text-white cursor-pointer rounded-r-md bs-pill-in"
         >
-          <ChevronLeft className="size-4" aria-hidden="true" />
+          <ChevronRight className="size-4" aria-hidden="true" />
         </button>
-      </div>
-      <div className="flex-1 min-w-0 flex flex-col">
-        {/* Screenshots / Text segmented toggle, pinned above the active list. */}
-        <div className="shrink-0 pt-3 pb-1.5 pr-3 pl-1">
-          <div className="flex gap-0.5 rounded-md bg-neutral-900/90 p-0.5">
-            <button
-              type="button"
-              onClick={() => onColumnViewChange("screenshots")}
-              aria-pressed={columnView === "screenshots"}
-              className={`flex-1 flex items-center justify-center gap-1.5 rounded px-2 py-1 text-xs cursor-pointer transition-colors ${
-                columnView === "screenshots"
-                  ? "bg-neutral-700 text-white"
-                  : "text-neutral-400 hover:text-white"
-              }`}
-            >
-              <ImageIcon className="size-3.5" aria-hidden="true" />
-              Screenshots
-            </button>
-            <button
-              type="button"
-              onClick={() => onColumnViewChange("clipboard")}
-              aria-pressed={columnView === "clipboard"}
-              className={`flex-1 flex items-center justify-center gap-1.5 rounded px-2 py-1 text-xs cursor-pointer transition-colors ${
-                columnView === "clipboard"
-                  ? "bg-neutral-700 text-white"
-                  : "text-neutral-400 hover:text-white"
-              }`}
-            >
-              <ClipboardList className="size-3.5" aria-hidden="true" />
-              Text
-            </button>
-          </div>
-        </div>
-
-        {/* Both views stay mounted once loaded (hidden, not unmounted) so
-            toggling never re-decodes thumbnails or refetches clipboard. */}
-        <div
-          data-thumb-scroll
-          onScroll={() => onHoverChange?.(true)}
-          className={`flex-1 min-w-0 overflow-y-auto pt-1 pb-4 pr-3 pl-1 flex-col gap-5 items-stretch [&::-webkit-scrollbar]:hidden [-ms-overflow-style:none] [scrollbar-width:none] ${
-            columnView === "screenshots" ? "flex" : "hidden"
-          }`}
-          style={{
-            background: "transparent",
-            maskImage:
-              "linear-gradient(to bottom, transparent 0, black 4px, black calc(100% - 6px), transparent 100%)",
-            WebkitMaskImage:
-              "linear-gradient(to bottom, transparent 0, black 4px, black calc(100% - 6px), transparent 100%)",
-          }}
-        >
-          {paths.map((path, i) => (
-            <ThumbnailItem
-              key={path}
-              path={path}
-              eager={i < EAGER_COUNT}
-              onEdit={onEdit}
-              onRemove={onRemove}
-            />
-          ))}
-        </div>
-
-        {clipboardLoaded ? (
-          <div
-            onScroll={() => onHoverChange?.(true)}
-            className={`flex-1 min-w-0 min-h-0 flex-col ${columnView === "clipboard" ? "flex" : "hidden"}`}
+      ) : null}
+      <div
+        ref={colRef}
+        className={`h-dvh w-dvw overflow-hidden select-none flex-row ${isCollapsed ? "hidden" : "flex"}`}
+        style={{ background: "transparent", transformOrigin: "left center", opacity: 0 }}
+        onMouseEnter={() => onHoverChange?.(true)}
+        onMouseMove={() => onHoverChange?.(true)}
+        onMouseLeave={() => onHoverChange?.(false)}
+        onWheel={() => onHoverChange?.(true)}
+      >
+        {/* Same edge pill as the collapsed handle, vertically centered on the left,
+            flipped arrow — click to close. */}
+        <div className="shrink-0 flex items-center">
+          <button
+            type="button"
+            onClick={triggerCollapse}
+            aria-label="Hide screenshots"
+            className="h-[90px] w-[18px] flex items-center justify-center bg-neutral-900/90 hover:bg-neutral-800 text-white cursor-pointer rounded-r-md"
           >
-            <Suspense fallback={null}>
-              <ClipboardColumnList />
-            </Suspense>
+            <ChevronLeft className="size-4" aria-hidden="true" />
+          </button>
+        </div>
+        <div className="flex-1 min-w-0 flex flex-col">
+          {/* Screenshots / Text segmented toggle, pinned above the active list. */}
+          <div className="shrink-0 pt-3 pb-1.5 pr-3 pl-1">
+            <div className="flex gap-0.5 rounded-md bg-neutral-900/90 p-0.5">
+              <button
+                type="button"
+                onClick={() => onColumnViewChange("screenshots")}
+                aria-pressed={columnView === "screenshots"}
+                className={`flex-1 flex items-center justify-center gap-1.5 rounded px-2 py-1 text-xs cursor-pointer transition-colors ${
+                  columnView === "screenshots"
+                    ? "bg-neutral-700 text-white"
+                    : "text-neutral-400 hover:text-white"
+                }`}
+              >
+                <ImageIcon className="size-3.5" aria-hidden="true" />
+                Screenshots
+              </button>
+              <button
+                type="button"
+                onClick={() => onColumnViewChange("clipboard")}
+                aria-pressed={columnView === "clipboard"}
+                className={`flex-1 flex items-center justify-center gap-1.5 rounded px-2 py-1 text-xs cursor-pointer transition-colors ${
+                  columnView === "clipboard"
+                    ? "bg-neutral-700 text-white"
+                    : "text-neutral-400 hover:text-white"
+                }`}
+              >
+                <ClipboardList className="size-3.5" aria-hidden="true" />
+                Text
+              </button>
+            </div>
           </div>
-        ) : null}
+
+          {/* Both views stay mounted once loaded (hidden, not unmounted) so
+              toggling never re-decodes thumbnails or refetches clipboard. */}
+          <VirtualThumbList
+            paths={paths}
+            revealed={!isCollapsed && columnView === "screenshots"}
+            revealSignal={openSignal}
+            onEdit={onEdit}
+            onRemove={onRemove}
+            onHoverChange={onHoverChange}
+          />
+
+          {clipboardLoaded ? (
+            <div
+              onScroll={() => onHoverChange?.(true)}
+              className={`flex-1 min-w-0 min-h-0 flex-col ${columnView === "clipboard" ? "flex" : "hidden"}`}
+            >
+              <Suspense fallback={null}>
+                <ClipboardColumnList />
+              </Suspense>
+            </div>
+          ) : null}
+        </div>
+      </div>
+    </>
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Virtualized screenshot list. Tiles are fixed-height 4:3 slots, so the
+// visible index range is pure arithmetic off scrollTop — only ~viewport +
+// overscan tiles exist in the DOM (~16-30) instead of the whole library
+// (~371 tiles / ~4k nodes / 742 IntersectionObservers, whose synchronous
+// full-column mount+layout is what froze every pill click and ballooned the
+// layer tree WindowServer choked on).
+// ---------------------------------------------------------------------------
+
+const LIST_GAP = 20; // matches the old gap-5 flex column (and App's THUMB_GAP)
+const OVERSCAN = 12; // items each side → ~30-item render window
+// pl-1 + pr-3 horizontal padding inside the scroll container.
+const LIST_PAD_X = 16;
+// Fallback before first measure: 240 window − 18 pill − padding, 4:3.
+const DEFAULT_ITEM_HEIGHT = Math.round(((240 - 18 - LIST_PAD_X) * 3) / 4);
+
+interface VirtualThumbListProps {
+  paths: string[];
+  /** False while the column is collapsed or the Text view is active — the list
+   * is display-hidden (zero layout) but keeps its mounted tiles + state. */
+  revealed: boolean;
+  /** The parent's openSignal: bumped after the native window reached its final
+   * geometry, so a cold reveal (mounted while the window was still pill-sized,
+   * clientWidth 0) gets a guaranteed post-resize layout pass. */
+  revealSignal?: number;
+  onEdit: (path: string) => void;
+  onRemove: (path: string) => void;
+  onHoverChange?: (hovered: boolean) => void;
+}
+
+function VirtualThumbList({ paths, revealed, revealSignal = 0, onEdit, onRemove, onHoverChange }: VirtualThumbListProps) {
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const rafRef = useRef(0);
+  const [layout, setLayout] = useState<{ itemHeight: number } & WindowRange>({
+    itemHeight: DEFAULT_ITEM_HEIGHT,
+    start: 0,
+    end: 0,
+  });
+
+  // Re-derive item height + visible range from the live scroll box. Skipped
+  // entirely while display-hidden (clientWidth 0) so a hidden-but-mounted
+  // column never recomputes to an empty range and drops its tiles.
+  const sync = useCallback(() => {
+    const el = scrollRef.current;
+    if (!el || el.clientWidth === 0) return;
+    const innerWidth = Math.max(0, el.clientWidth - LIST_PAD_X);
+    const itemHeight = Math.max(1, Math.round((innerWidth * 3) / 4));
+    const range = computeWindowRange(
+      el.scrollTop,
+      el.clientHeight,
+      paths.length,
+      itemHeight,
+      LIST_GAP,
+      OVERSCAN,
+    );
+    setLayout((prev) =>
+      prev.itemHeight === itemHeight && prev.start === range.start && prev.end === range.end
+        ? prev
+        : { itemHeight, ...range },
+    );
+  }, [paths.length]);
+
+  // Sync before paint on mount, on list changes, when the list is revealed
+  // again (re-expand / toggle back from Text — scroll geometry only exists
+  // once it's visible), and after the native window reaches final geometry
+  // (revealSignal).
+  useLayoutEffect(() => {
+    if (revealed) sync();
+  }, [sync, revealed, revealSignal]);
+
+  useEffect(() => {
+    const onResize = () => sync();
+    window.addEventListener("resize", onResize);
+    return () => {
+      window.removeEventListener("resize", onResize);
+      // Reset so handleScroll can schedule again after this cleanup runs on a
+      // paths change (a stale non-zero id would block all future syncs).
+      cancelAnimationFrame(rafRef.current);
+      rafRef.current = 0;
+    };
+  }, [sync]);
+
+  const handleScroll = () => {
+    onHoverChange?.(true);
+    if (rafRef.current) return;
+    rafRef.current = requestAnimationFrame(() => {
+      rafRef.current = 0;
+      sync();
+    });
+  };
+
+  const { itemHeight, start, end } = layout;
+  return (
+    <div
+      ref={scrollRef}
+      data-thumb-scroll
+      onScroll={handleScroll}
+      className={`flex-1 min-w-0 overflow-y-auto pt-1 pb-4 pr-3 pl-1 [&::-webkit-scrollbar]:hidden [-ms-overflow-style:none] [scrollbar-width:none] ${
+        revealed ? "block" : "hidden"
+      }`}
+      style={{ background: "transparent" }}
+    >
+      <div
+        className="relative w-full"
+        style={{ height: windowTotalHeight(paths.length, itemHeight, LIST_GAP) }}
+      >
+        {paths.slice(start, end).map((path, offset) => {
+          const index = start + offset;
+          return (
+            <div
+              key={path}
+              className="absolute inset-x-0"
+              style={{ top: windowItemTop(index, itemHeight, LIST_GAP), height: itemHeight }}
+            >
+              <ThumbnailItem path={path} onEdit={onEdit} onRemove={onRemove} />
+            </div>
+          );
+        })}
       </div>
     </div>
   );
 }
 
-// Render the first few items (which include the newest, top-of-column shot)
-// eagerly so they're instantly visible/draggable; everything below is mounted
-// lazily as it scrolls near view (IntersectionObserver) so expanding the pill
-// no longer decodes all ~371 images at once.
-const EAGER_COUNT = 6;
-
 interface ThumbnailItemProps {
   path: string;
-  eager?: boolean;
   onEdit: (path: string) => void;
   onRemove: (path: string) => void;
 }
 
-// Longest side of the cached column thumbnail. ~2x the 240px column width so
-// it stays crisp on Retina while decoding ~50-100x faster than a full shot.
-const THUMB_MAX_PX = 512;
-
 // A synced shot whose Storage blob never downloaded — or an orphaned/corrupted
 // doc with no valid blob at all — must NOT park the tile in a perpetual shimmer.
-// Bound both the Firebase URL resolve and the remote image load so the source
-// cascade ALWAYS reaches a terminal state (rendered or "unavailable").
+// Bound both the Firebase URL resolve and the remote image load so the remote
+// fallback ALWAYS reaches a terminal state (rendered or "unavailable"). Local
+// thumbnail requests are NOT time-bounded — see thumbCache.
 const REMOTE_TIMEOUT_MS = 8000;
 
 // Test-load `url` in an off-DOM <img> and resolve true only if it actually
-// decoded (false on error or after `timeoutMs`). The cascade commits a source
-// ONLY after it probes good, so the on-DOM <img> then loads it straight from
-// cache — and we never ping-pong between broken srcs via the <img> onError.
+// decoded (false on error or after `timeoutMs`). Used for the two FALLBACK
+// sources only — asset:// local file and remote Firebase URL — which can fail
+// in ways the on-DOM <img> onError must not ping-pong over. Blob URLs minted
+// from our own Rust thumbnail bytes skip this: they decode or they don't, and
+// <img decoding="async"> already keeps that off the critical path (probing
+// them doubled every decode).
 //
 // `cors` MUST match the displayed <img>'s crossOrigin mode for the SAME src, or
 // WKWebView serves the probe's cached response in the wrong mode and paints a
 // broken "?". The modes map to the source kinds:
-//   • OWN CAPTURE blob: thumbnail bytes → cors=false (a blob URL is same-origin;
-//     this is the origin-independent PRIMARY load that renders in the release
-//     `http://localhost` webview, which can't CORS-load asset://).
 //   • LOCAL  asset:// files → cors=true  (Tauri's asset protocol returns CORS
-//     headers; the cors-cached bitmap is also what lets the drag-icon canvas
-//     export read it back without tainting). Fallback only — blocked in release.
+//     headers). Fallback only — blocked in release.
 //   • REMOTE Firebase URLs  → cors=false (the Storage bucket has NO CORS config
 //     — by design; synced bytes are fetched in Rust — so a crossOrigin probe
-//     is rejected and the image never loads, which is exactly what stranded a
-//     synced shot on "?"; a plain no-cors <img> loads the token URL fine, just
-//     like the public share link).
+//     is rejected and the image never loads; a plain no-cors <img> loads the
+//     token URL fine, just like the public share link).
 function probeImage(url: string, timeoutMs?: number, cors = true): Promise<boolean> {
   return new Promise((resolve) => {
     const img = new Image();
@@ -300,7 +425,7 @@ function probeImage(url: string, timeoutMs?: number, cors = true): Promise<boole
 }
 
 // Resolve `p`, or null if it rejects or doesn't settle within `ms` — so a
-// hung getDownloadURL() can't stall the cascade short of its terminal state.
+// hung getDownloadURL() can't stall the fallback short of its terminal state.
 function withTimeout<T>(p: Promise<T>, ms: number): Promise<T | null> {
   return Promise.race([
     p.catch(() => null),
@@ -308,23 +433,15 @@ function withTimeout<T>(p: Promise<T>, ms: number): Promise<T | null> {
   ]);
 }
 
-// Memoized: MainApp re-renders on every Firestore snapshot (and every poll
-// diff), and without memo each snapshot re-rendered every mounted tile. Props
-// are stable (path string + App-level useCallback handlers), so churny sync
-// activity no longer touches the tiles at all.
-const ThumbnailItem = memo(function ThumbnailItem({
-  path,
-  eager = false,
-  onEdit,
-  onRemove,
-}: ThumbnailItemProps) {
-  // No optimistic full-res src: mounting the original (a 5–15MB retina PNG)
-  // for the top tiles decoded tens of MB of bitmap per tile on EVERY open
-  // (and in release the asset:// load just errors). The cascade below commits
-  // the cheap cached thumbnail instead — eager only means "load immediately,
-  // skip the viewport windowing".
-  const [src, setSrc] = useState<string>("");
-  const [ready, setReady] = useState(false);
+// Memoized: scroll-window shifts re-render the list container, and without
+// memo every mounted tile would re-render on each shift. Props are stable
+// (path string + App-level useCallback handlers).
+const ThumbnailItem = memo(function ThumbnailItem({ path, onEdit, onRemove }: ThumbnailItemProps) {
+  // Cache-first: a tile whose thumbnail blob URL is already in the module
+  // cache commits it in its INITIAL state — remounting (scroll-back, or a
+  // future column remount) paints with zero IPC, zero effects-first flash.
+  const [src, setSrc] = useState<string>(() => getCachedThumbUrl(path) ?? "");
+  const [ready, setReady] = useState(() => src !== "");
   // Terminal "unavailable" state: every source (thumb, local, remote) was tried
   // and none rendered. Shows a static placeholder (still deletable) instead of
   // looping back to the shimmer.
@@ -333,20 +450,18 @@ const ThumbnailItem = memo(function ThumbnailItem({
   const [isSharing, setIsSharing] = useState(false);
   const [isCopied, setIsCopied] = useState(false);
   const copiedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const [inView, setInView] = useState(eager);
-  const rootRef = useRef<HTMLDivElement>(null);
   const exitingRef = useRef(false);
 
   // Resolve a Firebase Storage token URL for this tile when its local cache
   // file is missing or won't decode — a synced (remote) shot whose Rust
   // download hasn't landed yet, an OWN-DEVICE capture whose local file was
   // evicted, or an orphaned doc. Firebase is dynamically imported so it never
-  // enters the startup-critical column chunk (same reason the clipboard list is
-  // lazy); the import only fires once a local load fails. `findDocForCachePath`
-  // resolves the backing doc for BOTH kinds of cache file — a received shot's
-  // `{docId}.png` filename AND an own capture's `shot_{ts}.png` (via the
-  // publish-time path→docId map) — so own captures get the same cloud fallback
-  // synced shots already had instead of stranding on "Unavailable".
+  // enters the startup-critical column chunk; the import only fires once a
+  // local load DEFINITELY failed (never on a slow local decode — that
+  // timeout-then-network pattern fired a wave of per-tile Firebase RPCs on
+  // every cold open). `findDocForCachePath` resolves the backing doc for BOTH
+  // kinds of cache file — a received shot's `{docId}.png` filename AND an own
+  // capture's `shot_{ts}.png` (via the publish-time path→docId map).
   const resolveFallbackUrl = async (): Promise<string | null> => {
     try {
       const { findDocForCachePath, storageDownloadUrl } = await import("@/lib/sync/screenshots");
@@ -359,73 +474,28 @@ const ThumbnailItem = memo(function ThumbnailItem({
     }
   };
 
-  // Windowed mounting: only items near the viewport hold a decoded bitmap, and
-  // items scrolled far past it RELEASE theirs (src cleared) — otherwise a long
-  // scroll through hundreds of full-res screenshots retains every decode and
-  // OOMs the WKWebView (transparent column, app hang). Two observers give the
-  // load/unload hysteresis (load at 1200px, unload past 2400px) so items near
-  // the edge don't thrash. The load margin doubles as the PRELOAD BUFFER: now
-  // that column items decode small cached thumbnails (not full-res shots), a
-  // generous ~1200px look-ahead is cheap and keeps fast scrolling gap-free.
-  // Eager (newest, top) items stay loaded always.
+  // Source cascade, cache-aware:
+  //   1. Module-cached blob URL (handled in the state initializer above).
+  //   2. Rust thumbnail bytes via the gated request queue → blob URL,
+  //      committed directly (no off-DOM probe — the bytes are our own PNG).
+  //   3. On DEFINITE local error only: asset:// full-res (dev origin), then
+  //      the time-bounded remote Firebase URL, then terminal "unavailable".
+  // Virtualization already guarantees this only runs for tiles in/near the
+  // viewport, and unmount cancels a still-queued request (scrolled away).
   useEffect(() => {
-    if (eager) return;
-    const el = rootRef.current;
-    if (!el) return;
-    const root = el.closest("[data-thumb-scroll]");
-    const loadIO = new IntersectionObserver(
-      (entries) => {
-        if (entries.some((e) => e.isIntersecting)) setInView(true);
-      },
-      { root, rootMargin: "1200px 0px" },
-    );
-    const unloadIO = new IntersectionObserver(
-      (entries) => {
-        // The Screenshots list is `display:none` while the Text view is active,
-        // which reports EVERY tile as non-intersecting. Releasing the decodes
-        // there forced a full IPC + re-decode of the whole visible column on
-        // each toggle back — the "switching views is extremely slow" bug. A
-        // hidden element has no client rects; only unload on real scroll-away.
-        if (el.getClientRects().length === 0) return;
-        if (entries.every((e) => !e.isIntersecting)) setInView(false);
-      },
-      { root, rootMargin: "2400px 0px" },
-    );
-    loadIO.observe(el);
-    unloadIO.observe(el);
-    return () => {
-      loadIO.disconnect();
-      unloadIO.disconnect();
-    };
-  }, [eager]);
-
-  // Column preview loads a small CACHED THUMBNAIL (native-side downscale) —
-  // decoding a ~512px PNG is dramatically cheaper than a multi-MB screenshot,
-  // which is what made fast scrolling lag. The thumbnail BYTES come back over
-  // IPC and are wrapped in a same-origin `blob:` URL (NOT `asset://`): in the
-  // RELEASE build the webview origin is `http://localhost:38217`, which cannot
-  // CORS-load `asset://`, so a path-based <img> never paints and a just-taken
-  // own capture stranded on "Unavailable". A `blob:` URL renders regardless of
-  // origin (dev AND release) — the same Rust-bytes trick synced shots already
-  // use. The blob is pre-decoded off-DOM (probeImage) before swapping in, so the
-  // crossfade over the shimmer never shows a half-painted frame. All ACTIONS
-  // (edit, drag payload, share upload, delete) still use the original full-res
-  // `path`. No cache-bust needed: the native thumbnail cache is content-keyed
-  // (path+mtime+size), so the bytes change when the file does.
-  useEffect(() => {
-    if (!inView) {
-      setSrc("");
-      setReady(false);
+    // Usually committed by the state initializer already; the setState here
+    // covers a thumb that landed in the cache (via another tile's shared
+    // request) between this tile's first render and this effect.
+    const cached = getCachedThumbUrl(path);
+    if (cached) {
+      setSrc(cached);
+      setReady(true);
       setFailed(false);
       return;
     }
+
     let cancelled = false;
-    // The one `blob:` URL this run may mint (from the thumbnail bytes). Revoked
-    // on cleanup (deps change / unmount) so a long scroll doesn't leak object
-    // URLs. Revoking after the bitmap has painted is safe — the decoded image
-    // stays; only a fresh load of the (now-dead) URL would fail, which never
-    // happens for an already-committed src.
-    let createdUrl: string | null = null;
+    const request = requestThumbUrl(path);
 
     const commit = (url: string) => {
       if (cancelled) return;
@@ -434,53 +504,29 @@ const ThumbnailItem = memo(function ThumbnailItem({
       setFailed(false);
     };
 
-    // Deterministic source cascade. Each step PROBES its candidate (off-DOM
-    // load) and only commits one that actually decodes, so an own-device shot
-    // shows instantly from its local file and a synced shot falls back to its
-    // bounded Firebase URL — but a doc with no valid blob anywhere ends in the
-    // terminal "unavailable" state instead of an endless shimmer or an
-    // onError ping-pong between two broken srcs.
     (async () => {
-      const local = convertFileSrc(path);
-
-      // 1. Cheap cached thumbnail (native downscale), returned as raw BYTES and
-      //    wrapped in a same-origin `blob:` URL — NEVER `asset://`, so it loads
-      //    under the release webview's `http://localhost` origin (which can't
-      //    CORS-load `asset://`). This is the PRIMARY, origin-independent load
-      //    for OWN local captures. TIME-BOUNDED: a hung Rust call (or a missing
-      //    local file → reject) returns null instead of stranding the tile on
-      //    the shimmer forever — we fall through to the local file, then the
-      //    remote URL, and ultimately the terminal state. A `blob:` URL is
-      //    same-origin, so it's probed/loaded in NO-CORS mode (no crossOrigin).
-      const thumbBytes = await withTimeout(
-        invoke<ArrayBuffer>("get_screenshot_thumbnail", { path, maxPx: THUMB_MAX_PX }),
-        REMOTE_TIMEOUT_MS,
-      );
-      if (cancelled) return;
-      if (thumbBytes && thumbBytes.byteLength > 0) {
-        const thumbUrl = URL.createObjectURL(new Blob([thumbBytes], { type: "image/png" }));
-        createdUrl = thumbUrl;
-        if (await probeImage(thumbUrl, undefined, false)) {
-          commit(thumbUrl);
-          return;
-        }
+      try {
+        const url = await request.promise;
+        if (cancelled) return;
+        if (url) commit(url);
+        // null → cancelled while queued (tile unmounted); nothing to do.
+        return;
+      } catch {
+        // Definite local failure — fall through to the fallback cascade.
       }
       if (cancelled) return;
 
-      // 2. Original full-res local file — fallback when the thumbnail bytes
-      //    couldn't be produced (dev-origin only; release can't CORS-load it).
+      // Original full-res local file (dev-origin only; release can't CORS-load it).
+      const local = convertFileSrc(path);
       if (await probeImage(local)) {
         commit(local);
         return;
       }
       if (cancelled) return;
 
-      // 3. Remote Firebase token URL — the reliable source for a SYNCED shot
-      //    whose local cache file won't decode in the webview (or never landed).
-      //    Probed/loaded in NO-CORS mode: the Storage bucket has no CORS config,
-      //    so a cors probe would fail exactly like the local fast-path it's meant
-      //    to rescue and leave the tile stuck on "?". Both resolve + load are
-      //    time-bounded.
+      // Remote Firebase token URL — the reliable source for a SYNCED shot whose
+      // local cache file is missing/corrupt. Probed/loaded in NO-CORS mode (the
+      // Storage bucket has no CORS config). Both resolve + load time-bounded.
       const remote = await withTimeout(resolveFallbackUrl(), REMOTE_TIMEOUT_MS);
       if (cancelled) return;
       if (remote && (await probeImage(remote, REMOTE_TIMEOUT_MS, false))) {
@@ -489,8 +535,8 @@ const ThumbnailItem = memo(function ThumbnailItem({
       }
       if (cancelled) return;
 
-      // 4. Exhausted every source (no local file AND remote failed/timed out) —
-      //    terminal state so the user can SEE + DELETE an orphaned/corrupted doc.
+      // Exhausted every source — terminal state so the user can SEE + DELETE
+      // an orphaned/corrupted doc.
       setSrc("");
       setReady(false);
       setFailed(true);
@@ -498,51 +544,27 @@ const ThumbnailItem = memo(function ThumbnailItem({
 
     return () => {
       cancelled = true;
-      if (createdUrl) URL.revokeObjectURL(createdUrl);
+      request.release();
     };
-  }, [path, inView]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [path]);
 
-  // Drag preview is generated ON DRAG START from the already-decoded <img>
-  // (no extra full-res decode, no per-item temp file on mount). The temp icon
-  // is deleted once the drag session ends.
-  const beginDrag = (imgEl: HTMLImageElement) => {
+  // Drag icon comes from the already-cached thumbnail BYTES (one temp-file
+  // write, memoized per path) — not the old canvas draw + toDataURL + serial
+  // temp-dir/save IPC round-trips against the full-res <img> on every drag.
+  const beginDrag = () => {
     (async () => {
-      let iconPath: string | null = null;
+      let icon = path; // full-res file itself as the fallback icon
       try {
-        const target = 160;
-        const ratio = Math.min(target / imgEl.naturalWidth, target / imgEl.naturalHeight, 1);
-        const w = Math.max(1, Math.round(imgEl.naturalWidth * ratio));
-        const h = Math.max(1, Math.round(imgEl.naturalHeight * ratio));
-        const canvas = document.createElement("canvas");
-        canvas.width = w;
-        canvas.height = h;
-        const ctx = canvas.getContext("2d");
-        if (ctx) {
-          ctx.imageSmoothingEnabled = true;
-          ctx.imageSmoothingQuality = "high";
-          ctx.drawImage(imgEl, 0, 0, w, h);
-          const dataUrl = canvas.toDataURL("image/png");
-          const tempDir = await invoke<string>("get_temp_directory");
-          const safe = path.replace(/[^a-zA-Z0-9._-]/g, "_");
-          iconPath = await invoke<string>("save_edited_image", {
-            imageData: dataUrl,
-            saveDir: tempDir,
-            copyToClip: false,
-            overwritePath: `${tempDir}/sx-drag-${safe}`,
-          });
-        }
-      } catch (err) {
-        console.error("drag icon generation failed:", err);
-        iconPath = null;
+        const iconPath = await ensureDragIconPath(path);
+        if (iconPath) icon = iconPath;
+      } catch {
+        // fall through with the full-res path
       }
       try {
-        await startDrag({ item: [path], icon: iconPath || path });
+        await startDrag({ item: [path], icon });
       } catch (err) {
         console.error("startDrag failed:", err);
-      } finally {
-        if (iconPath) {
-          invoke("delete_file", { path: iconPath }).catch(() => {});
-        }
       }
     })();
   };
@@ -591,21 +613,22 @@ const ThumbnailItem = memo(function ThumbnailItem({
   }, []);
 
   // Copies the ORIGINAL full-res image file (not the downscaled column
-  // thumbnail) via the same Rust command used on editor open.
-  const copyImage = async () => {
-    try {
-      await invoke("copy_to_clipboard", { path });
-      toast.success("Copied to clipboard", { duration: 1500 });
-      setIsCopied(true);
-      if (copiedTimerRef.current) clearTimeout(copiedTimerRef.current);
-      copiedTimerRef.current = setTimeout(() => setIsCopied(false), 1500);
-    } catch (err) {
+  // thumbnail). OPTIMISTIC: toast + checkmark immediately, revert on error —
+  // the Rust copy re-encodes a multi-MB PNG and the UI must not sit silent
+  // behind it.
+  const copyImage = () => {
+    setIsCopied(true);
+    toast.success("Copied to clipboard", { duration: 1500 });
+    if (copiedTimerRef.current) clearTimeout(copiedTimerRef.current);
+    copiedTimerRef.current = setTimeout(() => setIsCopied(false), 1500);
+    invoke("copy_to_clipboard", { path }).catch((err) => {
       console.error("copy image failed:", err);
+      setIsCopied(false);
       toast.error("Couldn't copy image", {
         description: err instanceof Error ? err.message : String(err),
         duration: 4000,
       });
-    }
+    });
   };
 
   const slideOutAndRemove = () => {
@@ -617,27 +640,18 @@ const ThumbnailItem = memo(function ThumbnailItem({
 
   return (
     <div
-      ref={rootRef}
-      className={`relative w-full shrink-0 overflow-visible transition-all duration-200 ease-in ${
+      className={`group relative h-full w-full overflow-visible transition-all duration-200 ease-in ${
         isExiting ? "-translate-x-full opacity-0" : "translate-x-0 opacity-100"
       }`}
-      style={{ aspectRatio: "4 / 3" }}
     >
       {/* Skeleton keeps the slot's fixed size and animates while the thumbnail
           decodes, so fast scrolling shows a shimmer instead of blank gaps.
           Hidden once the image is ready OR the tile reached its terminal
           "unavailable" state — it never loops back to the shimmer. */}
-      {/* Sweep animates only for tiles actually loading in/near view — an
-          offscreen tail of hundreds of unloaded tiles must not composite an
-          infinite animation each. */}
       <div
         aria-hidden="true"
         className={`absolute inset-0 rounded-md bs-thumb-shimmer transition-opacity duration-200 ${
-          ready || failed
-            ? "opacity-0 bs-thumb-shimmer-done"
-            : inView
-              ? "opacity-100"
-              : "opacity-100 bs-thumb-shimmer-done"
+          ready || failed ? "opacity-0 bs-thumb-shimmer-done" : "opacity-100"
         }`}
       />
       {failed ? (
@@ -656,19 +670,17 @@ const ThumbnailItem = memo(function ThumbnailItem({
         <img
           src={src}
           alt="Screenshot preview"
-          // CORS mode must match the probe that committed this src (see
-          // probeImage). Three source kinds, two modes:
+          // CORS mode must match how this src was (probe-)loaded. Three source
+          // kinds, two modes:
           //   • blob:/data:  (own-capture thumbnail bytes) → NO crossOrigin. A
-          //     blob URL is same-origin, so a crossOrigin="anonymous" would add a
-          //     pointless CORS check; this is the origin-independent path that
-          //     renders in the release localhost webview.
+          //     blob URL is same-origin; this is the origin-independent path
+          //     that renders in the release localhost webview.
           //   • https://     (remote Firebase token URL) → NO crossOrigin. The
           //     Storage bucket has no CORS config, so a cors request is rejected
           //     and a synced shot would fall to "?"; a plain no-cors <img> loads
           //     the token URL fine, like the public share link.
           //   • asset://     (local full-res fallback) → crossOrigin="anonymous".
-          //     Tauri's asset protocol supplies CORS headers, and the cors-cached
-          //     bitmap lets the drag-icon canvas read it back untainted.
+          //     Tauri's asset protocol supplies CORS headers.
           crossOrigin={/^(blob:|data:|https?:\/\/)/i.test(src) ? undefined : "anonymous"}
           decoding="async"
           className={`relative block h-full w-full object-cover select-none rounded-md cursor-pointer transition-opacity duration-200 ${
@@ -677,13 +689,13 @@ const ThumbnailItem = memo(function ThumbnailItem({
           draggable
           onDragStart={(e) => {
             e.preventDefault();
-            beginDrag(e.currentTarget);
+            beginDrag();
           }}
           onError={() => {
-            // Every on-DOM src was cascade-committed (probed-good off-DOM), so a
-            // failure here — e.g. cache eviction between probe and paint — is
-            // terminal: looping back through the cascade would risk a
-            // local↔remote ping-pong.
+            // Every on-DOM src either came from our own thumbnail bytes or was
+            // probed-good off-DOM, so a failure here — e.g. cache eviction
+            // between commit and paint — is terminal: looping back through the
+            // cascade would risk a local↔remote ping-pong.
             setReady(false);
             setFailed(true);
           }}
@@ -694,6 +706,9 @@ const ThumbnailItem = memo(function ThumbnailItem({
         />
       ) : null}
 
+      {/* Tile actions are hover/focus-gated and use a SOLID scrim, not
+          backdrop-blur: three always-composited blur layers per tile on a
+          transparent NSWindow is pure WindowServer tax. */}
       <button
         type="button"
         onClick={(e) => {
@@ -703,7 +718,7 @@ const ThumbnailItem = memo(function ThumbnailItem({
         onPointerDown={(e) => e.stopPropagation()}
         aria-label="Delete"
         title="Delete"
-        className="absolute top-1.5 left-1.5 size-6 rounded-full bg-black/55 hover:bg-red-600/90 text-white flex items-center justify-center backdrop-blur-sm shadow-md z-10 cursor-pointer"
+        className="absolute top-1.5 left-1.5 size-6 rounded-full bg-neutral-900/80 hover:bg-red-600/90 text-white flex items-center justify-center shadow-md z-10 cursor-pointer opacity-0 group-hover:opacity-100 focus-visible:opacity-100 transition-opacity"
       >
         <Trash2 className="size-3" aria-hidden="true" />
       </button>
@@ -717,7 +732,7 @@ const ThumbnailItem = memo(function ThumbnailItem({
         onPointerDown={(e) => e.stopPropagation()}
         aria-label="Copy image"
         title="Copy image"
-        className="absolute top-1.5 right-1.5 size-6 rounded-full bg-black/55 hover:bg-blue-600/90 text-white flex items-center justify-center backdrop-blur-sm shadow-md z-10 cursor-pointer"
+        className="absolute top-1.5 right-1.5 size-6 rounded-full bg-neutral-900/80 hover:bg-blue-600/90 text-white flex items-center justify-center shadow-md z-10 cursor-pointer opacity-0 group-hover:opacity-100 focus-visible:opacity-100 transition-opacity"
       >
         {isCopied ? (
           <Check className="size-3" aria-hidden="true" />
@@ -736,7 +751,7 @@ const ThumbnailItem = memo(function ThumbnailItem({
         disabled={isSharing}
         aria-label="Copy share link"
         title="Copy share link"
-        className="absolute bottom-1.5 right-1.5 size-6 rounded-full bg-black/55 hover:bg-blue-600/90 text-white flex items-center justify-center backdrop-blur-sm shadow-md z-10 cursor-pointer disabled:cursor-wait"
+        className="absolute bottom-1.5 right-1.5 size-6 rounded-full bg-neutral-900/80 hover:bg-blue-600/90 text-white flex items-center justify-center shadow-md z-10 cursor-pointer disabled:cursor-wait opacity-0 group-hover:opacity-100 focus-visible:opacity-100 transition-opacity"
       >
         {isSharing ? (
           <Loader2 className="size-3 animate-spin" aria-hidden="true" />

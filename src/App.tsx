@@ -11,7 +11,8 @@ import { editorActions } from "@/stores/editorStore";
 import { loadLicenseStatus, type LicenseStatus } from "@/lib/license";
 import { Paywall } from "@/components/Paywall";
 // Light module (zustand + types only — no Firebase): safe in the entry chunk.
-import { registerRenameCapturePath, useScreenshots, useSyncStore } from "@/stores/syncStore";
+import { registerRenameCapturePath, useSyncStore } from "@/stores/syncStore";
+import { clearThumbs, dropThumb } from "@/lib/thumbCache";
 // Firebase-FREE column ordering (own module so the heavy Firebase SDK stays off
 // this startup-critical path): order the edge column by each screenshot's true
 // creation time, not file mtime.
@@ -421,18 +422,30 @@ function MainApp() {
   const [showPaywall, setShowPaywall] = useState(false);
 
   useEffect(() => {
-    (async () => {
-      const status = await loadLicenseStatus();
-      setLicenseStatus(status);
+    // Only setState on a REAL change: the poll used to store a fresh object
+    // every 60s, which re-rendered MainApp (and everything non-memoized under
+    // it) once a minute for no reason.
+    const applyStatus = (status: LicenseStatus) => {
+      const prev = licenseStatusRef.current;
       licenseStatusRef.current = status;
+      if (!prev || JSON.stringify(prev) !== JSON.stringify(status)) {
+        setLicenseStatus(status);
+      }
+    };
+    (async () => {
+      applyStatus(await loadLicenseStatus());
     })();
     const interval = setInterval(async () => {
-      const status = await loadLicenseStatus();
-      setLicenseStatus(status);
-      licenseStatusRef.current = status;
+      applyStatus(await loadLicenseStatus());
     }, 60_000);
     return () => clearInterval(interval);
   }, []);
+
+  // Cursor parked on/inside the column (per its enter/leave/move handlers) —
+  // used to pause the display-follow poll: relocating only matters when the
+  // cursor is AWAY from the window, so polling IPC while the user is hovering
+  // or focused on it is pure churn.
+  const columnHoveredRef = useRef(false);
 
   // Follow the cursor across displays: while the edge pill / thumbnail column is
   // the visible surface, relocate it to whichever physical display the cursor is
@@ -448,6 +461,12 @@ function MainApp() {
       if (modeRef.current === "pairing" || modeRef.current === "preferences") return;
       if (thumbsRef.current.length === 0) return;
       if (openEditorsRef.current > 0) return;
+      // Paused while the window is focused or the cursor is inside it (both
+      // sync checks — no IPC). :hover cross-checks the hover ref because
+      // either alone can go stale when the window moves/hides under a
+      // stationary cursor.
+      if (document.hasFocus()) return;
+      if (columnHoveredRef.current && document.documentElement.matches(":hover")) return;
       busy = true;
       try {
         const w = getCurrentWindow();
@@ -652,7 +671,8 @@ function MainApp() {
     }
   }, []);
 
-  const handleHoverChange = useCallback((_active: boolean) => {
+  const handleHoverChange = useCallback((active: boolean) => {
+    columnHoveredRef.current = active;
     // Enter / move / leave all just re-arm the idle countdown.
     startAutoHide();
   }, [startAutoHide]);
@@ -705,6 +725,7 @@ function MainApp() {
         console.error("clear local screenshots on sign-out failed:", e);
       }
       updateThumbs(() => []);
+      clearThumbs();
     })();
   }, [syncAuthState, updateThumbs]);
 
@@ -995,15 +1016,26 @@ function MainApp() {
   // re-sort in place so the newest shot — Mac or phone — settles on top and the
   // order is stable. Own `shot_{ts}` captures already sort right from the start
   // (their epoch is in the filename); this fixes the doc-id-named ones.
-  const screenshotDocs = useScreenshots();
+  //
+  // Plain store subscription, NOT a useScreenshots() hook: subscribing MainApp
+  // to the whole screenshots array re-rendered the entire app (and reconciled
+  // every column tile) on EVERY Firestore snapshot, even when the visible
+  // order didn't change. This only touches React state when the order really
+  // moved.
   useEffect(() => {
-    const cur = thumbsRef.current;
-    if (cur.length === 0) return;
-    const ordered = orderScreenshotsByCreatedAt(cur);
-    const same =
-      ordered.length === cur.length && ordered.every((p, i) => p === cur[i]);
-    if (!same) updateThumbs(() => ordered);
-  }, [screenshotDocs, updateThumbs]);
+    const reorder = () => {
+      const cur = thumbsRef.current;
+      if (cur.length === 0) return;
+      const ordered = orderScreenshotsByCreatedAt(cur);
+      const same =
+        ordered.length === cur.length && ordered.every((p, i) => p === cur[i]);
+      if (!same) updateThumbs(() => ordered);
+    };
+    reorder();
+    return useSyncStore.subscribe((state, prevState) => {
+      if (state.screenshots !== prevState.screenshots) reorder();
+    });
+  }, [updateThumbs]);
 
 
   const handleCapture = useCallback(async (captureMode: CaptureMode = "region") => {
@@ -1358,6 +1390,8 @@ function MainApp() {
 
   const handleThumbnailItemRemove = useCallback(async (path: string) => {
     const remaining = updateThumbs((prev) => prev.filter((p) => p !== path));
+    // Free (and revoke) the deleted shot's cached thumbnail blob URL.
+    dropThumb(path);
     // Propagate the delete to Firebase so the doc + Storage blobs are removed
     // and the subscription doesn't resync the shot back onto this (or any
     // other) device. deleteScreenshotByPath reads the file for its content
@@ -1406,27 +1440,23 @@ function MainApp() {
       await showCollapsedThumbnail();
       setIsCollapsed(true);
     } else {
-      // EXPAND. Sequence: render column invisible -> resize window to final
-      // geometry -> wait for that resize to actually PAINT -> run the genie-in.
+      // EXPAND. The column stayed MOUNTED through the collapse (display-hidden,
+      // thumbs cached), so this swap is a pure CSS flip — no remount, no IPC, no
+      // decode. Sequence: unhide column (still opacity:0) -> resize window to
+      // final geometry -> one painted frame -> genie-in.
       isCollapsedRef.current = false;
       setIsCollapsed(false);
       // Double rAF so React doesn't just COMMIT the swap but the pill-removed /
       // opacity:0 column state is actually COMPOSITED to screen before we touch
-      // native geometry. A single rAF fires after the commit but before paint, so
-      // the old collapsed pill was still on screen during the resize and rode the
-      // window's top edge upward (the "pill jumps up, vanishes, returns"). Two
-      // frames guarantee the pill is painted away first → the centered grow is
-      // invisible and the genie unfurls in place.
+      // native geometry — otherwise the old collapsed pill rides the window's
+      // top edge upward during the resize (the "pill jumps up" flash).
       await new Promise<void>((resolve) =>
         requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
       );
       await expandThumbWindow(columnWindowHeight(columnViewRef.current, thumbsRef.current.length));
-      // Double rAF: a single rAF fires BEFORE the native resize is composited to
-      // screen, so the genie would start inside a pill-sized window (the "jump up").
-      // Two frames guarantee the new window geometry has painted before we reveal.
-      await new Promise<void>((resolve) =>
-        requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
-      );
+      // One more frame so the resized geometry is composited before the reveal
+      // starts (the genie must not unfurl inside a still-pill-sized window).
+      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
       setOpenSignal((n) => n + 1);
       startAutoHide();
     }
