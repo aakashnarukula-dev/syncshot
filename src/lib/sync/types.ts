@@ -55,6 +55,24 @@ export interface ClipboardDoc {
   charCount: number;
 }
 
+/**
+ * Cheap identity signature for a screenshot snapshot: covers every field a
+ * consumer actually renders/acts on (id, status, createdAt, blob paths) plus
+ * the window's hasMore flag. The engine uses it to SKIP the store write for
+ * echo snapshots (cache replays, unrelated-field touches) — every skipped
+ * write is a full App re-render avoided while uploads/downloads churn.
+ */
+export function screenshotsSignature(
+  items: ScreenshotDoc[],
+  hasMore: boolean,
+): string {
+  let sig = hasMore ? "1" : "0";
+  for (const i of items) {
+    sig += `|${i.id}:${i.status}:${i.createdAt ?? ""}:${i.thumbPath}:${i.fullPath ?? ""}`;
+  }
+  return sig;
+}
+
 /** Max clipboard text size synced (spec: 100 KB cap to stay well under 1 MB). */
 export const CLIPBOARD_MAX_BYTES = 100 * 1024;
 

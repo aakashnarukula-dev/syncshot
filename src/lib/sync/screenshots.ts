@@ -31,6 +31,7 @@ import {
 } from "firebase/firestore";
 import { deleteObject, getDownloadURL, ref, uploadBytes } from "firebase/storage";
 import { renameCapturePath, useSyncStore } from "@/stores/syncStore";
+import { isSyncedCacheFile } from "./order";
 import { db, storage } from "./firebase";
 import { sha256Hex } from "./hash";
 import {
@@ -451,8 +452,8 @@ export function receivedCacheName(item: ScreenshotDoc): string {
 
 /**
  * Persist a received full screenshot to disk via Rust (saves into the local
- * screenshot cache and copies the image to the clipboard). Returns the saved
- * file path.
+ * screenshot cache; the save-dir poll then copies a FRESH arrival to the
+ * clipboard per the user's auto-copy setting). Returns the saved file path.
  *
  * The raw bytes are fetched in RUST, not the webview: we resolve the full
  * image's tokenized `getDownloadURL` (a capability that bypasses Storage rules
@@ -568,13 +569,23 @@ export async function ensureLocalScreenshot(path: string): Promise<string> {
  * re-running this is safe and never double-uploads. Returns the count newly
  * published. A small concurrency pool keeps a large library from issuing
  * hundreds of simultaneous hashes/uploads.
+ *
+ * PERF: files already named `{docId}.<ext>` (received shots AND published own
+ * captures — renamed on publish) PROVABLY have a cloud doc, so they're skipped
+ * up front. Without this filter every launch re-read the ENTIRE library's
+ * bytes over IPC and re-hashed + dupe-queried each file (multi-GB of reads for
+ * a few-hundred-shot library) just to no-op — the single biggest source of
+ * "everything is laggy right after the rail opens". Only genuinely unpublished
+ * names (`shot_…` etc.) are still checked; each drops out of the set once its
+ * publish renames it.
  */
 export async function backfillScreenshots(
   uid: string,
   device: DeviceRef,
-  paths: string[],
+  allPaths: string[],
   concurrency = 3,
 ): Promise<number> {
+  const paths = allPaths.filter((p) => !isSyncedCacheFile(p));
   let published = 0;
   let next = 0;
   async function worker(): Promise<void> {

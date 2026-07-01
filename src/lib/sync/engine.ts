@@ -18,7 +18,7 @@ import { logout, watchAuth } from "./firebase";
 import { loadSyncPrefs, saveDeviceId, saveDeviceName, savePaused } from "./persistence";
 import { publishScreenshot, reconcileLocalCache, saveReceivedScreenshot, subscribeScreenshots } from "./screenshots";
 import { subscribeClipboard, writeClipboardEntry } from "./clipboard";
-import type { ClipboardDoc, DeviceRef, ScreenshotDoc } from "./types";
+import { screenshotsSignature, type ClipboardDoc, type DeviceRef, type ScreenshotDoc } from "./types";
 
 let started = false;
 let device: DeviceRef | null = null;
@@ -32,6 +32,11 @@ let unlistenClipChanged: UnlistenFn | null = null;
 
 // Full images already pulled to disk — avoids re-saving on every snapshot.
 const savedFullIds = new Set<string>();
+// Signature of the last snapshot written to the store. Firestore fires plenty
+// of echo snapshots (cache replays, latency-compensation double-fires) whose
+// rendered content is identical; skipping the store write for those avoids a
+// full App re-render per echo while uploads/downloads churn.
+let lastScreenshotsSig: string | null = null;
 // Newest clipboard hash seen (any device) — suppresses echo when we re-copy a
 // remote entry (set_clipboard_text would otherwise bounce back via the poller).
 let recentClipHash: string | null = null;
@@ -45,7 +50,11 @@ function handleScreenshots(
   hasMore: boolean,
   fromCache: boolean,
 ): void {
-  store().setScreenshots(items, hasMore);
+  const sig = screenshotsSignature(items, hasMore);
+  if (sig !== lastScreenshotsSig) {
+    lastScreenshotsSig = sig;
+    store().setScreenshots(items, hasMore);
+  }
 
   // FULL-SET RECONCILE. The store list is full-replaced above, so the Library
   // grid already reflects the current set — but a received shot's local cache
@@ -99,6 +108,7 @@ function stopListeners(): void {
   // Drop the re-download guard so a re-subscribe (e.g. account switch) re-pulls
   // the new account's shots instead of skipping ids the previous account saw.
   savedFullIds.clear();
+  lastScreenshotsSig = null;
 }
 
 function startListeners(uid: string): void {

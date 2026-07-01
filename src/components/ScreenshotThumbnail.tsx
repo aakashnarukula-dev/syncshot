@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { lazy, memo, Suspense, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { animate } from "motion";
 import { startDrag } from "@crabnebula/tauri-plugin-drag";
@@ -217,8 +217,8 @@ export function ScreenshotThumbnail({
               key={path}
               path={path}
               eager={i < EAGER_COUNT}
-              onEdit={() => onEdit(path)}
-              onRemove={() => onRemove(path)}
+              onEdit={onEdit}
+              onRemove={onRemove}
             />
           ))}
         </div>
@@ -247,8 +247,8 @@ const EAGER_COUNT = 6;
 interface ThumbnailItemProps {
   path: string;
   eager?: boolean;
-  onEdit: () => void;
-  onRemove: () => void;
+  onEdit: (path: string) => void;
+  onRemove: (path: string) => void;
 }
 
 // Longest side of the cached column thumbnail. ~2x the 240px column width so
@@ -308,12 +308,23 @@ function withTimeout<T>(p: Promise<T>, ms: number): Promise<T | null> {
   ]);
 }
 
-function ThumbnailItem({ path, eager = false, onEdit, onRemove }: ThumbnailItemProps) {
-  // Eager (newest, top) items show the full-res original IMMEDIATELY so a fresh
-  // capture appears with zero delay, then swap to the cached thumbnail once it's
-  // decoded (the swap is invisible: same box, pre-decoded bitmap).
-  const [src, setSrc] = useState<string>(() => (eager ? convertFileSrc(path) : ""));
-  const [ready, setReady] = useState(eager);
+// Memoized: MainApp re-renders on every Firestore snapshot (and every poll
+// diff), and without memo each snapshot re-rendered every mounted tile. Props
+// are stable (path string + App-level useCallback handlers), so churny sync
+// activity no longer touches the tiles at all.
+const ThumbnailItem = memo(function ThumbnailItem({
+  path,
+  eager = false,
+  onEdit,
+  onRemove,
+}: ThumbnailItemProps) {
+  // No optimistic full-res src: mounting the original (a 5–15MB retina PNG)
+  // for the top tiles decoded tens of MB of bitmap per tile on EVERY open
+  // (and in release the asset:// load just errors). The cascade below commits
+  // the cheap cached thumbnail instead — eager only means "load immediately,
+  // skip the viewport windowing".
+  const [src, setSrc] = useState<string>("");
+  const [ready, setReady] = useState(false);
   // Terminal "unavailable" state: every source (thumb, local, remote) was tried
   // and none rendered. Shows a static placeholder (still deletable) instead of
   // looping back to the shimmer.
@@ -325,13 +336,6 @@ function ThumbnailItem({ path, eager = false, onEdit, onRemove }: ThumbnailItemP
   const [inView, setInView] = useState(eager);
   const rootRef = useRef<HTMLDivElement>(null);
   const exitingRef = useRef(false);
-  // True once the deterministic cascade has COMMITTED a probed-good source.
-  // Distinguishes a real on-DOM failure of a vetted src (terminal) from the
-  // optimistic eager src (the raw local file shown pre-probe) 404-ing because a
-  // synced shot's local copy hasn't downloaded yet — the latter must stay on
-  // the shimmer while the cascade resolves the remote URL, NOT flash
-  // "Unavailable". Reset at the top of each cascade run.
-  const committedByCascadeRef = useRef(false);
 
   // Resolve a Firebase Storage token URL for this tile when its local cache
   // file is missing or won't decode — a synced (remote) shot whose Rust
@@ -377,6 +381,12 @@ function ThumbnailItem({ path, eager = false, onEdit, onRemove }: ThumbnailItemP
     );
     const unloadIO = new IntersectionObserver(
       (entries) => {
+        // The Screenshots list is `display:none` while the Text view is active,
+        // which reports EVERY tile as non-intersecting. Releasing the decodes
+        // there forced a full IPC + re-decode of the whole visible column on
+        // each toggle back — the "switching views is extremely slow" bug. A
+        // hidden element has no client rects; only unload on real scroll-away.
+        if (el.getClientRects().length === 0) return;
         if (entries.every((e) => !e.isIntersecting)) setInView(false);
       },
       { root, rootMargin: "2400px 0px" },
@@ -403,9 +413,6 @@ function ThumbnailItem({ path, eager = false, onEdit, onRemove }: ThumbnailItemP
   // `path`. No cache-bust needed: the native thumbnail cache is content-keyed
   // (path+mtime+size), so the bytes change when the file does.
   useEffect(() => {
-    // A fresh cascade run owns the terminal failure decision; clear the flag so
-    // the optimistic eager src isn't mistaken for a committed one.
-    committedByCascadeRef.current = false;
     if (!inView) {
       setSrc("");
       setReady(false);
@@ -422,7 +429,6 @@ function ThumbnailItem({ path, eager = false, onEdit, onRemove }: ThumbnailItemP
 
     const commit = (url: string) => {
       if (cancelled) return;
-      committedByCascadeRef.current = true;
       setSrc(url);
       setReady(true);
       setFailed(false);
@@ -461,8 +467,8 @@ function ThumbnailItem({ path, eager = false, onEdit, onRemove }: ThumbnailItemP
       }
       if (cancelled) return;
 
-      // 2. Original full-res local file. For own captures this is present and
-      //    paints immediately; for eager tiles it's already on-screen.
+      // 2. Original full-res local file — fallback when the thumbnail bytes
+      //    couldn't be produced (dev-origin only; release can't CORS-load it).
       if (await probeImage(local)) {
         commit(local);
         return;
@@ -606,7 +612,7 @@ function ThumbnailItem({ path, eager = false, onEdit, onRemove }: ThumbnailItemP
     if (exitingRef.current) return;
     exitingRef.current = true;
     setIsExiting(true);
-    setTimeout(() => onRemove(), 220);
+    setTimeout(() => onRemove(path), 220);
   };
 
   return (
@@ -621,10 +627,17 @@ function ThumbnailItem({ path, eager = false, onEdit, onRemove }: ThumbnailItemP
           decodes, so fast scrolling shows a shimmer instead of blank gaps.
           Hidden once the image is ready OR the tile reached its terminal
           "unavailable" state — it never loops back to the shimmer. */}
+      {/* Sweep animates only for tiles actually loading in/near view — an
+          offscreen tail of hundreds of unloaded tiles must not composite an
+          infinite animation each. */}
       <div
         aria-hidden="true"
         className={`absolute inset-0 rounded-md bs-thumb-shimmer transition-opacity duration-200 ${
-          ready || failed ? "opacity-0 bs-thumb-shimmer-done" : "opacity-100"
+          ready || failed
+            ? "opacity-0 bs-thumb-shimmer-done"
+            : inView
+              ? "opacity-100"
+              : "opacity-100 bs-thumb-shimmer-done"
         }`}
       />
       {failed ? (
@@ -667,21 +680,16 @@ function ThumbnailItem({ path, eager = false, onEdit, onRemove }: ThumbnailItemP
             beginDrag(e.currentTarget);
           }}
           onError={() => {
-            // Two very different on-DOM failures:
-            //  • A cascade-COMMITTED src (already probed-good off-DOM) failing —
-            //    e.g. cache eviction between probe and paint. Terminal: looping
-            //    back through the cascade would risk a local↔remote ping-pong.
-            //  • The OPTIMISTIC eager src (the raw local file shown pre-probe so
-            //    a fresh own-capture appears instantly) 404-ing because a SYNCED
-            //    shot's local copy hasn't downloaded yet. The cascade is still in
-            //    flight resolving the thumbnail/local/remote source, so stay on
-            //    the SHIMMER and let it finish — do NOT flash "Unavailable".
+            // Every on-DOM src was cascade-committed (probed-good off-DOM), so a
+            // failure here — e.g. cache eviction between probe and paint — is
+            // terminal: looping back through the cascade would risk a
+            // local↔remote ping-pong.
             setReady(false);
-            if (committedByCascadeRef.current) setFailed(true);
+            setFailed(true);
           }}
           onClick={() => {
             exitingRef.current = true;
-            onEdit();
+            onEdit(path);
           }}
         />
       ) : null}
@@ -738,4 +746,4 @@ function ThumbnailItem({ path, eager = false, onEdit, onRemove }: ThumbnailItemP
       </button>
     </div>
   );
-}
+});

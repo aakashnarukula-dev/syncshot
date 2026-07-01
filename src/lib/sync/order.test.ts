@@ -3,6 +3,8 @@ import { useSyncStore } from "@/stores/syncStore";
 import type { ScreenshotDoc } from "./types";
 import {
   cacheDocId,
+  isRecentScreenshot,
+  isSyncedCacheFile,
   orderScreenshotsByCreatedAt,
   screenshotCreatedAt,
 } from "./order";
@@ -114,6 +116,52 @@ describe("orderScreenshotsByCreatedAt", () => {
       "/cache/legacy_b.png", // mtime-only tail keeps incoming order
       "/cache/legacy_a.png",
     ]);
+  });
+});
+
+describe("isSyncedCacheFile", () => {
+  it("matches a {docId}.<ext> cache file (20 alnum chars)", () => {
+    expect(isSyncedCacheFile("/cache/Abc123XYZ0000000abcd.png")).toBe(true);
+    expect(isSyncedCacheFile("/cache/Abc123XYZ0000000abcd.jpg")).toBe(true);
+  });
+
+  it("never matches unpublished local captures (underscore names)", () => {
+    expect(isSyncedCacheFile("/cache/shot_1700000000000.png")).toBe(false);
+    expect(isSyncedCacheFile("/cache/screenshot_42.png")).toBe(false);
+    expect(isSyncedCacheFile("/cache/syncshot_1.png")).toBe(false);
+    expect(isSyncedCacheFile("/cache/region_9.png")).toBe(false);
+    expect(isSyncedCacheFile("/cache/synced_1.png")).toBe(false);
+  });
+
+  it("rejects wrong-length ids", () => {
+    expect(isSyncedCacheFile("/cache/short.png")).toBe(false);
+    expect(isSyncedCacheFile("/cache/waytoolongid000000000000000.png")).toBe(false);
+  });
+});
+
+describe("isRecentScreenshot", () => {
+  const NOW = 1_700_000_100_000;
+  const MAX = 120_000;
+
+  it("true when the doc createdAt is within the window", () => {
+    setStore([makeDoc("FreshDoc000000000001", NOW - 10_000)]);
+    expect(isRecentScreenshot("/cache/FreshDoc000000000001.png", NOW, MAX)).toBe(true);
+  });
+
+  it("false when the doc createdAt is older than the window (backlog page-in)", () => {
+    setStore([makeDoc("OldDoc00000000000001", NOW - 3_600_000)]);
+    expect(isRecentScreenshot("/cache/OldDoc00000000000001.png", NOW, MAX)).toBe(false);
+  });
+
+  it("uses the shot_{ts} filename epoch for own captures", () => {
+    setStore([]);
+    expect(isRecentScreenshot(`/cache/shot_${NOW - 5_000}.png`, NOW, MAX)).toBe(true);
+    expect(isRecentScreenshot(`/cache/shot_${NOW - 300_000}.png`, NOW, MAX)).toBe(false);
+  });
+
+  it("treats an unresolvable file as recent (own edits/saves must keep today's behavior)", () => {
+    setStore([]);
+    expect(isRecentScreenshot("/cache/syncshot_99.png", NOW, MAX)).toBe(true);
   });
 });
 

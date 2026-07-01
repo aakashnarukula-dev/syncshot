@@ -15,7 +15,7 @@ import { registerRenameCapturePath, useScreenshots, useSyncStore } from "@/store
 // Firebase-FREE column ordering (own module so the heavy Firebase SDK stays off
 // this startup-critical path): order the edge column by each screenshot's true
 // creation time, not file mtime.
-import { orderScreenshotsByCreatedAt } from "@/lib/sync/order";
+import { isRecentScreenshot, orderScreenshotsByCreatedAt } from "@/lib/sync/order";
 // Startup-critical: static import so it ships in the entry chunk and never
 // needs a runtime protocol fetch that can stall behind the launch IPC burst.
 import { ScreenshotThumbnail } from "./components/ScreenshotThumbnail";
@@ -941,8 +941,16 @@ function MainApp() {
 
         if (next.length > 0) {
           setMode("thumbnail");
-          // New file arrived (or first hydration) — surface the window.
-          if (hasNew) {
+          // Only a genuinely FRESH arrival (created within the window below)
+          // gets the full reaction: clipboard copy + toast + surface the rail.
+          // A BACKLOG page-in of old synced shots (post-sign-in catch-up
+          // downloads land a few files per poll tick) must update the list
+          // silently — reacting per tick re-copied the user's clipboard,
+          // re-surfaced the window and re-toasted every 2.5s for minutes.
+          const FRESH_MS = 120_000;
+          const newestIsFresh =
+            hasNew && isRecentScreenshot(newOnes[0], Date.now(), FRESH_MS);
+          if (hasNew && (isHydration || newestIsFresh)) {
             // Copy the newest synced-in screenshot to this Mac's clipboard,
             // mirroring local-capture behavior and the user's auto-copy
             // setting — but not for pre-existing files on hydration.
@@ -957,6 +965,14 @@ function MainApp() {
             setIsCollapsed(false);
             await openThumbnailWindow(next.length);
             startAutoHide();
+          } else if (hasNew && !isCollapsedRef.current && columnViewRef.current === "screenshots") {
+            // Stale adds while the screenshots column is expanded: just refit
+            // the window height to the new count — no reveal/copy/toast churn.
+            try {
+              if (await getCurrentWindow().isVisible()) {
+                await resizeThumbWindowKeepingBottom(next.length);
+              }
+            } catch {}
           }
         }
       } catch {

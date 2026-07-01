@@ -211,6 +211,59 @@ pub fn save_base64_image_to_path(image_data: &str, file_path: &str) -> AppResult
 /// the same source never write to the same file.
 static THUMB_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// Cap on SIMULTANEOUS thumbnail generations. Each generation decodes a
+/// full-res screenshot (a retina PNG expands to ~60–130MB of bitmap), and
+/// tokio's blocking pool happily runs hundreds of spawn_blocking tasks at
+/// once — so a cold-cache column open plus a fast scroll used to fire dozens
+/// of full-res decodes concurrently: the memory/CPU storm behind the app (and
+/// whole-system) hangs. Cache hits never take a slot.
+const MAX_CONCURRENT_THUMB_DECODES: u32 = 3;
+
+static THUMB_DECODE_SLOTS: std::sync::Mutex<u32> = std::sync::Mutex::new(0);
+static THUMB_DECODE_CVAR: std::sync::Condvar = std::sync::Condvar::new();
+
+/// RAII permit for one thumbnail decode; blocks until a slot frees up.
+/// Blocking is fine here — callers already run on the blocking thread pool.
+struct ThumbDecodeSlot;
+
+impl ThumbDecodeSlot {
+    fn acquire() -> Self {
+        let mut in_flight = THUMB_DECODE_SLOTS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while *in_flight >= MAX_CONCURRENT_THUMB_DECODES {
+            in_flight = THUMB_DECODE_CVAR
+                .wait(in_flight)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        *in_flight += 1;
+        ThumbDecodeSlot
+    }
+}
+
+impl Drop for ThumbDecodeSlot {
+    fn drop(&mut self) {
+        let mut in_flight = THUMB_DECODE_SLOTS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *in_flight = in_flight.saturating_sub(1);
+        drop(in_flight);
+        THUMB_DECODE_CVAR.notify_one();
+    }
+}
+
+/// Where cached thumbnails live: a PERSISTENT cache dir (~/Library/Caches on
+/// macOS), not the temp dir. macOS purges TMPDIR periodically, and every purge
+/// meant the next column open regenerated the whole library's thumbnails — a
+/// recurring cold-cache decode storm. Falls back to the temp dir only when no
+/// cache dir can be resolved.
+fn thumbnail_cache_dir() -> PathBuf {
+    dirs::cache_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("com.aakashnarukula.syncshot")
+        .join("thumbnails")
+}
+
 /// Return the path to a cached, downscaled thumbnail of the screenshot at
 /// `source_path` (longest side ≈ `max_px`). The cache key covers the source
 /// path, its mtime and size, so an edited/replaced file regenerates while an
@@ -234,9 +287,18 @@ pub fn screenshot_thumbnail(source_path: &str, max_px: u32) -> AppResult<String>
     max_px.hash(&mut hasher);
     let key = hasher.finish();
 
-    let cache_dir = std::env::temp_dir().join("syncshot-thumbnails");
+    let cache_dir = thumbnail_cache_dir();
     ensure_dir(&cache_dir)?;
     let thumb_path = cache_dir.join(format!("thumb-{:016x}.png", key));
+    if thumb_path.exists() {
+        return Ok(thumb_path.to_string_lossy().into_owned());
+    }
+
+    // Bound concurrent full-res decodes (see MAX_CONCURRENT_THUMB_DECODES) and
+    // re-check the cache after the wait: a sibling call for the same file may
+    // have just generated it, and skipping the duplicate decode matters when a
+    // burst of tiles requests the same fresh capture.
+    let _slot = ThumbDecodeSlot::acquire();
     if thumb_path.exists() {
         return Ok(thumb_path.to_string_lossy().into_owned());
     }
@@ -433,6 +495,82 @@ mod tests {
             assert_eq!(detect_image_kind(b""), None);
             // A different ftyp brand (e.g. mp4) is not HEIF.
             assert_eq!(detect_image_kind(b"\x00\x00\x00\x18ftypmp42"), None);
+        }
+    }
+
+    mod thumbnails {
+        use super::*;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+
+        #[test]
+        fn cache_dir_is_persistent_not_tmp() {
+            let dir = thumbnail_cache_dir();
+            let s = dir.to_string_lossy();
+            assert!(
+                s.ends_with("com.aakashnarukula.syncshot/thumbnails"),
+                "got: {s}"
+            );
+            // On macOS this must resolve to ~/Library/Caches, never the
+            // periodically-purged TMPDIR (purge = recurring decode storm).
+            #[cfg(target_os = "macos")]
+            assert!(s.contains("/Library/Caches/"), "got: {s}");
+        }
+
+        #[test]
+        fn decode_slots_bound_concurrency() {
+            let live = Arc::new(AtomicU32::new(0));
+            let peak = Arc::new(AtomicU32::new(0));
+            let handles: Vec<_> = (0..16)
+                .map(|_| {
+                    let live = live.clone();
+                    let peak = peak.clone();
+                    std::thread::spawn(move || {
+                        let _slot = ThumbDecodeSlot::acquire();
+                        let now = live.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(now, Ordering::SeqCst);
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        live.fetch_sub(1, Ordering::SeqCst);
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.join().unwrap();
+            }
+            assert!(
+                peak.load(Ordering::SeqCst) <= MAX_CONCURRENT_THUMB_DECODES,
+                "peak {} exceeded cap {}",
+                peak.load(Ordering::SeqCst),
+                MAX_CONCURRENT_THUMB_DECODES
+            );
+        }
+
+        #[test]
+        fn thumbnail_bytes_downscale_and_cache() {
+            // Source: a 64x48 PNG written to a temp file.
+            let dir = std::env::temp_dir().join(format!(
+                "syncshot_thumb_test_{}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let src = dir.join("src.png");
+            let img = DynamicImage::new_rgba8(64, 48);
+            img.save(&src).unwrap();
+            let src_str = src.to_string_lossy().into_owned();
+
+            let bytes = screenshot_thumbnail_bytes(&src_str, 32).expect("thumbnail bytes");
+            assert!(!bytes.is_empty());
+            let thumb = image::load_from_memory(&bytes).expect("decodable png");
+            assert!(thumb.width() <= 32 && thumb.height() <= 32);
+
+            // Second call must serve the SAME cached file (path is key-stable).
+            let p1 = screenshot_thumbnail(&src_str, 32).unwrap();
+            let p2 = screenshot_thumbnail(&src_str, 32).unwrap();
+            assert_eq!(p1, p2);
+            assert!(std::path::Path::new(&p1).exists());
+
+            let _ = std::fs::remove_file(std::path::Path::new(&p1));
+            let _ = std::fs::remove_dir_all(&dir);
         }
     }
 
