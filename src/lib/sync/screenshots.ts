@@ -34,10 +34,11 @@ import { renameCapturePath, useSyncStore } from "@/stores/syncStore";
 import { isSyncedCacheFile } from "./order";
 import { db, storage } from "./firebase";
 import { sha256Hex } from "./hash";
+import { makeThumb } from "./thumbs";
+import { createDownloadUrlCache } from "./downloadUrlCache";
+import { createBackfillLedger, type FileStat } from "./backfillLedger";
 import {
   SCREENSHOTS_PAGE_SIZE,
-  THUMB_MAX_EDGE,
-  THUMB_WEBP_QUALITY,
   type DeviceRef,
   type ScreenshotDoc,
 } from "./types";
@@ -176,47 +177,21 @@ export function subscribeScreenshots(
   };
 }
 
-function blobToImage(blob: Blob): Promise<HTMLImageElement> {
-  return new Promise((resolve, reject) => {
-    const url = URL.createObjectURL(blob);
-    const img = new Image();
-    img.onload = () => {
-      URL.revokeObjectURL(url);
-      resolve(img);
-    };
-    img.onerror = () => {
-      URL.revokeObjectURL(url);
-      reject(new Error("Failed to decode screenshot image"));
-    };
-    img.src = url;
-  });
-}
-
-async function makeThumb(
-  blob: Blob,
-): Promise<{ width: number; height: number; thumb: Blob }> {
-  const img = await blobToImage(blob);
-  const width = img.naturalWidth;
-  const height = img.naturalHeight;
-  const ratio = Math.min(THUMB_MAX_EDGE / width, THUMB_MAX_EDGE / height, 1);
-  const w = Math.max(1, Math.round(width * ratio));
-  const h = Math.max(1, Math.round(height * ratio));
-  const canvas = document.createElement("canvas");
-  canvas.width = w;
-  canvas.height = h;
-  const ctx = canvas.getContext("2d");
-  if (!ctx) throw new Error("2D canvas context unavailable");
-  ctx.imageSmoothingEnabled = true;
-  ctx.imageSmoothingQuality = "high";
-  ctx.drawImage(img, 0, 0, w, h);
-  const thumb = await new Promise<Blob>((resolve, reject) => {
-    canvas.toBlob(
-      (b) => (b ? resolve(b) : reject(new Error("WebP thumbnail encode failed"))),
-      "image/webp",
-      THUMB_WEBP_QUALITY,
-    );
-  });
-  return { width, height, thumb };
+/**
+ * Try to stat a local file (mtime+size) for the backfill ledger. The Rust
+ * `stat_file` command may not exist yet — an "unknown command" error disables
+ * further probes for this session; any other error just means "no stat for
+ * this file". The ledger degrades gracefully to path-only keying either way.
+ */
+let statUnavailable = false;
+async function statLocalFile(path: string): Promise<FileStat | null> {
+  if (statUnavailable) return null;
+  try {
+    return await invoke<FileStat>("stat_file", { path });
+  } catch (err) {
+    if (/not found|not allowed|unknown/i.test(String(err))) statUnavailable = true;
+    return null;
+  }
 }
 
 /**
@@ -243,7 +218,8 @@ async function makeThumb(
 async function adoptDocIdFilename(path: string, docId: string): Promise<string> {
   let newPath = path;
   try {
-    newPath = await invoke<string>("rename_screenshot_to_doc_id", { path, docId });
+    const renamed = await invoke<string>("rename_screenshot_to_doc_id", { path, docId });
+    newPath = typeof renamed === "string" && renamed ? renamed : path;
   } catch (err) {
     console.error("adopt doc-id cache filename failed:", path, err);
     newPath = path;
@@ -253,15 +229,22 @@ async function adoptDocIdFilename(path: string, docId: string): Promise<string> 
   return newPath;
 }
 
-/**
- * Publish a locally-captured screenshot file at `path` to the library.
- * No-op (returns false) if an identical image (same sha256) already exists.
- */
-export async function publishScreenshot(
+/** What a publish attempt resolved to — used by backfill to feed its ledger. */
+interface PublishOutcome {
+  /** True when a NEW doc was created (false = sha256 dupe no-op). */
+  published: boolean;
+  /** The backing cloud doc id (new or pre-existing dupe). */
+  docId: string;
+  sha256: string;
+  /** The file's path AFTER the doc-id rename (== input path if rename failed). */
+  finalPath: string;
+}
+
+async function publishScreenshotDetailed(
   uid: string,
   device: DeviceRef,
   path: string,
-): Promise<boolean> {
+): Promise<PublishOutcome> {
   const buf = await readLocalBytes(path);
   const blob = new Blob([buf]);
   const sha256 = await sha256Hex(buf);
@@ -274,8 +257,8 @@ export async function publishScreenshot(
     // Already synced (e.g. backfill re-run): adopt the doc-id cache filename so
     // this own capture resolves its cloud copy by filename, exactly like a
     // received shot (and swap the column path to the renamed file).
-    await adoptDocIdFilename(path, dupes.docs[0].id);
-    return false;
+    const finalPath = await adoptDocIdFilename(path, dupes.docs[0].id);
+    return { published: false, docId: dupes.docs[0].id, sha256, finalPath };
   }
 
   const { width, height, thumb } = await makeThumb(blob);
@@ -321,9 +304,21 @@ export async function publishScreenshot(
   // RECEIVED_CACHE_ID and so becomes subject to reconcileLocalCache — renaming
   // before the doc exists on the server could let a reconcile snapshot whose
   // keep-set lacks this fresh id delete the just-captured file.
-  await adoptDocIdFilename(path, id);
+  const finalPath = await adoptDocIdFilename(path, id);
 
-  return true;
+  return { published: true, docId: id, sha256, finalPath };
+}
+
+/**
+ * Publish a locally-captured screenshot file at `path` to the library.
+ * No-op (returns false) if an identical image (same sha256) already exists.
+ */
+export async function publishScreenshot(
+  uid: string,
+  device: DeviceRef,
+  path: string,
+): Promise<boolean> {
+  return (await publishScreenshotDetailed(uid, device, path)).published;
 }
 
 /**
@@ -356,7 +351,7 @@ export async function shareScreenshotLink(
     useSyncStore.getState().mapLocalCapture(path, existing.id);
     const data = existing.data();
     if (data.fullPath) {
-      return getDownloadURL(ref(storage, data.fullPath as string));
+      return downloadUrls.get(data.fullPath as string);
     }
     const fullRef = ref(
       storage,
@@ -368,7 +363,7 @@ export async function shareScreenshotLink(
       fullPath: fullRef.fullPath,
       bytes: blob.size,
     });
-    return getDownloadURL(fullRef);
+    return downloadUrls.get(fullRef.fullPath);
   }
 
   // Not synced yet: full publish (mirrors publishScreenshot's thumb-first path).
@@ -403,7 +398,7 @@ export async function shareScreenshotLink(
     bytes: blob.size,
   });
 
-  return getDownloadURL(fullRef);
+  return downloadUrls.get(fullRef.fullPath);
 }
 
 /** Image extensions the cache / save / paste path recognizes (lowercase, no
@@ -467,12 +462,26 @@ export async function saveReceivedScreenshot(
   item: ScreenshotDoc,
 ): Promise<string> {
   if (!item.fullPath) throw new Error("Screenshot has no full image yet");
-  const url = await getDownloadURL(ref(storage, item.fullPath));
-  return invoke<string>("download_synced_image", {
-    url,
-    name: receivedCacheName(item),
-  });
+  const url = await downloadUrls.get(item.fullPath);
+  try {
+    return await invoke<string>("download_synced_image", {
+      url,
+      name: receivedCacheName(item),
+    });
+  } catch (err) {
+    // The cached URL may be stale (object replaced/revoked) — drop it so the
+    // caller's retry resolves a fresh one.
+    downloadUrls.invalidate(item.fullPath);
+    throw err;
+  }
 }
+
+/**
+ * Module-level download-URL cache: tokenized URLs are long-lived capabilities,
+ * so N tiles resolving the same Storage path within an hour cost ONE RPC
+ * total (in-flight dedup included) instead of one per tile per mount.
+ */
+const downloadUrls = createDownloadUrlCache((p) => getDownloadURL(ref(storage, p)));
 
 /**
  * Resolve a tokenized download URL for a Storage object (thumb or full image).
@@ -480,9 +489,16 @@ export async function saveReceivedScreenshot(
  * so the URL renders directly in an `<img src>` with NO bucket-CORS config —
  * unlike getBytes()/getBlob(), whose cross-origin XHR the bucket blocks without
  * CORS. The webview's CSP img-src must allow firebasestorage.googleapis.com.
+ *
+ * Cached (~1h TTL + in-flight dedup) — call freely per tile render.
  */
 export async function storageDownloadUrl(storagePath: string): Promise<string> {
-  return getDownloadURL(ref(storage, storagePath));
+  return downloadUrls.get(storagePath);
+}
+
+/** Drop a cached download URL (e.g. after a consumer's <img> load 404'd). */
+export function invalidateStorageDownloadUrl(storagePath: string): void {
+  downloadUrls.invalidate(storagePath);
 }
 
 /**
@@ -585,14 +601,40 @@ export async function backfillScreenshots(
   allPaths: string[],
   concurrency = 3,
 ): Promise<number> {
-  const paths = allPaths.filter((p) => !isSyncedCacheFile(p));
+  const candidates = allPaths.filter((p) => !isSyncedCacheFile(p));
+  if (candidates.length === 0) return 0;
+
+  // LEDGER: a file that keeps a non-doc-id name after publish (rename failed,
+  // legacy editor saves) used to re-pay the full byte read + sha256 + dupe
+  // query EVERY launch. The persisted ledger (path → docId, validated against
+  // mtime+size when a stat is available) makes each file hash at most once.
+  const ledger = createBackfillLedger(uid);
+  ledger.prune(candidates);
+  const paths: string[] = [];
+  for (const path of candidates) {
+    const stat = await statLocalFile(path);
+    if (ledger.get(path, stat)) continue; // already published, unchanged
+    paths.push(path);
+  }
+
   let published = 0;
   let next = 0;
   async function worker(): Promise<void> {
     while (next < paths.length) {
       const path = paths[next++];
       try {
-        if (await publishScreenshot(uid, device, path)) published++;
+        const outcome = await publishScreenshotDetailed(uid, device, path);
+        if (outcome.published) published++;
+        // Only files that KEEP a non-doc-id name need a ledger entry — a
+        // renamed `{docId}.<ext>` file is already skipped by isSyncedCacheFile.
+        if (!isSyncedCacheFile(outcome.finalPath)) {
+          const stat = await statLocalFile(outcome.finalPath);
+          ledger.put(outcome.finalPath, {
+            docId: outcome.docId,
+            sha256: outcome.sha256,
+            ...(stat ?? {}),
+          });
+        }
       } catch (err) {
         console.error("backfill publish failed:", path, err);
       }
@@ -600,6 +642,7 @@ export async function backfillScreenshots(
   }
   const workers = Math.max(1, Math.min(concurrency, paths.length));
   await Promise.all(Array.from({ length: workers }, () => worker()));
+  ledger.flush();
   return published;
 }
 
@@ -622,6 +665,7 @@ async function deleteDocAndBlobs(
   ]);
   if (thumbPath) blobPaths.add(thumbPath);
   if (fullPath) blobPaths.add(fullPath);
+  for (const p of blobPaths) downloadUrls.invalidate(p);
   await Promise.all(
     [...blobPaths].map((p) => deleteObject(ref(storage, p)).catch(() => {})),
   );

@@ -244,7 +244,20 @@ describe("reconcileLocalCache", () => {
 });
 
 describe("backfillScreenshots", () => {
+  // The vitest environment's global localStorage is Node's method-less
+  // experimental stub, so the ledger sees "no storage" by default. Stub a
+  // working fake so ledger persistence across backfill runs is exercised.
+  beforeEach(() => {
+    const data = new Map<string, string>();
+    vi.stubGlobal("localStorage", {
+      getItem: (k: string) => data.get(k) ?? null,
+      setItem: (k: string, v: string) => void data.set(k, v),
+      removeItem: (k: string) => void data.delete(k),
+    });
+  });
+
   afterEach(() => {
+    vi.unstubAllGlobals();
     refMock.mockImplementation((_s: unknown, path: string) => ({ fullPath: path }));
   });
 
@@ -275,5 +288,27 @@ describe("backfillScreenshots", () => {
     const published = await backfillScreenshots(UID, DEVICE, []);
     expect(published).toBe(0);
     expect(getDocs).not.toHaveBeenCalled();
+  });
+
+  it("consults the persisted ledger: a file hashed once is never re-read on a later run", async () => {
+    invokeMock.mockImplementation((cmd: string) =>
+      cmd === "read_image_bytes"
+        ? Promise.resolve(new ArrayBuffer(4))
+        : Promise.resolve(undefined),
+    );
+    sha256Hex.mockResolvedValue("dupe-sha");
+    getDocs.mockResolvedValue({ empty: false, docs: [{ id: "exists" }] });
+
+    // First run pays the read+hash+dupe-query for the file…
+    await backfillScreenshots(UID, DEVICE, ["/cache/legacy_1.png"]);
+    expect(getDocs).toHaveBeenCalledTimes(1);
+    const bytesReads = () =>
+      invokeMock.mock.calls.filter((c) => c[0] === "read_image_bytes").length;
+    expect(bytesReads()).toBe(1);
+
+    // …a second run (next launch) hits the ledger and never touches the file.
+    await backfillScreenshots(UID, DEVICE, ["/cache/legacy_1.png"]);
+    expect(getDocs).toHaveBeenCalledTimes(1);
+    expect(bytesReads()).toBe(1);
   });
 });
