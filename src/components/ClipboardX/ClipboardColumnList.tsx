@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { memo, useState } from "react";
 import { toast } from "sonner";
 import { Check, Pin, PinOff, Trash2 } from "lucide-react";
 import {
@@ -11,12 +11,21 @@ import type { ClipboardDoc } from "@/lib/sync/types";
 import { cn } from "@/lib/utils";
 import { relativeTime } from "./ClipboardEntry";
 
+// Cards rendered up front / added per near-bottom scroll. Card heights vary
+// (1-4 clamped text lines) so this list windows by capping + growing rather
+// than fixed-stride virtualization — 40 text cards are cheap; 200 at once on
+// every toggle were not.
+const RENDER_CHUNK = 40;
+// Grow when the user scrolls within this many px of the rendered bottom.
+const GROW_MARGIN_PX = 600;
+
 // Compact copied-text cards for the 240px edge column. This module pulls in
 // lib/sync/clipboard (→ Firebase), so it must only ever be loaded lazily from
 // the column — never statically from the launch-critical chunk.
 export function ClipboardColumnList() {
   const entries = useClipboardEntries();
   const uid = useUid();
+  const [renderCount, setRenderCount] = useState(RENDER_CHUNK);
 
   if (entries.length === 0) {
     return (
@@ -31,19 +40,23 @@ export function ClipboardColumnList() {
     );
   }
 
+  const visible = entries.length > renderCount ? entries.slice(0, renderCount) : entries;
+
+  const maybeGrow = (el: HTMLElement) => {
+    if (renderCount >= entries.length) return;
+    if (el.scrollTop + el.clientHeight >= el.scrollHeight - GROW_MARGIN_PX) {
+      setRenderCount((n) => Math.min(entries.length, n + RENDER_CHUNK));
+    }
+  };
+
   return (
     <ul
       data-thumb-scroll
+      onScroll={(e) => maybeGrow(e.currentTarget)}
       className="flex-1 min-w-0 overflow-y-auto pt-1 pb-4 pr-3 pl-1 flex flex-col gap-2 items-stretch [&::-webkit-scrollbar]:hidden [-ms-overflow-style:none] [scrollbar-width:none]"
-      style={{
-        background: "transparent",
-        maskImage:
-          "linear-gradient(to bottom, transparent 0, black 4px, black calc(100% - 6px), transparent 100%)",
-        WebkitMaskImage:
-          "linear-gradient(to bottom, transparent 0, black 4px, black calc(100% - 6px), transparent 100%)",
-      }}
+      style={{ background: "transparent" }}
     >
-      {entries.map((entry) => (
+      {visible.map((entry) => (
         <ClipCard key={entry.id} uid={uid} entry={entry} />
       ))}
     </ul>
@@ -55,7 +68,10 @@ interface ClipCardProps {
   entry: ClipboardDoc;
 }
 
-function ClipCard({ uid, entry }: ClipCardProps) {
+// Memoized: every Firestore clipboard snapshot re-renders the list, and
+// without memo all rendered cards re-rendered with it. Props are stable per
+// entry (uid string + the entry doc object, replaced only when it changes).
+const ClipCard = memo(function ClipCard({ uid, entry }: ClipCardProps) {
   const [copied, setCopied] = useState(false);
   const [busy, setBusy] = useState(false);
 
@@ -124,6 +140,8 @@ function ClipCard({ uid, entry }: ClipCardProps) {
         </p>
       </button>
 
+      {/* Solid scrim, not backdrop-blur: two always-composited blur layers per
+          card on the transparent NSWindow were pure WindowServer tax. */}
       <div className="absolute top-1.5 right-1.5 flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
         <button
           type="button"
@@ -131,7 +149,7 @@ function ClipCard({ uid, entry }: ClipCardProps) {
           aria-label={entry.pinned ? "Unpin entry" : "Pin entry"}
           aria-pressed={entry.pinned}
           className={cn(
-            "flex size-5 items-center justify-center rounded bg-black/55 backdrop-blur-sm cursor-pointer",
+            "flex size-5 items-center justify-center rounded bg-black/70 cursor-pointer",
             entry.pinned ? "text-white" : "text-white/60 hover:text-white",
           )}
         >
@@ -145,11 +163,11 @@ function ClipCard({ uid, entry }: ClipCardProps) {
           type="button"
           onClick={remove}
           aria-label="Delete entry"
-          className="flex size-5 items-center justify-center rounded bg-black/55 backdrop-blur-sm text-white/60 hover:bg-red-600/90 hover:text-white cursor-pointer"
+          className="flex size-5 items-center justify-center rounded bg-black/70 text-white/60 hover:bg-red-600/90 hover:text-white cursor-pointer"
         >
           <Trash2 className="size-3" aria-hidden="true" />
         </button>
       </div>
     </li>
   );
-}
+});
