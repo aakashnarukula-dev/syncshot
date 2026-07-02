@@ -259,6 +259,7 @@ async fn embedded_auth(app: tauri::AppHandle) -> Result<String, String> {
         .resizable(true)
         .center()
         .focused(true)
+        .accept_first_mouse(true)
         .on_navigation(move |target| {
             // The hosted page completes by navigating to the loopback callback.
             // Catch it, lift the token, and CANCEL the navigation so the http

@@ -365,6 +365,7 @@ pub fn build_editor_window(
     .center()
     .visible(visible)
     .focused(visible)
+    .accept_first_mouse(true)
     .build()
     .map_err(|e| format!("Failed to open editor window: {}", e))
 }

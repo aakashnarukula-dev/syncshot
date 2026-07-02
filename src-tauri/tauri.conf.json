@@ -23,7 +23,8 @@
         "alwaysOnTop": false,
         "center": true,
         "resizable": true,
-        "visible": false
+        "visible": false,
+        "acceptFirstMouse": true
       }
     ],
     "security": {
