@@ -538,9 +538,34 @@ mod cg_thumb {
     type CGImageRef = *const c_void;
     type CGImageSourceRef = *const c_void;
     type CGImageDestinationRef = *const c_void;
+    type CGColorSpaceRef = *const c_void;
+    type CGContextRef = *const c_void;
 
     const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
     const K_CF_NUMBER_SINT32_TYPE: CFIndex = 3;
+
+    /// RGBA8, alpha premultiplied in the last byte — a single fixed pixel format
+    /// for the normalization context (see `normalize_srgb8`).
+    const K_CG_IMAGE_ALPHA_PREMULTIPLIED_LAST: u32 = 1;
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct CGPoint {
+        x: f64,
+        y: f64,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct CGSize {
+        width: f64,
+        height: f64,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct CGRect {
+        origin: CGPoint,
+        size: CGSize,
+    }
 
     /// Opaque callback tables — only their ADDRESSES are passed to
     /// CFDictionaryCreate.
@@ -607,6 +632,77 @@ mod cg_thumb {
             properties: CFDictionaryRef,
         );
         fn CGImageDestinationFinalize(dest: CGImageDestinationRef) -> Boolean;
+    }
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        static kCGColorSpaceSRGB: CFStringRef;
+        fn CGColorSpaceCreateWithName(name: CFStringRef) -> CGColorSpaceRef;
+        fn CGColorSpaceCreateDeviceRGB() -> CGColorSpaceRef;
+        fn CGImageGetWidth(image: CGImageRef) -> usize;
+        fn CGImageGetHeight(image: CGImageRef) -> usize;
+        fn CGBitmapContextCreate(
+            data: *mut c_void,
+            width: usize,
+            height: usize,
+            bits_per_component: usize,
+            bytes_per_row: usize,
+            space: CGColorSpaceRef,
+            bitmap_info: u32,
+        ) -> CGContextRef;
+        fn CGBitmapContextCreateImage(ctx: CGContextRef) -> CGImageRef;
+        fn CGContextDrawImage(ctx: CGContextRef, rect: CGRect, image: CGImageRef);
+    }
+
+    /// Redraw `image` into a fresh 8-bit sRGB, premultiplied-RGBA bitmap and
+    /// return the resulting CGImage. ImageIO's thumbnail decoder hands back a
+    /// CGImage in whatever native layout the SOURCE dictates — a phone JPEG/HEIC
+    /// is commonly wide-gamut (Display P3) or deep-color with a padded
+    /// `bytesPerRow` and a non-`AlphaLast` `bitmapInfo`. Feeding that straight to
+    /// the PNG `CGImageDestination` is what streaked mobile-origin thumbnails
+    /// with horizontal banding (a Mac PNG capture is already 8-bit sRGB, so it
+    /// never tripped this). Drawing through a CG bitmap context (which owns its
+    /// own correctly-aligned stride, `bytesPerRow = 0`) collapses every input to
+    /// one canonical, web-safe pixel format before the encode.
+    unsafe fn normalize_srgb8(image: CGImageRef) -> Result<CF, String> {
+        let width = CGImageGetWidth(image);
+        let height = CGImageGetHeight(image);
+        if width == 0 || height == 0 {
+            return Err("thumbnail CGImage has zero dimension".to_string());
+        }
+
+        let mut space = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+        if space.is_null() {
+            space = CGColorSpaceCreateDeviceRGB();
+        }
+        let space = CF::new(space, "CGColorSpace(sRGB)")?;
+
+        let ctx = CF::new(
+            CGBitmapContextCreate(
+                std::ptr::null_mut(),
+                width,
+                height,
+                8,
+                0,
+                space.0,
+                K_CG_IMAGE_ALPHA_PREMULTIPLIED_LAST,
+            ),
+            "CGBitmapContextCreate",
+        )?;
+
+        CGContextDrawImage(
+            ctx.0,
+            CGRect {
+                origin: CGPoint { x: 0.0, y: 0.0 },
+                size: CGSize {
+                    width: width as f64,
+                    height: height as f64,
+                },
+            },
+            image,
+        );
+
+        CF::new(CGBitmapContextCreateImage(ctx.0), "CGBitmapContextCreateImage")
     }
 
     /// Owned CF object released on drop. Never wrap the extern constants.
@@ -683,6 +779,11 @@ mod cg_thumb {
                 CGImageSourceCreateThumbnailAtIndex(image_source.0, 0, options.0),
                 "CGImageSourceCreateThumbnailAtIndex",
             )?;
+
+            // Flatten the decoder's native layout (wide-gamut / deep-color /
+            // padded stride for mobile JPEG/HEIC) to canonical sRGB8 before the
+            // PNG encode — otherwise those inputs stripe with horizontal bands.
+            let thumb = normalize_srgb8(thumb.0)?;
 
             let png_type = CF::new(
                 CFStringCreateWithCString(
@@ -1017,6 +1118,35 @@ mod tests {
 
             let _ = std::fs::remove_file(std::path::Path::new(&a_thumb));
             let _ = std::fs::remove_file(&b_thumb);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn jpeg_source_thumbnail_is_clean_rgba() {
+            // A JPEG source exercises the CGImageSource decode → sRGB8
+            // normalization → PNG encode path (mobile shots are JPEG/HEIC, and
+            // it was those that streaked). The thumbnail must decode back to a
+            // sane, bounded, opaque image.
+            let dir = std::env::temp_dir()
+                .join(format!("syncshot_jpeg_thumb_test_{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let src = dir.join("src.jpg");
+            let mut img = image::RgbImage::new(200, 120);
+            for (x, y, px) in img.enumerate_pixels_mut() {
+                *px = image::Rgb([(x % 256) as u8, (y % 256) as u8, 128]);
+            }
+            DynamicImage::ImageRgb8(img)
+                .save_with_format(&src, image::ImageFormat::Jpeg)
+                .expect("write jpeg");
+
+            let bytes = screenshot_thumbnail_bytes(&src.to_string_lossy(), 64)
+                .expect("jpeg thumbnail bytes");
+            let thumb = image::load_from_memory(&bytes).expect("decodable png");
+            assert!(thumb.width() <= 64 && thumb.height() <= 64);
+            assert!(thumb.width() > 0 && thumb.height() > 0);
+
+            let p = thumb_cache_path(&src.to_string_lossy(), 64).unwrap().0;
+            let _ = std::fs::remove_file(&p);
             let _ = std::fs::remove_dir_all(&dir);
         }
 
