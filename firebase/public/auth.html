@@ -162,6 +162,25 @@
       const cbPort = params.get("cb_port");
       const state = params.get("state");
 
+      // --- Dev-only reCAPTCHA bypass ------------------------------------------
+      // Firebase Web phone-auth ALWAYS runs reCAPTCHA client-side (the verifier's
+      // .verify()) BEFORE the backend learns whether a number is a console-
+      // whitelisted "test" number — so test numbers still get the image
+      // challenge. Setting `appVerificationDisabledForTesting = true` makes the
+      // verifier resolve WITHOUT a challenge. The Auth backend only honors that
+      // fake token for numbers registered under Authentication → Sign-in method →
+      // Phone → "Phone numbers for testing"; any REAL number is still rejected
+      // and forced through full reCAPTCHA + a real SMS. So this can never let a
+      // bot sign in as a real user. Enabled ONLY for the allow-listed fictional
+      // numbers below, or when the page is opened with ?test=1.
+      //
+      // SECURITY: this hosting page is PUBLIC. Anyone who knows a test number can
+      // sign in as that fictional account (fixed code, no SMS, no captcha). Keep
+      // these as throwaway dev accounts and REMOVE them from the Firebase console
+      // (and this list) before a real launch. Real users are unaffected.
+      const TEST_NUMBERS = new Set(["9177216132", "9876543210"]);
+      const forceTest = params.get("test") === "1";
+
       const $ = (id) => document.getElementById(id);
       const msg = $("msg");
       const setMsg = (text, kind = "") => {
@@ -199,6 +218,10 @@
         $("send").disabled = true;
         setMsg("Sending code…");
         try {
+          // Skip reCAPTCHA ONLY for whitelisted fictional test numbers (or ?test=1);
+          // real numbers always run full app verification + a real SMS.
+          auth.settings.appVerificationDisabledForTesting =
+            forceTest || TEST_NUMBERS.has(phone);
           verifier?.clear();
           verifier = new RecaptchaVerifier(auth, "recaptcha", { size: "invisible" });
           confirmation = await signInWithPhoneNumber(auth, "+91" + phone, verifier);
