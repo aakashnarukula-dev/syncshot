@@ -2,6 +2,53 @@
 
 Open-source CleanShot X alternative for macOS. Capture → edit (backgrounds/effects/annotations) → export. Local + lightweight. Tauri 2 (Rust) + React 19.
 
+## Installing on a fresh Mac — "clone and install the app" (READ FIRST)
+
+When the user says **"clone this repo and install the app"**, they mean: produce a
+**double-clickable `SyncShot.app` in `/Applications`** — NOT just `pnpm install`.
+`pnpm install` / `pnpm dev` only run the browser frontend; they do NOT create an app in
+`/Applications`. This is a Tauri desktop app, so it needs a native Rust build to bundle.
+
+### Environment gotchas (verified 2026-07)
+- **Clone with `gh`** — private repo; `git clone https://…` fails (no stored creds / no SSH
+  keys). Use `gh repo clone aakashnarukula-dev/syncshot`.
+- **Node 22 LTS for ALL pnpm/build work.** The system `node` may be too new (v26+) and
+  break the toolchain. Prepend `export PATH="/opt/homebrew/opt/node@22/bin:$PATH"`
+  (`brew install node@22`).
+- **pnpm via corepack** — not on PATH by default: `corepack prepare pnpm@10.28.0 --activate`.
+- **pnpm blocks build scripts** (esbuild, @firebase/util, protobufjs, tesseract.js).
+  Approve them — esbuild's native binary is load-bearing (`pnpm approve-builds`, or accept
+  when prompted).
+- **Rust is REQUIRED for the desktop build** and is often missing on a fresh Mac. Install:
+  `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y` then
+  `source "$HOME/.cargo/env"`. `pnpm dev` (browser-only) works without Rust; the `.app` does NOT.
+
+### Full install (copy-paste)
+```bash
+export PATH="/opt/homebrew/opt/node@22/bin:$PATH"
+cd ~/developer
+gh repo clone aakashnarukula-dev/syncshot
+cd syncshot
+corepack prepare pnpm@10.28.0 --activate
+corepack pnpm install
+command -v cargo >/dev/null || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y; }
+source "$HOME/.cargo/env"
+
+# --- build the /Applications app (native release build, ~2 min) ---
+corepack pnpm tauri build --bundles app   # → src-tauri/target/release/bundle/macos/SyncShot.app (Tauri ad-hoc signs it)
+cp -R "src-tauri/target/release/bundle/macos/SyncShot.app" /Applications/
+
+# --- make the icon render + register the app ---
+touch "/Applications/SyncShot.app"
+/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsregister -f "/Applications/SyncShot.app"
+killall Finder Dock 2>/dev/null || true
+```
+`--bundles app` skips the slower `.dmg` and just builds the `.app`. Tauri already ad-hoc
+signs it (`signingIdentity "-"`). First launch: right-click → **Open** (Gatekeeper, once).
+No secrets needed — Firebase uses committed public web-app defaults in
+`src/lib/sync/firebaseConfig.ts`. If the `/Applications` icon is blank, it's a Finder icon
+cache — the `lsregister` + `killall Finder Dock` above fixes it.
+
 ## Repo layout (monorepo, multiple projects)
 
 | Path | What | Stack |
