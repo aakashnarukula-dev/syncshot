@@ -264,11 +264,90 @@ export function ImageEditor({ imagePath }: ImageEditorProps) {
 
     let cancelled = false;
     let objectUrl: string | null = null;
+    let trimmedUrl: string | null = null;
     const img = new Image();
     img.decoding = "async";
     img.onload = async () => {
       if (cancelled) return;
-      setScreenshotImage(img);
+
+      // macOS WINDOW captures bake a wide fully-transparent margin (the
+      // drop-shadow area) around the opaque window. The editor renders on a
+      // black background, so that margin shows as black padding. Auto-trim it
+      // on open. Region/full-screen captures have no such margin (bbox == full
+      // image) and fall through unchanged. Done here so the trimmed image is
+      // the base everything downstream (preview, canvas, save/copy/crop/OCR)
+      // is relative to — no annotation math elsewhere needs to change.
+      let baseImg: HTMLImageElement = img;
+      try {
+        const w = img.naturalWidth;
+        const h = img.naturalHeight;
+        const trimCanvas = document.createElement("canvas");
+        trimCanvas.width = w;
+        trimCanvas.height = h;
+        const tctx = trimCanvas.getContext("2d");
+        if (tctx) {
+          tctx.drawImage(img, 0, 0);
+          // Throws (taints) only on the convertFileSrc crossOrigin fallback;
+          // the primary blob: path is same-origin and untainted.
+          const { data } = tctx.getImageData(0, 0, w, h);
+          // Bounding box of "content" (alpha >= 250 ~= opaque) pixels.
+          let top = -1, bottom = -1, left = w, right = -1;
+          for (let y = 0; y < h; y++) {
+            const rowStart = y * w * 4;
+            let rowHasContent = false;
+            for (let x = 0; x < w; x++) {
+              if (data[rowStart + x * 4 + 3] >= 250) {
+                rowHasContent = true;
+                if (x < left) left = x;
+                if (x > right) right = x;
+              }
+            }
+            if (rowHasContent) {
+              if (top === -1) top = y;
+              bottom = y;
+            }
+          }
+          const hasContent = top !== -1 && right !== -1;
+          const bx = left;
+          const by = top;
+          const bw = right - left + 1;
+          const bh = bottom - top + 1;
+          // Skip when fully transparent (no content) or when the bbox spans
+          // the whole image (no margin — the common region/full-screen case).
+          if (hasContent && !(bx === 0 && by === 0 && bw === w && bh === h)) {
+            const cropCanvas = document.createElement("canvas");
+            cropCanvas.width = bw;
+            cropCanvas.height = bh;
+            const cctx = cropCanvas.getContext("2d");
+            if (cctx) {
+              cctx.drawImage(img, bx, by, bw, bh, 0, 0, bw, bh);
+              const blob = await new Promise<Blob | null>((resolve) =>
+                cropCanvas.toBlob(resolve, "image/png"),
+              );
+              if (cancelled) return;
+              if (blob) {
+                trimmedUrl = URL.createObjectURL(blob);
+                const cropped = new Image();
+                cropped.decoding = "async";
+                await new Promise<void>((resolve, reject) => {
+                  cropped.onload = () => resolve();
+                  cropped.onerror = () => reject(new Error("cropped image load failed"));
+                  cropped.src = trimmedUrl as string;
+                });
+                if (cancelled) return;
+                baseImg = cropped;
+              }
+            }
+          }
+        }
+      } catch {
+        // getImageData tainted (crossOrigin fallback) or any trim failure —
+        // use the original image unchanged.
+        baseImg = img;
+      }
+
+      if (cancelled) return;
+      setScreenshotImage(baseImg);
       setImageLoaded(true);
 
       try {
@@ -284,9 +363,10 @@ export function ImageEditor({ imagePath }: ImageEditorProps) {
         const monLogH = (m?.size.height || 900) / scale;
         // Screenshot pixels are physical (a Retina capture is stored at the
         // display's device resolution); divide by the scale factor for the
-        // logical size the window is measured in.
-        const imgLogW = img.naturalWidth / scale;
-        const imgLogH = img.naturalHeight / scale;
+        // logical size the window is measured in. Use the TRIMMED image's
+        // dimensions so the window fits the visible content, not the margin.
+        const imgLogW = baseImg.naturalWidth / scale;
+        const imgLogH = baseImg.naturalHeight / scale;
         // Measure the real toolbar row instead of hardcoding — h-11 + a 1px
         // bottom border is 45px, but reading offsetHeight tracks any change.
         const toolbarH = toolbarRef.current?.offsetHeight || 45;
@@ -384,6 +464,7 @@ export function ImageEditor({ imagePath }: ImageEditorProps) {
       // The decoded HTMLImageElement keeps its bitmap after revoke; only a
       // fresh load of the dead URL would fail, which never happens here.
       if (objectUrl) URL.revokeObjectURL(objectUrl);
+      if (trimmedUrl) URL.revokeObjectURL(trimmedUrl);
     };
   }, [openReq]);
 

@@ -734,6 +734,11 @@ fn native_capture_blocking(save_dir: &str, mode_flag: &str) -> Result<String, St
     let child = Command::new("screencapture")
         .arg(mode_flag)
         .arg("-x")
+        // `-o`: in window-capture mode, omit the window's drop shadow. macOS bakes
+        // the shadow into a wide TRANSPARENT margin around the window, which the
+        // editor renders as unwanted black padding. Safe to always pass — it only
+        // affects window capture (no-op for interactive rectangle-region grabs).
+        .arg("-o")
         .arg(&path_str)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
