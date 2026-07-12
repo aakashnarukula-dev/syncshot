@@ -321,6 +321,62 @@ export function ImageEditor({ imagePath }: ImageEditorProps) {
             const cctx = cropCanvas.getContext("2d");
             if (cctx) {
               cctx.drawImage(img, bx, by, bw, bh, 0, 0, bw, bh);
+              // Square the rounded window corners. After trimming to the opaque
+              // bbox, the four corner regions inside the rectangle but outside
+              // the window's rounded corner are still transparent, showing the
+              // editor's black background as notches. By construction every row
+              // in the cropped bbox has at least one opaque pixel, so extend the
+              // window's edge color horizontally into the transparent leading /
+              // trailing run of each row. This fills the corner notches (and any
+              // anti-aliased fringe) making all four corners square. No-op for
+              // rows with no transparent leading/trailing run.
+              const cropData = cctx.getImageData(0, 0, bw, bh);
+              const cd = cropData.data;
+              for (let y = 0; y < bh; y++) {
+                const rowStart = y * bw * 4;
+                // Extend from the LEFT: find the first opaque pixel and fill the
+                // transparent run before it with that pixel's RGB, alpha 255.
+                let firstOpaque = -1;
+                for (let x = 0; x < bw; x++) {
+                  if (cd[rowStart + x * 4 + 3] >= 250) {
+                    firstOpaque = x;
+                    break;
+                  }
+                }
+                // firstOpaque is always found (row has content), but guard anyway.
+                if (firstOpaque > 0) {
+                  const src = rowStart + firstOpaque * 4;
+                  const r = cd[src], g = cd[src + 1], b = cd[src + 2];
+                  for (let x = 0; x < firstOpaque; x++) {
+                    const p = rowStart + x * 4;
+                    cd[p] = r;
+                    cd[p + 1] = g;
+                    cd[p + 2] = b;
+                    cd[p + 3] = 255;
+                  }
+                }
+                // Extend from the RIGHT: find the last opaque pixel and fill the
+                // trailing transparent run after it.
+                let lastOpaque = -1;
+                for (let x = bw - 1; x >= 0; x--) {
+                  if (cd[rowStart + x * 4 + 3] >= 250) {
+                    lastOpaque = x;
+                    break;
+                  }
+                }
+                if (lastOpaque !== -1 && lastOpaque < bw - 1) {
+                  const src = rowStart + lastOpaque * 4;
+                  const r = cd[src], g = cd[src + 1], b = cd[src + 2];
+                  for (let x = lastOpaque + 1; x < bw; x++) {
+                    const p = rowStart + x * 4;
+                    cd[p] = r;
+                    cd[p + 1] = g;
+                    cd[p + 2] = b;
+                    cd[p + 3] = 255;
+                  }
+                }
+              }
+              cctx.putImageData(cropData, 0, 0);
               const blob = await new Promise<Blob | null>((resolve) =>
                 cropCanvas.toBlob(resolve, "image/png"),
               );
