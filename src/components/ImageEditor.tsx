@@ -257,16 +257,28 @@ export function ImageEditor({ imagePath }: ImageEditorProps) {
       setImageLoaded(true);
 
       try {
-        // Open the editor at 85% of the current display's size, centered.
-        // The canvas inside scales to fit this window (see AnnotationCanvas),
-        // so the window no longer tracks the screenshot's own dimensions.
+        // Size the window to the SCREENSHOT's own aspect ratio so the canvas
+        // fills it edge-to-edge with no dark letterbox, scaled up to ~85% of
+        // the current display (whichever dimension binds). The fixed toolbar
+        // row (h-11 = 44px logical) sits above the canvas, so it's excluded
+        // from the image's height budget and added back to the window height.
         const monitors = await availableMonitors();
         const m = monitors[0];
         const scale = m?.scaleFactor || 1;
         const monLogW = (m?.size.width || 1440) / scale;
         const monLogH = (m?.size.height || 900) / scale;
-        const finalW = Math.round(monLogW * 0.85);
-        const finalH = Math.round(monLogH * 0.85);
+        // Screenshot pixels are physical (a Retina capture is stored at the
+        // display's device resolution); divide by the scale factor for the
+        // logical size the window is measured in.
+        const imgLogW = img.naturalWidth / scale;
+        const imgLogH = img.naturalHeight / scale;
+        const TOOLBAR_H = 44; // h-11
+        const availW = monLogW * 0.85;
+        const availH = monLogH * 0.85 - TOOLBAR_H;
+        // Do NOT clamp to <=1 — smaller screenshots scale UP to a large window.
+        const fit = Math.min(availW / imgLogW, availH / imgLogH);
+        const finalW = Math.round(imgLogW * fit);
+        const finalH = Math.round(imgLogH * fit) + TOOLBAR_H;
         const win = getCurrentWindow();
         await win.setSize(new LogicalSize(finalW, finalH));
         await win.center();

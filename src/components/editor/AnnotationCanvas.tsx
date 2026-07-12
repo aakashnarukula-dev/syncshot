@@ -623,7 +623,11 @@ export const AnnotationCanvas = memo(function AnnotationCanvas({
       canvas.height = img.height;
     }
     
-    // Calculate display size to fit container
+    // Fit the canvas to the container (contain-style, preserving the image's
+    // aspect ratio). The container's aspect ratio matches the image's (the
+    // window is sized to it in ImageEditor), so this fills edge-to-edge with
+    // no letterbox. Do NOT cap at the image's native pixel size — small
+    // screenshots scale UP to fill the window instead of sitting centered.
     const containerRect = container.getBoundingClientRect();
     const containerWidth = containerRect.width;
     const containerHeight = containerRect.height;
@@ -634,10 +638,10 @@ export const AnnotationCanvas = memo(function AnnotationCanvas({
     let displayHeight: number;
 
     if (imgAspect > containerAspect) {
-      displayWidth = Math.min(containerWidth, img.width);
+      displayWidth = containerWidth;
       displayHeight = displayWidth / imgAspect;
     } else {
-      displayHeight = Math.min(containerHeight, img.height);
+      displayHeight = containerHeight;
       displayWidth = displayHeight * imgAspect;
     }
 
