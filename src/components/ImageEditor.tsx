@@ -108,6 +108,14 @@ export function ImageEditor({ imagePath }: ImageEditorProps) {
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
+  // Toolbar wrapper — measured (not hardcoded) so the window height budget
+  // matches the real toolbar row exactly. Fallback to 45 if unmeasurable.
+  const toolbarRef = useRef<HTMLDivElement>(null);
+  // Guards the one-shot self-correcting window reconciliation to the nonce it
+  // ran for, so it fires at most once per open and can't feedback-loop on the
+  // resize it triggers.
+  const reconciledNonceRef = useRef<number>(-1);
+
   // Preview generator hook
   const { previewUrl, error: previewError, renderHighQualityCanvas } = usePreviewGenerator({
     screenshotImage,
@@ -205,20 +213,27 @@ export function ImageEditor({ imagePath }: ImageEditorProps) {
   }, [closeEditor]);
 
   // Restore window state on every open (a reused window may have been left
-  // fullscreen by the previous session).
+  // fullscreen OR maximized/zoomed by the previous session). A maximized macOS
+  // window will NOT shrink on setSize(), so it must be un-maximized here before
+  // the img.onload handler resizes it — otherwise the canvas contain-fits into
+  // an oversized window and leaves a thick black letterbox.
   useEffect(() => {
     if (!openReq.path) return;
+    // A fresh open gets a fresh one-shot reconciliation.
+    reconciledNonceRef.current = -1;
     const restoreWindowState = async () => {
+      const appWindow = getCurrentWindow();
+      // Un-fullscreen / un-maximize first, each guarded so one failing (or a
+      // method being unavailable) never blocks the others.
+      try { await appWindow.setFullscreen(false); } catch (err) { console.error("setFullscreen(false) failed:", err); }
       try {
-        const appWindow = getCurrentWindow();
-        await Promise.all([
-          appWindow.setFullscreen(false),
-          appWindow.setAlwaysOnTop(false),
-        ]);
-        await appWindow.setDecorations(true);
-      } catch (err) {
-        console.error("Failed to restore window decorations:", err);
+        if (await appWindow.isMaximized()) await appWindow.unmaximize();
+      } catch {
+        // isMaximized() unavailable/failed — un-maximize unconditionally.
+        try { await appWindow.unmaximize(); } catch (err) { console.error("unmaximize failed:", err); }
       }
+      try { await appWindow.setAlwaysOnTop(false); } catch (err) { console.error("setAlwaysOnTop(false) failed:", err); }
+      try { await appWindow.setDecorations(true); } catch (err) { console.error("setDecorations(true) failed:", err); }
     };
     restoreWindowState();
   }, [openReq]);
@@ -260,8 +275,8 @@ export function ImageEditor({ imagePath }: ImageEditorProps) {
         // Size the window to the SCREENSHOT's own aspect ratio so the canvas
         // fills it edge-to-edge with no dark letterbox, scaled up to ~85% of
         // the current display (whichever dimension binds). The fixed toolbar
-        // row (h-11 = 44px logical) sits above the canvas, so it's excluded
-        // from the image's height budget and added back to the window height.
+        // row sits above the canvas, so it's excluded from the image's height
+        // budget and added back to the window height.
         const monitors = await availableMonitors();
         const m = monitors[0];
         const scale = m?.scaleFactor || 1;
@@ -272,16 +287,66 @@ export function ImageEditor({ imagePath }: ImageEditorProps) {
         // logical size the window is measured in.
         const imgLogW = img.naturalWidth / scale;
         const imgLogH = img.naturalHeight / scale;
-        const TOOLBAR_H = 44; // h-11
+        // Measure the real toolbar row instead of hardcoding — h-11 + a 1px
+        // bottom border is 45px, but reading offsetHeight tracks any change.
+        const toolbarH = toolbarRef.current?.offsetHeight || 45;
+        const imgAspect = imgLogW / imgLogH;
         const availW = monLogW * 0.85;
-        const availH = monLogH * 0.85 - TOOLBAR_H;
+        const availH = monLogH * 0.85 - toolbarH;
         // Do NOT clamp to <=1 — smaller screenshots scale UP to a large window.
         const fit = Math.min(availW / imgLogW, availH / imgLogH);
+        // Derive the height from the ROUNDED width so a single rounding step
+        // governs the content aspect (avoids two independent roundings drifting
+        // apart and reintroducing a hairline bar).
         const finalW = Math.round(imgLogW * fit);
-        const finalH = Math.round(imgLogH * fit) + TOOLBAR_H;
+        const contentH = Math.round(finalW / imgAspect);
+        const finalH = contentH + toolbarH;
+
         const win = getCurrentWindow();
+        // Defense in depth: a maximized/fullscreen window won't shrink on
+        // setSize, so ensure it isn't before sizing (restoreWindowState also
+        // does this, but ordering across the two async effects isn't
+        // guaranteed).
+        try { await win.setFullscreen(false); } catch {}
+        try {
+          if (await win.isMaximized()) await win.unmaximize();
+        } catch {
+          try { await win.unmaximize(); } catch {}
+        }
         await win.setSize(new LogicalSize(finalW, finalH));
         await win.center();
+
+        // Self-correcting reconciliation: after layout settles, if the canvas's
+        // ACTUAL rendered size (the authoritative contain-fit result) is smaller
+        // than the window content area, a black bar remains — shrink the window
+        // to the canvas once. Scoped to this nonce so it runs at most once per
+        // open and can't feedback-loop on the resize it triggers.
+        const nonceAtSize = openReq.nonce;
+        requestAnimationFrame(() => requestAnimationFrame(() => {
+          void (async () => {
+            if (reconciledNonceRef.current === nonceAtSize) return;
+            reconciledNonceRef.current = nonceAtSize;
+            try {
+              const canvasEl = document.querySelector<HTMLCanvasElement>("canvas[data-editor-canvas]");
+              if (!canvasEl) return;
+              const rect = canvasEl.getBoundingClientRect();
+              if (rect.width < 1 || rect.height < 1) return;
+              const tbH = toolbarRef.current?.offsetHeight || 45;
+              const targetW = Math.round(rect.width);
+              const targetH = Math.round(rect.height) + tbH;
+              // window.innerWidth/innerHeight = the webview content area (logical px).
+              const bufW = window.innerWidth;
+              const bufH = window.innerHeight;
+              if (bufW - targetW > 1 || bufH - targetH > 1) {
+                const w = getCurrentWindow();
+                await w.setSize(new LogicalSize(targetW, targetH));
+                await w.center();
+              }
+            } catch (e) {
+              console.error("Editor window reconciliation failed:", e);
+            }
+          })();
+        }));
       } catch (e) {
         console.error("Failed to size editor window:", e);
       }
@@ -650,7 +715,7 @@ export function ImageEditor({ imagePath }: ImageEditorProps) {
 
   return (
     <div className="flex flex-col h-dvh w-dvw bg-black text-foreground overflow-hidden">
-      <div className="shrink-0">
+      <div ref={toolbarRef} className="shrink-0">
         <AnnotationToolbar
           selectedTool={selectedTool}
           onToolSelect={setSelectedTool}

@@ -1198,6 +1198,7 @@ export const AnnotationCanvas = memo(function AnnotationCanvas({
     <div ref={containerRef} className="relative flex items-center justify-center w-full h-full min-w-0 min-h-0">
       <canvas
         ref={canvasRef}
+        data-editor-canvas
         onMouseDown={handleMouseDown}
         onMouseMove={handleMouseMove}
         onMouseUp={handleMouseUp}
