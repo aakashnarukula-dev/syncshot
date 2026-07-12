@@ -257,19 +257,16 @@ export function ImageEditor({ imagePath }: ImageEditorProps) {
       setImageLoaded(true);
 
       try {
+        // Open the editor at 85% of the current display's size, centered.
+        // The canvas inside scales to fit this window (see AnnotationCanvas),
+        // so the window no longer tracks the screenshot's own dimensions.
         const monitors = await availableMonitors();
         const m = monitors[0];
         const scale = m?.scaleFactor || 1;
         const monLogW = (m?.size.width || 1440) / scale;
         const monLogH = (m?.size.height || 900) / scale;
-        const logicalW = img.width / scale;
-        const logicalH = img.height / scale;
-        const TOOLBAR_H = 48;
-        const maxW = monLogW * 0.92;
-        const maxH = monLogH * 0.92 - TOOLBAR_H;
-        const ratio = Math.min(1, maxW / logicalW, maxH / logicalH);
-        const finalW = Math.round(logicalW * ratio);
-        const finalH = Math.round(logicalH * ratio) + TOOLBAR_H;
+        const finalW = Math.round(monLogW * 0.85);
+        const finalH = Math.round(monLogH * 0.85);
         const win = getCurrentWindow();
         await win.setSize(new LogicalSize(finalW, finalH));
         await win.center();
