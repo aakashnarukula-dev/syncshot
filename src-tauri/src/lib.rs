@@ -29,40 +29,80 @@ use license::{get_machine_id, keychain_delete, keychain_get, keychain_set};
 /// Port for the release-mode localhost server (see tauri_plugin_localhost below).
 const LOCALHOST_PORT: u16 = 38217;
 
-/// Build the tray menu for the given auth state.
-/// - signed IN  → Preferences, Log Out, Quit  (no "Sign in & Sync")
-/// - signed OUT → Sign in & Sync, Preferences, Quit
+/// Shared state so the native tray menu (which does NOT rebuild on open) can be
+/// rebuilt at any time to reflect the latest auth AND window-visibility state.
+/// The last menu item toggles: window visible → "Quit", window hidden → "Open App".
+struct TrayState {
+    signed_in: std::sync::atomic::AtomicBool,
+    window_visible: std::sync::atomic::AtomicBool,
+}
+
+/// Build the tray menu for the given auth + visibility state.
+/// - signed IN  → Preferences, Log Out, <Quit|Open App>  (no "Sign in & Sync")
+/// - signed OUT → Sign in & Sync, Preferences, <Quit|Open App>
+/// The last item is "Quit" (hides the window) when the window is visible, or
+/// "Open App" (shows+focuses the window) when the window is hidden.
 fn build_tray_menu<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     signed_in: bool,
+    window_visible: bool,
 ) -> tauri::Result<tauri::menu::Menu<R>> {
     use tauri::menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem};
     let preferences_item = MenuItemBuilder::with_id("preferences", "Preferences…").build(app)?;
-    let quit_item = MenuItemBuilder::with_id("quit", "Quit")
-        .accelerator("CommandOrControl+Q")
-        .build(app)?;
     let sep = PredefinedMenuItem::separator(app)?;
+    // The trailing item depends on whether the window is currently visible.
+    let last_item = if window_visible {
+        MenuItemBuilder::with_id("quit", "Quit")
+            .accelerator("CommandOrControl+Q")
+            .build(app)?
+    } else {
+        MenuItemBuilder::with_id("open", "Open App").build(app)?
+    };
     if signed_in {
         let logout_item = MenuItemBuilder::with_id("logout", "Log Out").build(app)?;
         MenuBuilder::new(app)
-            .items(&[&preferences_item, &logout_item, &sep, &quit_item])
+            .items(&[&preferences_item, &logout_item, &sep, &last_item])
             .build()
     } else {
         let library_item = MenuItemBuilder::with_id("library", "Sign in & Sync").build(app)?;
         MenuBuilder::new(app)
-            .items(&[&library_item, &preferences_item, &sep, &quit_item])
+            .items(&[&library_item, &preferences_item, &sep, &last_item])
             .build()
     }
 }
 
+/// Rebuild + set the tray menu from the CURRENT `TrayState` (both auth and
+/// window-visibility). Call this whenever either changes so the native menu
+/// stays in sync (it does not rebuild itself on open).
+fn refresh_tray_menu(app: &tauri::AppHandle) {
+    use std::sync::atomic::Ordering;
+    use tauri::Manager;
+    let state = app.state::<TrayState>();
+    let signed_in = state.signed_in.load(Ordering::Relaxed);
+    let window_visible = state.window_visible.load(Ordering::Relaxed);
+    match build_tray_menu(app, signed_in, window_visible) {
+        Ok(menu) => {
+            if let Some(tray) = app.tray_by_id("main") {
+                if let Err(e) = tray.set_menu(Some(menu)) {
+                    eprintln!("Failed to set tray menu: {}", e);
+                }
+            }
+        }
+        Err(e) => eprintln!("Failed to build tray menu: {}", e),
+    }
+}
+
 /// Bridge: the webview calls this whenever auth state resolves/changes so the
-/// tray menu reflects signed-in vs signed-out (see build_tray_menu).
+/// tray menu reflects signed-in vs signed-out (see build_tray_menu). Preserves
+/// the current window-visibility state.
 #[tauri::command]
 fn update_tray_menu(app: tauri::AppHandle, signed_in: bool) -> Result<(), String> {
-    let menu = build_tray_menu(&app, signed_in).map_err(|e| e.to_string())?;
-    if let Some(tray) = app.tray_by_id("main") {
-        tray.set_menu(Some(menu)).map_err(|e| e.to_string())?;
-    }
+    use std::sync::atomic::Ordering;
+    use tauri::Manager;
+    app.state::<TrayState>()
+        .signed_in
+        .store(signed_in, Ordering::Relaxed);
+    refresh_tray_menu(&app);
     Ok(())
 }
 
@@ -172,6 +212,14 @@ pub fn run() {
             use tauri::Manager;
             use tauri_plugin_autostart::ManagerExt;
 
+            // Track auth + window visibility so the native tray menu (which does
+            // not rebuild on open) can be rebuilt whenever either changes. The
+            // window starts visible and signed-out.
+            app.manage(TrayState {
+                signed_in: false.into(),
+                window_visible: true.into(),
+            });
+
             // Release only: dev keeps the Vite devUrl (already http://localhost:1420).
             #[cfg(not(debug_assertions))]
             if let Some(window) = app.get_webview_window("main") {
@@ -221,12 +269,35 @@ pub fn run() {
 
             if let Some(window) = app.get_webview_window("main") {
                 let window_clone = window.clone();
+                let event_handle = app.handle().clone();
                 window.on_window_event(move |event| {
-                    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                        if let Err(e) = window_clone.hide() {
-                            eprintln!("Failed to hide window: {}", e);
+                    use std::sync::atomic::Ordering;
+                    match event {
+                        tauri::WindowEvent::CloseRequested { api, .. } => {
+                            // "Close" (✕) hides the window instead of terminating;
+                            // reflect the hidden state so the tray shows "Open App".
+                            if let Err(e) = window_clone.hide() {
+                                eprintln!("Failed to hide window: {}", e);
+                            }
+                            api.prevent_close();
+                            event_handle
+                                .state::<TrayState>()
+                                .window_visible
+                                .store(false, Ordering::Relaxed);
+                            refresh_tray_menu(&event_handle);
                         }
-                        api.prevent_close();
+                        // The frontend shows the window (Preferences / dock-click /
+                        // second-instance) via show()+setFocus(), which fires
+                        // Focused(true). Sync the tray to "Quit". Ignore
+                        // Focused(false): a visible window can lose focus.
+                        tauri::WindowEvent::Focused(true) => {
+                            event_handle
+                                .state::<TrayState>()
+                                .window_visible
+                                .store(true, Ordering::Relaxed);
+                            refresh_tray_menu(&event_handle);
+                        }
+                        _ => {}
                     }
                 });
             }
@@ -266,9 +337,10 @@ pub fn run() {
                 });
             }
 
-            // Start signed-out; the webview calls `update_tray_menu` once auth
-            // resolves and on every later change to flip the menu.
-            let menu = build_tray_menu(app.handle(), false)?;
+            // Start signed-out with a visible window; the webview calls
+            // `update_tray_menu` once auth resolves and on every later change,
+            // and visibility changes rebuild the menu too.
+            let menu = build_tray_menu(app.handle(), false, true)?;
 
             let tray_icon = tauri::image::Image::from_bytes(include_bytes!("../icons/tray.png"))?;
             let _tray = tauri::tray::TrayIconBuilder::with_id("main")
@@ -277,6 +349,7 @@ pub fn run() {
                 .icon_as_template(true)
                 .tooltip("SyncShot")
                 .on_menu_event(move |app, event| {
+                    use std::sync::atomic::Ordering;
                     use tauri::Emitter;
                     use tauri::Manager;
                     match event.id().as_ref() {
@@ -294,13 +367,32 @@ pub fn run() {
                             // resident in the menu bar (tray). The tray icon is
                             // a permanent resident; it must survive Quit. Mirror
                             // the CloseRequested handler (hide, don't terminate).
-                            // Reopen via any tray item (Preferences / Sign in &
-                            // Sync), which re-`show()`s the main window.
+                            // Reopen via the tray "Open App" item (shown once
+                            // hidden) or any tray item that re-`show()`s the window.
                             if let Some(window) = app.get_webview_window("main") {
                                 if let Err(e) = window.hide() {
                                     eprintln!("Failed to hide window on quit: {}", e);
                                 }
                             }
+                            app.state::<TrayState>()
+                                .window_visible
+                                .store(false, Ordering::Relaxed);
+                            refresh_tray_menu(app);
+                        }
+                        "open" => {
+                            // Shown when the window is hidden: bring it back and
+                            // focus it. Focused(true) will flip the menu, but set
+                            // it here too so state is correct even if focus is
+                            // already elsewhere.
+                            if let Some(window) = app.get_webview_window("main") {
+                                let _ = window.show();
+                                let _ = window.unminimize();
+                                let _ = window.set_focus();
+                            }
+                            app.state::<TrayState>()
+                                .window_visible
+                                .store(true, Ordering::Relaxed);
+                            refresh_tray_menu(app);
                         }
                         _ => {}
                     }
