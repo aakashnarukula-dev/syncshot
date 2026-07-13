@@ -38,10 +38,13 @@ struct TrayState {
 }
 
 /// Build the tray menu for the given auth + visibility state.
-/// - signed IN  → Preferences, Log Out, <Quit|Open App>  (no "Sign in & Sync")
-/// - signed OUT → Sign in & Sync, Preferences, <Quit|Open App>
-/// The last item is "Quit" (hides the window) when the window is visible, or
-/// "Open App" (shows+focuses the window) when the window is hidden.
+/// When the window is VISIBLE, "Quit" (hides the window) is the trailing item:
+/// - signed IN  → Preferences, Log Out, sep, Quit
+/// - signed OUT → Sign in & Sync, Preferences, sep, Quit
+/// When the window is HIDDEN, "Open App" (shows+focuses the window) is at the TOP,
+/// followed by a separator then the rest:
+/// - signed IN  → Open App, sep, Preferences, Log Out
+/// - signed OUT → Open App, sep, Sign in & Sync, Preferences
 fn build_tray_menu<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     signed_in: bool,
@@ -50,24 +53,36 @@ fn build_tray_menu<R: tauri::Runtime>(
     use tauri::menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem};
     let preferences_item = MenuItemBuilder::with_id("preferences", "Preferences…").build(app)?;
     let sep = PredefinedMenuItem::separator(app)?;
-    // The trailing item depends on whether the window is currently visible.
-    let last_item = if window_visible {
-        MenuItemBuilder::with_id("quit", "Quit")
+    if window_visible {
+        // Window visible: the trailing item is "Quit" (hides the window).
+        let quit_item = MenuItemBuilder::with_id("quit", "Quit")
             .accelerator("CommandOrControl+Q")
-            .build(app)?
+            .build(app)?;
+        if signed_in {
+            let logout_item = MenuItemBuilder::with_id("logout", "Log Out").build(app)?;
+            MenuBuilder::new(app)
+                .items(&[&preferences_item, &logout_item, &sep, &quit_item])
+                .build()
+        } else {
+            let library_item = MenuItemBuilder::with_id("library", "Sign in & Sync").build(app)?;
+            MenuBuilder::new(app)
+                .items(&[&library_item, &preferences_item, &sep, &quit_item])
+                .build()
+        }
     } else {
-        MenuItemBuilder::with_id("open", "Open App").build(app)?
-    };
-    if signed_in {
-        let logout_item = MenuItemBuilder::with_id("logout", "Log Out").build(app)?;
-        MenuBuilder::new(app)
-            .items(&[&preferences_item, &logout_item, &sep, &last_item])
-            .build()
-    } else {
-        let library_item = MenuItemBuilder::with_id("library", "Sign in & Sync").build(app)?;
-        MenuBuilder::new(app)
-            .items(&[&library_item, &preferences_item, &sep, &last_item])
-            .build()
+        // Window hidden: "Open App" goes to the TOP, then a separator, then the rest.
+        let open_item = MenuItemBuilder::with_id("open", "Open App").build(app)?;
+        if signed_in {
+            let logout_item = MenuItemBuilder::with_id("logout", "Log Out").build(app)?;
+            MenuBuilder::new(app)
+                .items(&[&open_item, &sep, &preferences_item, &logout_item])
+                .build()
+        } else {
+            let library_item = MenuItemBuilder::with_id("library", "Sign in & Sync").build(app)?;
+            MenuBuilder::new(app)
+                .items(&[&open_item, &sep, &library_item, &preferences_item])
+                .build()
+        }
     }
 }
 
