@@ -246,10 +246,14 @@ pub fn run() {
                 }
             }
 
-            // Regular (not Accessory) so the app shows a Dock icon with the
-            // running indicator dot; clicking it re-surfaces the column.
+            // Accessory (not Regular) so the app runs as a menu-bar / tray-only
+            // app: no Dock icon and no Cmd+Tab entry, like an LSUIElement app.
+            // The persistent tray icon and hide-to-tray behavior make the Dock
+            // icon redundant. Windows can still show()/set_focus() (the frontend
+            // does this for the always-on-top overlay), so the main window still
+            // appears at startup.
             #[cfg(target_os = "macos")]
-            app.set_activation_policy(tauri::ActivationPolicy::Regular);
+            app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
             // Launch at login automatically (idempotent if already enabled).
             if let Err(e) = app.autolaunch().enable() {
