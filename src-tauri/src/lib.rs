@@ -278,6 +278,7 @@ pub fn run() {
                 .tooltip("SyncShot")
                 .on_menu_event(move |app, event| {
                     use tauri::Emitter;
+                    use tauri::Manager;
                     match event.id().as_ref() {
                         "library" => {
                             let _ = app.emit("open-library", ());
@@ -289,7 +290,17 @@ pub fn run() {
                             let _ = app.emit("tray-logout", ());
                         }
                         "quit" => {
-                            app.exit(0);
+                            // "Quit" hides the main window but leaves the app
+                            // resident in the menu bar (tray). The tray icon is
+                            // a permanent resident; it must survive Quit. Mirror
+                            // the CloseRequested handler (hide, don't terminate).
+                            // Reopen via any tray item (Preferences / Sign in &
+                            // Sync), which re-`show()`s the main window.
+                            if let Some(window) = app.get_webview_window("main") {
+                                if let Err(e) = window.hide() {
+                                    eprintln!("Failed to hide window on quit: {}", e);
+                                }
+                            }
                         }
                         _ => {}
                     }
