@@ -2,8 +2,6 @@ package com.app.syncshot.ui
 
 import android.content.ClipData
 import android.content.ClipboardManager
-import android.content.Intent
-import android.provider.Settings
 import android.text.format.DateUtils
 import android.widget.Toast
 import androidx.compose.foundation.clickable
@@ -36,11 +34,10 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
@@ -50,12 +47,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import androidx.lifecycle.Lifecycle
-import androidx.lifecycle.LifecycleEventObserver
-import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.app.syncshot.data.ClipItem
 import com.app.syncshot.data.FirebaseRepo
-import com.app.syncshot.sync.ClipboardCaptureService
+import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.launch
 
 /** @param embedded true when shown under the shared header + Screenshots|Text pill
@@ -66,25 +60,14 @@ import kotlinx.coroutines.launch
 fun ClipboardScreen(embedded: Boolean = false) {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
-    val lifecycleOwner = LocalLifecycleOwner.current
-
-    var captureEnabled by remember { mutableStateOf(ClipboardCaptureService.isEnabled(ctx)) }
-    DisposableEffect(lifecycleOwner) {
-        val obs = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_RESUME) {
-                captureEnabled = ClipboardCaptureService.isEnabled(ctx)
-            }
-        }
-        lifecycleOwner.lifecycle.addObserver(obs)
-        onDispose { lifecycleOwner.lifecycle.removeObserver(obs) }
-    }
 
     var refreshKey by remember { mutableIntStateOf(0) }
     var refreshing by remember { mutableStateOf(false) }
-    val clips by produceState(initialValue = emptyList<ClipItem>(), refreshKey) {
-        if (!FirebaseRepo.signedIn) return@produceState
-        FirebaseRepo.clipboardSnapshots().collect { value = it }
+    val clipsFlow = remember(refreshKey) {
+        if (FirebaseRepo.signedIn) FirebaseRepo.clipboardSnapshots()
+        else flowOf(emptyList<ClipItem>())
     }
+    val clips by clipsFlow.collectAsState(initial = emptyList())
     // Pinned first, then newest.
     val sorted = remember(clips) { clips.sortedWith(compareByDescending<ClipItem> { it.pinned }.thenByDescending { it.createdAt }) }
 
@@ -92,6 +75,25 @@ fun ClipboardScreen(embedded: Boolean = false) {
         ctx.getSystemService(ClipboardManager::class.java)
             .setPrimaryClip(ClipData.newPlainText("SyncShot", item.text))
         Toast.makeText(ctx, "Copied", Toast.LENGTH_SHORT).show()
+    }
+
+    fun syncCurrentClipboard() {
+        val clipboard = ctx.getSystemService(ClipboardManager::class.java)
+        val text = clipboard.primaryClip
+            ?.takeIf { it.itemCount > 0 }
+            ?.getItemAt(0)
+            ?.coerceToText(ctx)
+            ?.toString()
+            ?.trim()
+        if (text.isNullOrBlank()) {
+            Toast.makeText(ctx, "Copy some text first", Toast.LENGTH_SHORT).show()
+            return
+        }
+        scope.launch {
+            runCatching { FirebaseRepo.writeClipboard(ctx.applicationContext, text) }
+                .onSuccess { Toast.makeText(ctx, "Saved to SyncShot", Toast.LENGTH_SHORT).show() }
+                .onFailure { Toast.makeText(ctx, "Couldn't save clipboard", Toast.LENGTH_SHORT).show() }
+        }
     }
 
     Column(Modifier.fillMaxSize().then(if (embedded) Modifier else Modifier.statusBarsPadding())) {
@@ -103,14 +105,7 @@ fun ClipboardScreen(embedded: Boolean = false) {
             )
         }
 
-        if (!captureEnabled) {
-            CaptureOnboarding {
-                ctx.startActivity(
-                    Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
-                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                )
-            }
-        }
+        ClipboardOnboarding(onSyncClipboard = ::syncCurrentClipboard)
 
         PullToRefreshBox(
             isRefreshing = refreshing,
@@ -198,20 +193,20 @@ private fun ClipRow(item: ClipItem, onCopy: () -> Unit, onPin: () -> Unit, onDel
 }
 
 @Composable
-private fun CaptureOnboarding(onEnable: () -> Unit) {
+private fun ClipboardOnboarding(onSyncClipboard: () -> Unit) {
     Card(Modifier.fillMaxWidth().padding(12.dp)) {
         Column(Modifier.padding(16.dp)) {
-            Text("Enable background capture", style = MaterialTheme.typography.titleSmall)
+            Text("Sync text intentionally", style = MaterialTheme.typography.titleSmall)
             Spacer(Modifier.height(4.dp))
             Text(
-                "To sync text you copy on this phone, turn on the SyncShot accessibility service. " +
-                    "It only reads the clipboard when you copy.",
+                "SyncShot never watches other apps. Copy text, then tap “Sync current clipboard”, " +
+                    "or choose SyncShot from Android's Share menu.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
             Spacer(Modifier.height(8.dp))
             Row(horizontalArrangement = Arrangement.End, modifier = Modifier.fillMaxWidth()) {
-                TextButton(onClick = onEnable) { Text("Open settings") }
+                TextButton(onClick = onSyncClipboard) { Text("Sync current clipboard") }
             }
         }
     }

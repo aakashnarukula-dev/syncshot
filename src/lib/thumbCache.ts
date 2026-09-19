@@ -32,7 +32,7 @@ const MAX_INFLIGHT = 5;
 export class ThumbLocalError extends Error {}
 
 const cache = new LruCache<string, string>(CACHE_CAP, (_path, url) => {
-  URL.revokeObjectURL(url);
+  if (url.startsWith("blob:")) URL.revokeObjectURL(url);
 });
 const gate = new TaskGate(MAX_INFLIGHT);
 
@@ -43,22 +43,11 @@ interface InflightEntry {
 }
 const inflight = new Map<string, InflightEntry>();
 
-/** Synchronous cache hit (refreshes LRU recency) — lets a remounting tile
- * commit its thumbnail in its initial render, before any effect runs. */
-export function getCachedThumbUrl(path: string): string | null {
-  return cache.get(path) ?? null;
-}
-
-export interface ThumbRequest {
-  /** Resolves to a blob URL, or null if the request was cancelled before it
-   * started. Rejects with ThumbLocalError on a definite local failure. */
-  promise: Promise<string | null>;
-  /** The requesting tile went away. The queued IPC is dropped once no tile
-   * still wants this path; an already-running request completes and caches. */
-  release: () => void;
-}
-
-export function requestThumbUrl(path: string): ThumbRequest {
+function requestBytes(
+  path: string,
+  load: () => Promise<ArrayBuffer>,
+  mime: string,
+): ThumbRequest {
   const cached = cache.get(path);
   if (cached) {
     return { promise: Promise.resolve(cached), release: () => {} };
@@ -66,15 +55,13 @@ export function requestThumbUrl(path: string): ThumbRequest {
 
   let entry = inflight.get(path);
   if (!entry) {
-    const handle = gate.schedule(() =>
-      invoke<ArrayBuffer>("get_screenshot_thumbnail", { path, maxPx: THUMB_MAX_PX }),
-    );
+    const handle = gate.schedule(load);
     const promise = handle.promise.then(
       (bytes) => {
         inflight.delete(path);
-        if (bytes === null) return null; // cancelled while queued
+        if (bytes === null) return null;
         if (bytes.byteLength === 0) throw new ThumbLocalError("empty thumbnail");
-        const url = URL.createObjectURL(new Blob([bytes], { type: "image/png" }));
+        const url = URL.createObjectURL(new Blob([bytes], { type: mime }));
         cache.set(path, url);
         return url;
       },
@@ -99,6 +86,83 @@ export function requestThumbUrl(path: string): ThumbRequest {
       if (tracked.refs <= 0) tracked.cancel();
     },
   };
+}
+
+/** Synchronous cache hit (refreshes LRU recency) — lets a remounting tile
+ * commit its thumbnail in its initial render, before any effect runs. */
+export function getCachedThumbUrl(path: string): string | null {
+  return cache.get(path) ?? null;
+}
+
+/** Seed an in-memory preview without writing the selected image to disk. */
+export function cacheThumbBlob(path: string, blob: Blob): string {
+  const url = URL.createObjectURL(blob);
+  cache.set(path, url);
+  return url;
+}
+
+/** Seed a tiny editor-generated preview synchronously across webviews. */
+export function cacheThumbDataUrl(path: string, dataUrl: string): string {
+  cache.set(path, dataUrl);
+  return dataUrl;
+}
+
+export interface ThumbRequest {
+  /** Resolves to a blob URL, or null if the request was cancelled before it
+   * started. Rejects with ThumbLocalError on a definite local failure. */
+  promise: Promise<string | null>;
+  /** The requesting tile went away. The queued IPC is dropped once no tile
+   * still wants this path; an already-running request completes and caches. */
+  release: () => void;
+}
+
+export function requestThumbUrl(path: string): ThumbRequest {
+  return requestBytes(
+    path,
+    () => invoke<ArrayBuffer>("get_screenshot_thumbnail", { path, maxPx: THUMB_MAX_PX }),
+    "image/png",
+  );
+}
+
+/**
+ * Fetch a cloud thumbnail through Rust and keep the resulting blob URL in the
+ * same bounded memory cache as local thumbnails. This avoids two WKWebView
+ * problems at once: remote image requests no longer compete with full-image
+ * prefetches, and a remounted tile paints synchronously from a stable blob URL
+ * instead of waiting for a second cross-origin image load/onLoad cycle.
+ *
+ * `path` includes the screenshot content version, so an edited screenshot can
+ * never reuse its predecessor's pixels. No screenshot bytes are persisted.
+ */
+export function requestRemoteThumbUrl(path: string, url: string): ThumbRequest {
+  return requestBytes(
+    path,
+    () => invoke<ArrayBuffer>("read_remote_image_bytes", { url }),
+    "image/webp",
+  );
+}
+
+/** Warm a local staging screenshot's thumbnail before swapping it into the
+ * rail. Keeping the previous tile visible until this resolves removes the
+ * editor-save blank/shimmer frame. */
+export async function primeThumb(path: string): Promise<string | null> {
+  const request = requestThumbUrl(path);
+  try {
+    return await request.promise;
+  } finally {
+    request.release();
+  }
+}
+
+/** Transfer a ready optimistic thumbnail to its stable cloud rail identity. */
+export async function cloneThumb(from: string, to: string): Promise<void> {
+  // The publisher may already have seeded the destination with its compact
+  // WebP. Keep that instead of copying a full-size optimistic import preview.
+  if (cache.get(to)) return;
+  const source = cache.get(from) ?? await primeThumb(from);
+  if (!source) return;
+  const blob = await fetch(source).then((response) => response.blob());
+  cache.set(to, URL.createObjectURL(blob));
 }
 
 /** Shot deleted — drop (and revoke) its cached thumbnail immediately. */

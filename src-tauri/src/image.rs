@@ -6,7 +6,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::utils::{ensure_dir, generate_filename, AppResult};
 
@@ -265,31 +265,6 @@ impl Drop for ThumbDecodeSlot {
     }
 }
 
-/// Count of INTERACTIVE thumbnail requests currently queued or decoding
-/// (frontend-driven, via the `get_screenshot_thumbnail*` commands). The launch
-/// backfill polls this to stay out of the way: it pauses whenever the user is
-/// actually waiting on a thumbnail.
-static INTERACTIVE_THUMBS_PENDING: AtomicU32 = AtomicU32::new(0);
-
-struct InteractiveThumbGuard;
-
-impl InteractiveThumbGuard {
-    fn new() -> Self {
-        INTERACTIVE_THUMBS_PENDING.fetch_add(1, Ordering::SeqCst);
-        InteractiveThumbGuard
-    }
-}
-
-impl Drop for InteractiveThumbGuard {
-    fn drop(&mut self) {
-        INTERACTIVE_THUMBS_PENDING.fetch_sub(1, Ordering::SeqCst);
-    }
-}
-
-fn interactive_thumbs_pending() -> bool {
-    INTERACTIVE_THUMBS_PENDING.load(Ordering::SeqCst) > 0
-}
-
 /// Cache keys currently being GENERATED. A burst of tiles requesting the same
 /// fresh file used to fire up to `max_concurrent_thumb_decodes()` identical
 /// full decodes; now the first request generates while the rest wait on the
@@ -332,16 +307,28 @@ impl Drop for ThumbInflightGuard {
     }
 }
 
-/// Where cached thumbnails live: a PERSISTENT cache dir (~/Library/Caches on
-/// macOS), not the temp dir. macOS purges TMPDIR periodically, and every purge
-/// meant the next column open regenerated the whole library's thumbnails — a
-/// recurring cold-cache decode storm. Falls back to the temp dir only when no
-/// cache dir can be resolved.
+/// Thumbnail files are short-lived native-operation artifacts. Firebase WebP
+/// thumbnails render cloud rail items directly; local staging files use TMPDIR
+/// only and leave no persistent Mac cache.
 fn thumbnail_cache_dir() -> PathBuf {
-    dirs::cache_dir()
-        .unwrap_or_else(std::env::temp_dir)
+    std::env::temp_dir()
         .join("com.aakashnarukula.syncshot")
         .join("thumbnails")
+}
+
+/// Thumbnail bytes are session-only. Remove the exact app-owned temp cache on
+/// launch so a prior crash/forced quit cannot leave screenshot data behind.
+pub fn clear_temporary_thumbnail_cache() {
+    let _ = fs::remove_dir_all(thumbnail_cache_dir());
+}
+
+/// Remove known cached thumbnail variants before deleting a staging source.
+pub fn delete_thumbnail_cache_for_source(source_path: &str) {
+    for max_px in [32, 64, 512] {
+        if let Ok((path, _)) = thumb_cache_path(source_path, max_px) {
+            let _ = fs::remove_file(path);
+        }
+    }
 }
 
 /// Compute the cache path (and its raw key) for `source_path`'s thumbnail.
@@ -372,12 +359,10 @@ fn thumb_cache_path(source_path: &str, max_px: u32) -> AppResult<(PathBuf, u64)>
 
 /// Return the path to a cached, downscaled thumbnail of the screenshot at
 /// `source_path` (longest side ≈ `max_px`), generating it if missing.
-/// INTERACTIVE entry point (the launch backfill pauses while any of these are
-/// pending). Concurrent calls are safe: each generation writes to a unique
+/// Concurrent calls are safe: each generation writes to a unique
 /// temp file and atomically renames it into place, and same-file bursts
 /// decode exactly once (see ThumbInflightGuard).
 pub fn screenshot_thumbnail(source_path: &str, max_px: u32) -> AppResult<String> {
-    let _interactive = InteractiveThumbGuard::new();
     thumbnail_impl(source_path, max_px)
 }
 
@@ -450,69 +435,6 @@ fn finalize_thumb(tmp_path: &Path, thumb_path: &Path) -> AppResult<()> {
         let _ = fs::remove_file(tmp_path);
         format!("Failed to finalize thumbnail: {}", e)
     })
-}
-
-/// The `max_px` the launch-time thumbnail backfill generates at. MUST match
-/// `THUMB_MAX_PX` in `src/components/ScreenshotThumbnail.tsx` — a different
-/// value keys a different cache entry and the rail would still cold-decode.
-pub const BACKFILL_THUMB_MAX_PX: u32 = 512;
-
-/// One LOW-PRIORITY pass over the image files in `dir`, generating any
-/// missing/stale thumbnail cache entries. Strictly serial (one decode at a
-/// time), sleeps between files, and pauses whenever an interactive thumbnail
-/// request is pending — interactive work always wins; the backfill is starved
-/// by design. Returns (generated, skipped, failed) counts.
-pub fn backfill_thumbnails(dir: &str, max_px: u32) -> (usize, usize, usize) {
-    let entries = match fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return (0, 0, 0),
-    };
-    let mut files: Vec<PathBuf> = entries
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| {
-            let ext = p
-                .extension()
-                .and_then(|e| e.to_str())
-                .map(|s| s.to_lowercase())
-                .unwrap_or_default();
-            matches!(
-                ext.as_str(),
-                "png" | "jpg" | "jpeg" | "gif" | "webp" | "heic"
-            ) && p.is_file()
-        })
-        .collect();
-    files.sort();
-
-    let (mut generated, mut skipped, mut failed) = (0, 0, 0);
-    for file in files {
-        while interactive_thumbs_pending() {
-            std::thread::sleep(std::time::Duration::from_millis(200));
-        }
-        let path_str = file.to_string_lossy().into_owned();
-        match thumb_cache_path(&path_str, max_px) {
-            Ok((thumb_path, _)) if thumb_path.exists() => {
-                skipped += 1;
-                continue;
-            }
-            Ok(_) => {}
-            Err(_) => {
-                // File vanished between the listing and the stat.
-                failed += 1;
-                continue;
-            }
-        }
-        match thumbnail_impl(&path_str, max_px) {
-            Ok(_) => generated += 1,
-            Err(e) => {
-                failed += 1;
-                eprintln!("[thumb-backfill] {} failed: {}", path_str, e);
-            }
-        }
-        // Yield between files so the pass never monopolizes I/O or a core.
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    (generated, skipped, failed)
 }
 
 /// macOS fast thumbnailing via ImageIO's CGImageSource: decodes STRAIGHT to a
@@ -611,10 +533,7 @@ mod cg_thumb {
         static kCGImageSourceCreateThumbnailFromImageAlways: CFStringRef;
         static kCGImageSourceCreateThumbnailWithTransform: CFStringRef;
         static kCGImageSourceThumbnailMaxPixelSize: CFStringRef;
-        fn CGImageSourceCreateWithURL(
-            url: CFURLRef,
-            options: CFDictionaryRef,
-        ) -> CGImageSourceRef;
+        fn CGImageSourceCreateWithURL(url: CFURLRef, options: CFDictionaryRef) -> CGImageSourceRef;
         fn CGImageSourceCreateThumbnailAtIndex(
             src: CGImageSourceRef,
             index: usize,
@@ -702,7 +621,10 @@ mod cg_thumb {
             image,
         );
 
-        CF::new(CGBitmapContextCreateImage(ctx.0), "CGBitmapContextCreateImage")
+        CF::new(
+            CGBitmapContextCreateImage(ctx.0),
+            "CGBitmapContextCreateImage",
+        )
     }
 
     /// Owned CF object released on drop. Never wrap the extern constants.
@@ -788,7 +710,7 @@ mod cg_thumb {
             let png_type = CF::new(
                 CFStringCreateWithCString(
                     std::ptr::null(),
-                    b"public.png\0".as_ptr() as *const c_char,
+                    c"public.png".as_ptr(),
                     K_CF_STRING_ENCODING_UTF8,
                 ),
                 "CFString(public.png)",
@@ -982,17 +904,17 @@ mod tests {
         use std::sync::Arc;
 
         #[test]
-        fn cache_dir_is_persistent_not_tmp() {
+        fn cache_dir_is_temporary() {
             let dir = thumbnail_cache_dir();
             let s = dir.to_string_lossy();
             assert!(
                 s.ends_with("com.aakashnarukula.syncshot/thumbnails"),
                 "got: {s}"
             );
-            // On macOS this must resolve to ~/Library/Caches, never the
-            // periodically-purged TMPDIR (purge = recurring decode storm).
+            // Cloud-only Mac builds must never persist screenshot thumbnails
+            // under ~/Library/Caches.
             #[cfg(target_os = "macos")]
-            assert!(s.contains("/Library/Caches/"), "got: {s}");
+            assert!(!s.contains("/Library/Caches/"), "got: {s}");
         }
 
         #[test]
@@ -1088,40 +1010,6 @@ mod tests {
         }
 
         #[test]
-        fn backfill_generates_missing_and_skips_fresh() {
-            let dir = std::env::temp_dir().join(format!(
-                "syncshot_backfill_test_{}",
-                std::process::id()
-            ));
-            std::fs::create_dir_all(&dir).unwrap();
-            let a = dir.join("a.png");
-            let b = dir.join("b.png");
-            DynamicImage::new_rgba8(64, 48).save(&a).unwrap();
-            DynamicImage::new_rgba8(48, 64).save(&b).unwrap();
-            // Non-image files must be ignored entirely.
-            std::fs::write(dir.join("notes.txt"), b"not an image").unwrap();
-
-            // Pre-generate a's thumbnail: backfill must skip it, generate b's.
-            let a_thumb = screenshot_thumbnail(&a.to_string_lossy(), 32).unwrap();
-
-            let (generated, skipped, failed) =
-                backfill_thumbnails(&dir.to_string_lossy(), 32);
-            assert_eq!((generated, skipped, failed), (1, 1, 0));
-
-            let b_thumb = thumb_cache_path(&b.to_string_lossy(), 32).unwrap().0;
-            assert!(b_thumb.exists(), "backfill must generate b's thumbnail");
-
-            // A second pass is a full skip.
-            let (generated2, skipped2, failed2) =
-                backfill_thumbnails(&dir.to_string_lossy(), 32);
-            assert_eq!((generated2, skipped2, failed2), (0, 2, 0));
-
-            let _ = std::fs::remove_file(std::path::Path::new(&a_thumb));
-            let _ = std::fs::remove_file(&b_thumb);
-            let _ = std::fs::remove_dir_all(&dir);
-        }
-
-        #[test]
         fn jpeg_source_thumbnail_is_clean_rgba() {
             // A JPEG source exercises the CGImageSource decode → sRGB8
             // normalization → PNG encode path (mobile shots are JPEG/HEIC, and
@@ -1153,10 +1041,8 @@ mod tests {
         #[test]
         fn thumbnail_bytes_downscale_and_cache() {
             // Source: a 64x48 PNG written to a temp file.
-            let dir = std::env::temp_dir().join(format!(
-                "syncshot_thumb_test_{}",
-                std::process::id()
-            ));
+            let dir =
+                std::env::temp_dir().join(format!("syncshot_thumb_test_{}", std::process::id()));
             std::fs::create_dir_all(&dir).unwrap();
             let src = dir.join("src.png");
             let img = DynamicImage::new_rgba8(64, 48);

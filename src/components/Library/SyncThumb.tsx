@@ -3,9 +3,10 @@ import { toast } from "sonner";
 import { Check, ImageOff, Loader2, Trash2 } from "lucide-react";
 import {
   deleteScreenshotDoc,
-  saveReceivedScreenshot,
+  copyScreenshotToClipboard,
   storageDownloadUrl,
 } from "@/lib/sync/screenshots";
+import { cloudScreenshotPath } from "@/lib/sync/order";
 import type { ScreenshotDoc } from "@/lib/sync/types";
 import { useUid } from "@/stores/syncStore";
 import { cn } from "@/lib/utils";
@@ -60,7 +61,7 @@ export function SyncThumb({ item }: SyncThumbProps) {
       setFailed(true);
       return;
     }
-    storageDownloadUrl(item.thumbPath)
+    storageDownloadUrl(item.thumbPath, item.sha256)
       .then((u) => {
         if (!cancelled) setSrc(u);
       })
@@ -71,7 +72,7 @@ export function SyncThumb({ item }: SyncThumbProps) {
     return () => {
       cancelled = true;
     };
-  }, [item.thumbPath, inView]);
+  }, [item.thumbPath, item.sha256, inView]);
 
   const savedTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => () => {
@@ -82,12 +83,12 @@ export function SyncThumb({ item }: SyncThumbProps) {
     if (saving || !item.fullPath) return;
     setSaving(true);
     try {
-      await saveReceivedScreenshot(item);
+      await copyScreenshotToClipboard(cloudScreenshotPath(item.id, item.sha256));
       setSaved(true);
-      toast.success("Saved & copied to clipboard", { duration: 1800 });
+      toast.success("Copied to clipboard", { duration: 1800 });
       savedTimer.current = setTimeout(() => setSaved(false), 1600);
     } catch (err) {
-      toast.error("Failed to save image", {
+      toast.error("Failed to copy image", {
         description: err instanceof Error ? err.message : String(err),
         duration: 4000,
       });

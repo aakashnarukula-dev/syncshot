@@ -1,21 +1,42 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { getCurrentWindow, LogicalPosition, LogicalSize } from "@tauri-apps/api/window";
-import { getAllWebviewWindows } from "@tauri-apps/api/webviewWindow";
+import {
+  Effect,
+  EffectState,
+  getCurrentWindow,
+  LogicalPosition,
+  LogicalSize,
+} from "@tauri-apps/api/window";
 import { register, unregister } from "@tauri-apps/plugin-global-shortcut";
 import { Store } from "@tauri-apps/plugin-store";
 import type { KeyboardShortcut } from "./components/preferences/KeyboardShortcutManager";
 import { toast } from "sonner";
 import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
+import { flushSync } from "react-dom";
 import { loadLicenseStatus, type LicenseStatus } from "@/lib/license";
 import { Paywall } from "@/components/Paywall";
 // Light module (zustand + types only — no Firebase): safe in the entry chunk.
-import { registerRenameCapturePath, useSyncStore } from "@/stores/syncStore";
-import { clearThumbs, dropThumb } from "@/lib/thumbCache";
+import {
+  loadMoreScreenshots,
+  registerIncomingScreenshotPreview,
+  registerIncomingScreenshotSaved,
+  registerRenameCapturePath,
+  useSyncStore,
+} from "@/stores/syncStore";
+import { cacheThumbBlob, cacheThumbDataUrl, clearThumbs, cloneThumb, dropThumb } from "@/lib/thumbCache";
 // Firebase-FREE column ordering (own module so the heavy Firebase SDK stays off
 // this startup-critical path): order the edge column by each screenshot's true
 // creation time, not file mtime.
-import { isRecentScreenshot, orderScreenshotsByCreatedAt } from "@/lib/sync/order";
+import {
+  cloudScreenshotPath,
+  cloudScreenshotId,
+  importScreenshotPath,
+  isCloudScreenshotPath,
+  isImportScreenshotPath,
+  isSyncedCacheFile,
+  orderScreenshotsByCreatedAt,
+} from "@/lib/sync/order";
+import { omitPendingPaths, replaceRailPath } from "@/lib/railPaths";
 // Startup-critical: static import so it ships in the entry chunk and never
 // needs a runtime protocol fetch that can stall behind the launch IPC burst.
 import { ScreenshotThumbnail } from "./components/ScreenshotThumbnail";
@@ -29,25 +50,49 @@ type AppMode = "main" | "preferences" | "thumbnail" | "pairing";
 export type ColumnView = "screenshots" | "clipboard";
 
 const THUMB_WIDTH = 240;
-const COLLAPSED_WIDTH = 18;
-const COLLAPSED_HEIGHT = 90;
-const THUMB_INNER_PAD_X = 24; // px-3 each side
+// The collapsed launcher has to be wide enough to be discoverable at the
+// display edge. The former 18px handle was technically clickable but was
+// practically invisible against a dark desktop, which made the pill appear to
+// be missing. Keep the expanded rail at a compact 240px and size its items
+// from the remaining content width.
+const COLLAPSED_WIDTH = 24;
+const COLLAPSED_HEIGHT = 72;
+const RAIL_RADIUS = 20;
+const THUMB_INNER_PAD_X = COLLAPSED_WIDTH + 16; // launcher + list px-1/pr-3
 const THUMB_ITEM_HEIGHT = Math.round((THUMB_WIDTH - THUMB_INNER_PAD_X) * 3 / 4); // 4:3 aspect
 const THUMB_GAP = 20; // gap-5
 const THUMB_VERT_PAD = 32; // py-4
-const THUMB_VISIBLE_COUNT = 4; // start scrolling after 4
+const THUMB_VISIBLE_COUNT = 5; // start scrolling after five screenshots
+const SCREENSHOT_COLUMN_AUTO_HIDE_MS = 5_000;
 const THUMB_MAX_HEIGHT =
   THUMB_VISIBLE_COUNT * THUMB_ITEM_HEIGHT +
   (THUMB_VISIBLE_COUNT - 1) * THUMB_GAP +
   THUMB_VERT_PAD;
 const THUMB_MIN_HEIGHT = THUMB_ITEM_HEIGHT + THUMB_VERT_PAD;
-const THUMB_MARGIN = 24;
 // Segmented Screenshots/Text toggle pinned at the top of the expanded column
 // (pt-3 + control + pb-1.5) — added on top of each view's content height.
 const COL_TOGGLE_HEIGHT = 46;
 // Compact copied-text card estimate (4 clamped text lines + meta + padding).
 const CLIP_ITEM_HEIGHT = 96;
 const CLIP_GAP = 8; // gap-2
+// The rail visibly holds five screenshots. Fetch a small buffer, then page
+// older cache entries only when the user reaches the end of that list.
+
+/** True only for files owned by SyncShot's current write/cache directory.
+ * Legacy Desktop screenshots are deliberately display-only: viewing them in
+ * the pill must never upload, copy, rename, or delete the user's originals. */
+function isManagedScreenshotPath(path: string, dir: string): boolean {
+  if (isCloudScreenshotPath(path) || isImportScreenshotPath(path)) return true;
+  if (
+    path.startsWith("/tmp/") ||
+    path.startsWith("/private/tmp/") ||
+    path.startsWith("/var/folders/") ||
+    path.startsWith("/private/var/folders/")
+  ) return true;
+  if (!dir) return false;
+  const root = dir.endsWith("/") ? dir : `${dir}/`;
+  return path.startsWith(root);
+}
 
 function computeThumbWindowHeight(count: number): number {
   if (count <= 0) return THUMB_MIN_HEIGHT + COL_TOGGLE_HEIGHT;
@@ -63,11 +108,6 @@ function computeClipWindowHeight(count: number): number {
   return Math.max(THUMB_MIN_HEIGHT, Math.min(raw, THUMB_MAX_HEIGHT)) + COL_TOGGLE_HEIGHT;
 }
 
-function columnWindowHeight(view: ColumnView, thumbCount: number): number {
-  return view === "clipboard"
-    ? computeClipWindowHeight(useSyncStore.getState().clipboard.length)
-    : computeThumbWindowHeight(thumbCount);
-}
 type CaptureMode = "region" | "fullscreen" | "window";
 
 // Cosmetic window flags (decorations/title/alwaysOnTop/contentProtected) can
@@ -88,6 +128,14 @@ async function showNormalWindow(
   height: number,
   opts: { title?: string; resizable?: boolean; alwaysOnTop?: boolean; decorations?: boolean } = {},
 ) {
+  // The edge rail is intentionally an all-Spaces/fullscreen overlay. The same
+  // native window becomes Library/Preferences/Paywall, where that behavior is
+  // wrong: restore normal macOS Space management before showing the decorated
+  // view. The native command is a no-op on other platforms.
+  try { await invoke("set_pill_all_spaces", { enable: false }); } catch (e) { console.error("restore normal Space behavior failed:", e); }
+  // Native vibrancy belongs only to the edge pill/rail. Normal app surfaces
+  // provide their own opaque backgrounds.
+  await tweak(() => w.clearEffects());
   if (opts.alwaysOnTop !== undefined) await tweak(() => w.setAlwaysOnTop(opts.alwaysOnTop!));
   await tweak(() => w.setContentProtected(false));
   if (opts.resizable !== undefined) await tweak(() => w.setResizable(opts.resizable!));
@@ -120,24 +168,28 @@ const DEFAULT_SHORTCUTS: KeyboardShortcut[] = [
   { id: "window", action: "Capture Window", shortcut: "CommandOrControl+Shift+D", enabled: false },
 ];
 
-// Cache the active display's logical geometry so expanding from the pill needs
-// zero IPC. Refreshed on every placement. Fields are GLOBAL top-left-origin
-// POINTS (the LogicalPosition space) — never divide by scaleFactor here.
-let cachedMon: { left: number; top: number; height: number } | null = null;
-function cacheRect(rect: { left: number; top: number; height: number }) {
-  cachedMon = { left: rect.left, top: rect.top, height: rect.height };
+type DisplayRect = { left: number; top: number; width: number; height: number };
+
+// Cache the display's true AppKit visibleFrame. It is already the usable work
+// area (menu bar and Dock excluded) in Tauri's logical-position coordinate
+// space, so the compact launcher and full-height rail can share one centre.
+let cachedMon: DisplayRect | null = null;
+let cachedWorkArea: DisplayRect | null = null;
+function cacheRect(rect: DisplayRect, workArea: DisplayRect = rect) {
+  cachedMon = rect;
+  cachedWorkArea = workArea;
 }
 
-// Resolve the rect of the physical display under a point (or the cursor when no
-// point is given) via CoreGraphics (CGGetDisplaysWithPoint + CGDisplayBounds).
+// Resolve the usable rect of the physical display under a point (or the cursor
+// when no point is given) via CoreGraphics hit-testing + NSScreen.visibleFrame.
 // winit's availableMonitors() reports positions in a single global PHYSICAL
 // space, so dividing each monitor by its OWN scaleFactor mismatched the cursor's
-// display across mixed-DPI setups (retina built-in + scale-1 externals). The CG
-// rect is already in global top-left-origin POINTS = the LogicalPosition space.
+// display across mixed-DPI setups (retina built-in + scale-1 externals). The
+// rect is already in global top-left-origin POINTS = LogicalPosition space.
 async function cursorDisplayRect(
   mouseX?: number,
   mouseY?: number,
-): Promise<{ left: number; top: number; width: number; height: number } | null> {
+): Promise<DisplayRect | null> {
   try {
     const r = await invoke<[number, number, number, number] | null>("cursor_display_bounds", {
       x: mouseX,
@@ -149,9 +201,31 @@ async function cursorDisplayRect(
   }
 }
 
+function expandedColumnGeometry(
+  view: ColumnView,
+  workArea: DisplayRect,
+): { height: number; y: number } {
+  if (view === "screenshots") {
+    return { height: workArea.height, y: workArea.top };
+  }
+  const height = Math.min(
+    computeClipWindowHeight(useSyncStore.getState().clipboard.length),
+    workArea.height,
+  );
+  return {
+    height,
+    y: workArea.top + Math.max(0, (workArea.height - height) / 2),
+  };
+}
+
 async function showThumbnailWindow(count: number, mouseX?: number, mouseY?: number) {
   const appWindow = getCurrentWindow();
-  const height = computeThumbWindowHeight(count);
+  const fallbackHeight = computeThumbWindowHeight(count);
+
+  // Restore overlay behavior whenever this shared window returns to the pill.
+  // Without this, opening Preferences once left future rails confined to the
+  // current Space instead of following the user across desktops/fullscreen apps.
+  try { await invoke("set_pill_all_spaces", { enable: true }); } catch (e) { console.error("set pill Space behavior failed:", e); }
 
   // Kick off the display query immediately and run the geometry-independent
   // window flags concurrently, instead of awaiting ~6 IPC calls one-by-one.
@@ -162,25 +236,29 @@ async function showThumbnailWindow(count: number, mouseX?: number, mouseY?: numb
     appWindow.setResizable(false).catch(() => {}),
     appWindow.setAlwaysOnTop(true).catch(() => {}),
     appWindow.setContentProtected(false).catch(() => {}),
+    appWindow.setEffects({
+      effects: [Effect.Sidebar],
+      state: EffectState.Active,
+      radius: RAIL_RADIUS,
+    }).catch(() => {}),
   ]);
 
   let placed = false;
   try {
     const rect = await rectPromise;
     if (rect) {
-      cacheRect(rect);
       const x = rect.left; // flush to the left screen edge (pill touches edge)
-      const y = rect.top + Math.max(THUMB_MARGIN, (rect.height - height) / 2);
+      cacheRect(rect, rect);
       await Promise.all([
-        appWindow.setSize(new LogicalSize(THUMB_WIDTH, height)),
-        appWindow.setPosition(new LogicalPosition(x, y)),
+        appWindow.setSize(new LogicalSize(THUMB_WIDTH, rect.height)),
+        appWindow.setPosition(new LogicalPosition(x, rect.top)),
       ]);
       placed = true;
     }
   } catch {}
 
   if (!placed) {
-    await appWindow.setSize(new LogicalSize(THUMB_WIDTH, height));
+    await appWindow.setSize(new LogicalSize(THUMB_WIDTH, fallbackHeight));
     await appWindow.center();
   }
 
@@ -189,9 +267,9 @@ async function showThumbnailWindow(count: number, mouseX?: number, mouseY?: numb
 }
 
 // WebKit's :hover can go stale when the shared window is hidden and re-shown
-// (e.g. right after the pairing window closes): no mouse event ever clears it,
-// so the auto-hide poll would re-arm forever. Verify against the real cursor;
-// on any failure err toward "hovering" (the pre-existing behavior).
+// (e.g. right after the pairing window closes). Verify against the real cursor
+// before the display-follow poll moves the window; on failure err toward
+// "hovering" so an active control surface is never yanked away.
 async function cursorInsideWindow(): Promise<boolean> {
   try {
     const w = getCurrentWindow();
@@ -211,15 +289,21 @@ async function cursorInsideWindow(): Promise<boolean> {
 
 async function showCollapsedThumbnail() {
   const appWindow = getCurrentWindow();
+  try { await invoke("set_pill_all_spaces", { enable: true }); } catch (e) { console.error("set pill Space behavior failed:", e); }
   try { await appWindow.setDecorations(false); } catch {}
   try { await appWindow.setResizable(false); } catch {}
+  // Native NSVisualEffectView always owns the window's full rectangular layer.
+  // Even with a corner radius it left a faint glass square visible outside the
+  // CSS capsule. The small launcher uses its own clipped translucent surface;
+  // native Sidebar vibrancy is restored only when the full rail expands.
+  try { await appWindow.clearEffects(); } catch {}
   await appWindow.setSize(new LogicalSize(COLLAPSED_WIDTH, COLLAPSED_HEIGHT));
   try {
     const rect = await cursorDisplayRect();
     if (rect) {
-      cacheRect(rect);
       const x = rect.left;
-      const y = rect.top + Math.max(THUMB_MARGIN, (rect.height - COLLAPSED_HEIGHT) / 2);
+      cacheRect(rect, rect);
+      const y = rect.top + Math.max(0, (rect.height - COLLAPSED_HEIGHT) / 2);
       await appWindow.setPosition(new LogicalPosition(x, y));
     }
   } catch {}
@@ -232,23 +316,35 @@ async function showCollapsedThumbnail() {
 // set, so we skip the decoration/alwaysOnTop/show IPC (pure latency on expand)
 // and only change geometry. Caller resizes while the column is still transparent
 // (opacity 0, pre-reveal) so the grow/move is invisible — no jump.
-async function expandThumbWindow(height: number) {
+async function expandThumbWindow(view: ColumnView, thumbCount: number) {
   const appWindow = getCurrentWindow();
-  let mon = cachedMon;
-  if (!mon) {
+  let display = cachedMon;
+  let workArea = cachedWorkArea;
+  if (!display || !workArea) {
     const rect = await cursorDisplayRect();
-    if (rect) cacheRect(rect);
-    mon = cachedMon;
+    if (rect) {
+      cacheRect(rect, rect);
+    }
+    display = cachedMon;
+    workArea = cachedWorkArea;
   }
   try {
-    if (mon) {
-      const x = mon.left;
-      const y = mon.top + Math.max(THUMB_MARGIN, (mon.height - height) / 2);
+    await appWindow.setEffects({
+      effects: [Effect.Sidebar],
+      state: EffectState.Active,
+      radius: RAIL_RADIUS,
+    }).catch(() => {});
+    if (display && workArea) {
+      const x = display.left;
+      const { height, y } = expandedColumnGeometry(view, workArea);
       await Promise.all([
         appWindow.setPosition(new LogicalPosition(x, y)),
         appWindow.setSize(new LogicalSize(THUMB_WIDTH, height)),
       ]);
     } else {
+      const height = view === "screenshots"
+        ? computeThumbWindowHeight(thumbCount)
+        : computeClipWindowHeight(useSyncStore.getState().clipboard.length);
       await appWindow.setSize(new LogicalSize(THUMB_WIDTH, height));
     }
   } catch {}
@@ -257,23 +353,27 @@ async function expandThumbWindow(height: number) {
 async function resizeThumbWindowKeepingBottom(count: number) {
   const appWindow = getCurrentWindow();
   try {
-    let mon = cachedMon;
-    if (!mon) {
+    let display = cachedMon;
+    let workArea = cachedWorkArea;
+    if (!display || !workArea) {
       const rect = await cursorDisplayRect();
-      if (rect) cacheRect(rect);
-      mon = cachedMon;
+      if (rect) {
+        cacheRect(rect, rect);
+      }
+      display = cachedMon;
+      workArea = cachedWorkArea;
     }
-    const newH = computeThumbWindowHeight(count);
     let placed = false;
-    if (mon) {
-      const x = mon.left; // flush to the left screen edge (pill touches edge)
-      const y = mon.top + Math.max(THUMB_MARGIN, (mon.height - newH) / 2);
+    if (display && workArea) {
+      const x = display.left; // flush to the left screen edge (pill touches edge)
+      const newH = workArea.height;
+      const y = workArea.top;
       await appWindow.setSize(new LogicalSize(THUMB_WIDTH, newH));
       await appWindow.setPosition(new LogicalPosition(x, y));
       placed = true;
     }
     if (!placed) {
-      await appWindow.setSize(new LogicalSize(THUMB_WIDTH, newH));
+      await appWindow.setSize(new LogicalSize(THUMB_WIDTH, computeThumbWindowHeight(count)));
     }
   } catch (e) {
     console.error("resize thumb window failed:", e);
@@ -315,22 +415,38 @@ function App() {
 }
 
 function MainApp() {
-  const [mode, setMode] = useState<AppMode>("main");
+  // The edge pill is the app's persistent launcher, not a by-product of having
+  // screenshots in memory. Starting in its collapsed state means opening
+  // SyncShot always gives the user a visible, tappable surface while the local
+  // cache and Firebase hydrate in the background.
+  const [mode, setMode] = useState<AppMode>("thumbnail");
   // Mirror `mode` into a ref so background pollers (folder watch) can tell when a
   // normal decorated window (library/preferences) is open and NOT yank it back
   // into the thin thumbnail-column geometry on a new screenshot.
-  const modeRef = useRef<AppMode>("main");
+  const modeRef = useRef<AppMode>("thumbnail");
   useEffect(() => { modeRef.current = mode; }, [mode]);
   const [saveDir, setSaveDir] = useState<string>("");
+  const [legacyCacheDir, setLegacyCacheDir] = useState<string>("");
   const [copyToClipboard, setCopyToClipboard] = useState(true);
   const reportError = useCallback((msg: string) => {
     toast.error(msg, { duration: 5000 });
   }, []);
-  const [isCapturing, setIsCapturing] = useState(false);
+  // Global-shortcut handlers receive both Pressed and Released events. Keep the
+  // capture lock in a ref so it flips synchronously before a second event can
+  // enter; React state is intentionally too late for this kind of IPC callback.
+  const isCapturingRef = useRef(false);
   const [thumbs, setThumbs] = useState<string[]>([]);
   const thumbsRef = useRef<string[]>([]);
-  const [isCollapsed, setIsCollapsed] = useState(false);
-  const isCollapsedRef = useRef(false);
+  const pillPageLoadingRef = useRef(false);
+  // A local scan or Firestore callback can observe a file while deletion is
+  // still running. Suppress those paths until the operation settles so an
+  // optimistic delete/replace cannot visually resurrect the old screenshot.
+  const pendingRemovalPathsRef = useRef<Set<string>>(new Set());
+  // Editor crops can arrive faster than Storage/Firestore round-trips. Process
+  // replacements in order: publish crop N before crop N+1 removes its file.
+  const editorReplacementQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const [isCollapsed, setIsCollapsed] = useState(true);
+  const isCollapsedRef = useRef(true);
   // Which list the edge column shows: local screenshot thumbnails or the
   // synced copied-text history. Ref mirrors state for stale-closure-free reads.
   const [columnView, setColumnView] = useState<ColumnView>("screenshots");
@@ -339,16 +455,49 @@ function MainApp() {
     columnViewRef.current = view;
     setColumnView(view);
   }, []);
-  // Bumped to ask the thumbnail column to animate its collapse (auto-hide).
-  const [collapseSignal, setCollapseSignal] = useState(0);
   // Bumped after the window is shown so the column replays its open animation
   // while actually visible (otherwise it animates behind a hidden window).
   const [openSignal, setOpenSignal] = useState(0);
+  const [autoCollapseSignal, setAutoCollapseSignal] = useState(0);
   const autoHideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const openEditorsRef = useRef(0);
   const [licenseStatus, setLicenseStatus] = useState<LicenseStatus | null>(null);
   const licenseStatusRef = useRef<LicenseStatus | null>(null);
   const [showPaywall, setShowPaywall] = useState(false);
+  const didShowInitialPillRef = useRef(false);
+
+  // A macOS resize is asynchronous to React. If a delayed collapse resize lands
+  // after another render, the native surface can be pill-width while the webview
+  // still tries to paint the full screenshot column (the vertical strip of
+  // thumbnail fragments reported in the UI). Treat native pill geometry as the
+  // authoritative safety signal and immediately select the pill renderer.
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    void getCurrentWindow().onResized(({ payload: size }) => {
+      // `onResized` reports physical pixels. A 18 logical-px pill is 36 px on a
+      // Retina display; 96 leaves room for scale factors without ever matching
+      // the 240 logical-px expanded rail.
+      if (modeRef.current !== "thumbnail" || size.width > 96 || isCollapsedRef.current) return;
+      isCollapsedRef.current = true;
+      setIsCollapsed(true);
+    }).then((stop) => { unlisten = stop; }).catch(() => {});
+    return () => { unlisten?.(); };
+  }, []);
+
+  // The native window starts hidden. Once settings resolve, surface a compact
+  // launcher even if the cache is empty (or still downloading). Without this,
+  // opening SyncShot during hydration showed an invisible/blank tiny window
+  // because the old code rendered the pill only after the first image arrived.
+  useEffect(() => {
+    if (didShowInitialPillRef.current || !saveDir) return;
+    didShowInitialPillRef.current = true;
+    isCollapsedRef.current = true;
+    setIsCollapsed(true);
+    setMode("thumbnail");
+    void showCollapsedThumbnail().catch((error) =>
+      console.error("show initial pill failed:", error),
+    );
+  }, [saveDir]);
 
   useEffect(() => {
     // Only setState on a REAL change: the poll used to store a fresh object
@@ -380,7 +529,7 @@ function MainApp() {
   // the visible surface, relocate it to whichever physical display the cursor is
   // currently on (flush-left, vertically centered) — live, not only at reveal.
   // Repositions only (never resizes), so it preserves collapsed-pill vs expanded-
-  // column geometry and won't fight the genie animations or the auto-hide poll.
+  // column geometry and won't fight the genie animations.
   useEffect(() => {
     const POLL_MS = 400;
     let busy = false;
@@ -388,7 +537,6 @@ function MainApp() {
       if (busy) return;
       // Only while the column/pill is the visible surface and not mid-use.
       if (modeRef.current === "pairing" || modeRef.current === "preferences") return;
-      if (thumbsRef.current.length === 0) return;
       if (openEditorsRef.current > 0) return;
       // Paused while the window is focused or the cursor is inside it (both
       // sync checks — no IPC). :hover cross-checks the hover ref because
@@ -406,14 +554,26 @@ function MainApp() {
         if (cachedMon && rect.left === cachedMon.left && rect.top === cachedMon.top) return;
         // Don't yank the window out from under an active hover/interaction.
         if (await cursorInsideWindow()) return;
-        // Relocate, preserving current size (collapsed pill vs expanded column).
-        const sf = await w.scaleFactor();
-        const size = await w.outerSize();
-        const hLogical = size.height / sf;
+        // `rect` is the true usable work area, so both states share its centre.
         const x = rect.left;
-        const y = rect.top + Math.max(THUMB_MARGIN, (rect.height - hLogical) / 2);
-        await w.setPosition(new LogicalPosition(x, y));
-        cacheRect(rect);
+        const workArea = rect;
+        cacheRect(rect, workArea);
+        if (isCollapsedRef.current) {
+          const y = workArea.top + Math.max(0, (workArea.height - COLLAPSED_HEIGHT) / 2);
+          await Promise.all([
+            w.setSize(new LogicalSize(COLLAPSED_WIDTH, COLLAPSED_HEIGHT)),
+            w.setPosition(new LogicalPosition(x, y)),
+          ]);
+        } else {
+          const { height, y } = expandedColumnGeometry(
+            columnViewRef.current,
+            workArea,
+          );
+          await Promise.all([
+            w.setSize(new LogicalSize(THUMB_WIDTH, height)),
+            w.setPosition(new LogicalPosition(x, y)),
+          ]);
+        }
       } catch {
         // ignore transient IPC errors
       } finally {
@@ -473,20 +633,22 @@ function MainApp() {
   }, []);
 
   // Closing a modal-style reuse of the shared window (pairing/preferences)
-  // must hand it back to the column: restore the collapsed edge pill when
-  // there are screenshots, otherwise hide entirely (the old behavior).
+  // always hands it back to the collapsed edge pill. The launcher remains
+  // useful even while the screenshot cache is empty or still hydrating.
   const restoreColumnAfterModal = useCallback(async () => {
-    setMode("main");
     const w = getCurrentWindow();
     await tweak(() => w.setDecorations(false));
     await tweak(() => w.setTitle(""));
-    if (thumbsRef.current.length > 0) {
-      isCollapsedRef.current = true;
+    isCollapsedRef.current = true;
+    setIsCollapsed(true);
+    setMode("thumbnail");
+    // The React surface changes first, so a delayed native IPC call can never
+    // squeeze Preferences or the screenshot column into pill-sized geometry.
+    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+    try {
       await showCollapsedThumbnail();
-      setIsCollapsed(true);
-      setMode("thumbnail");
-    } else {
-      try { await w.hide(); } catch (e) { console.error("hide failed:", e); }
+    } catch (error) {
+      console.error("restore collapsed pill failed:", error);
     }
   }, []);
 
@@ -515,6 +677,33 @@ function MainApp() {
     return next;
   }, []);
 
+  // Keep the pill's source list bounded. The native command returns one page
+  // already sorted newest-first; orderScreenshotsByCreatedAt refines that with
+  // Firestore timestamps once they are available.
+  const mergeThumbPages = useCallback((incoming: string[]) => {
+    return updateThumbs((current) => {
+      const seen = new Set<string>();
+      const visibleIncoming = omitPendingPaths(incoming, pendingRemovalPathsRef.current);
+      const visibleCurrent = omitPendingPaths(current, pendingRemovalPathsRef.current);
+      const merged = [...visibleIncoming, ...visibleCurrent].filter((path) => {
+        if (seen.has(path)) return false;
+        seen.add(path);
+        return true;
+      });
+      return orderScreenshotsByCreatedAt(merged);
+    });
+  }, [updateThumbs]);
+
+  const loadOlderPillPage = useCallback(async () => {
+    if (pillPageLoadingRef.current) return;
+    pillPageLoadingRef.current = true;
+    try {
+      if (useSyncStore.getState().screenshotsHasMore) loadMoreScreenshots();
+    } finally {
+      pillPageLoadingRef.current = false;
+    }
+  }, []);
+
   // The capture publisher renames an own-capture cache file to carry its doc id
   // (`shot_{ts}.png` → `{docId}.png`) so the tile resolves its cloud doc by
   // filename. Swap the column's path in place when that happens — the save-dir
@@ -523,9 +712,16 @@ function MainApp() {
   // the rename as a brand-new shot (which would re-surface the window + re-copy
   // the clipboard).
   useEffect(() => {
-    registerRenameCapturePath((from, to) =>
-      updateThumbs((prev) => prev.map((p) => (p === from ? to : p))),
-    );
+    registerRenameCapturePath((from, to) => {
+      void cloneThumb(from, to)
+        .catch(() => {})
+        .finally(() => {
+          updateThumbs((prev) =>
+            prev.includes(from) ? replaceRailPath(prev, from, to) : prev,
+          );
+          dropThumb(from);
+        });
+    });
     return () => registerRenameCapturePath(null);
   }, [updateThumbs]);
 
@@ -544,53 +740,20 @@ function MainApp() {
     setOpenSignal((n) => n + 1);
   }, [setColumnViewBoth]);
 
-  // Idle-based auto-hide: restarts a 10s countdown on every pointer signal. There
-  // is NO sticky "hovering" flag — a flag wedges open forever if a mouseleave is
-  // missed (e.g. the window moves out from under a stationary cursor on open).
-  // Instead, any activity re-arms the timer, and 5s of no activity collapses it.
+  // Keep outside clicks inert, but collapse an expanded screenshot column five
+  // seconds after capture/reveal. Signal the child so its existing genie-out
+  // animation runs before native window geometry shrinks back to the pill.
   const startAutoHide = useCallback(() => {
     if (autoHideTimerRef.current) clearTimeout(autoHideTimerRef.current);
-    autoHideTimerRef.current = null;
-    if (isCollapsedRef.current || thumbsRef.current.length === 0) return;
-    autoHideTimerRef.current = setTimeout(async () => {
+    autoHideTimerRef.current = setTimeout(() => {
       autoHideTimerRef.current = null;
-      if (isCollapsedRef.current || thumbsRef.current.length === 0) return;
-      // An open editor suspends auto-hide — but the editor destroys itself
-      // right after emitting "editor-closed", so that event can be dropped
-      // and the counter wedged > 0 forever. Reconcile against the actual
-      // windows: only keep suspending if an editor-* window really exists.
-      if (openEditorsRef.current > 0) {
-        const countBefore = openEditorsRef.current;
-        let anyEditor = true;
-        try {
-          anyEditor = (await getAllWebviewWindows()).some((w) =>
-            w.label.startsWith("editor-"),
-          );
-        } catch {}
-        // A new editor may have opened mid-await (its window might not be
-        // listed yet) — trust the bumped counter over the stale snapshot.
-        if (anyEditor || openEditorsRef.current > countBefore) {
-          startAutoHide();
-          return;
-        }
-        openEditorsRef.current = 0;
-        // Re-check state that may have changed during the await; if a fresh
-        // timer was armed meanwhile, defer to it instead of collapsing now.
-        if (isCollapsedRef.current || thumbsRef.current.length === 0 || autoHideTimerRef.current) return;
-      }
-      // Pointer parked over the column (window) = still browsing — re-arm.
-      // Checked live at fire time (no sticky hover flag, so a missed
-      // mouseleave can't wedge it open: cursor off the window → next poll
-      // collapses). Covers stationary hover and momentum scrolling, which
-      // generate no mousemove to reset the timer.
-      if (document.documentElement.matches(":hover") && (await cursorInsideWindow())) {
-        startAutoHide();
-        return;
-      }
-      // Play the slide-out animation (same as the manual collapse button)
-      // rather than snapping straight to the collapsed pill.
-      setCollapseSignal((n) => n + 1);
-    }, 5_000);
+      if (
+        modeRef.current !== "thumbnail" ||
+        isCollapsedRef.current ||
+        openEditorsRef.current > 0
+      ) return;
+      setAutoCollapseSignal((signal) => signal + 1);
+    }, SCREENSHOT_COLUMN_AUTO_HIDE_MS);
   }, []);
 
   const pauseAutoHide = useCallback(() => {
@@ -600,10 +763,23 @@ function MainApp() {
     }
   }, []);
 
+  useEffect(() => pauseAutoHide, [pauseAutoHide]);
+
   const handleHoverChange = useCallback((active: boolean) => {
     columnHoveredRef.current = active;
-    // Enter / move / leave all just re-arm the idle countdown.
-    startAutoHide();
+    if (active) {
+      pauseAutoHide();
+    } else if (!isCollapsedRef.current) {
+      // Full grace period begins only after pointer leaves rail. Scroll/wheel
+      // activity reports active too, so timer cannot expire mid-interaction.
+      startAutoHide();
+    }
+  }, [pauseAutoHide, startAutoHide]);
+
+  const handleColumnActivity = useCallback(() => {
+    // Hover already pauses timer. Keyboard/inertial scrolling after pointer
+    // leaves instead restarts full grace period without creating stuck hover.
+    if (!columnHoveredRef.current && !isCollapsedRef.current) startAutoHide();
   }, [startAutoHide]);
 
   // Toggle Screenshots/Text while expanded: swap the view instantly (both
@@ -617,7 +793,7 @@ function MainApp() {
     await new Promise<void>((resolve) =>
       requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
     );
-    await expandThumbWindow(columnWindowHeight(view, thumbsRef.current.length));
+    await expandThumbWindow(view, thumbsRef.current.length);
   }, [setColumnViewBoth, startAutoHide]);
   const [shortcuts, setShortcuts] = useState<KeyboardShortcut[]>(DEFAULT_SHORTCUTS);
   const [settingsVersion, setSettingsVersion] = useState(0);
@@ -626,36 +802,86 @@ function MainApp() {
   // Refs to hold current values for use in callbacks that may have stale closures
   const settingsRef = useRef({ saveDir, copyToClipboard, tempDir });
   const registeredShortcutsRef = useRef<Set<string>>(new Set());
+  // One physical key press may be delivered to more than one surviving plugin
+  // callback during a settings/StrictMode re-registration, and key repeat can
+  // emit additional Pressed events. This shared latch admits exactly one
+  // capture until that shortcut's Released event arrives.
+  const shortcutKeysDownRef = useRef<Set<string>>(new Set());
+  // A burst of remote docs may arrive in one Firestore snapshot. Their paths
+  // should all merge immediately, but only one native show/genie sequence may
+  // run at a time (otherwise the column visibly opens twice).
+  const incomingRevealRef = useRef<Promise<void> | null>(null);
 
   // Keep ref in sync with state
   useEffect(() => {
     settingsRef.current = { saveDir, copyToClipboard, tempDir };
   }, [saveDir, copyToClipboard, tempDir]);
 
-  // Sign-out wipes the local screenshot history: delete the save folder's
-  // screenshots and empty the column. Transition-gated (signedIn -> signedOut)
-  // so a normal signed-out launch never touches local files.
+  // Remote fast path: Firestore publishes a small WebP before the full image.
+  // Insert the future cache path immediately, so ThumbnailItem falls back to
+  // that Firebase thumbnail and the pill paints while the full upload/download
+  // continues. When the full bytes land at the same path, the second callback
+  // enables local copy/edit without waiting for the 2.5s folder poll.
+  useEffect(() => {
+    registerIncomingScreenshotPreview((_item, cloudPath) => {
+      if (pendingRemovalPathsRef.current.has(cloudPath)) return;
+      const next = mergeThumbPages([cloudPath]);
+
+      if (modeRef.current === "pairing" || modeRef.current === "preferences") return;
+      setMode("thumbnail");
+      setColumnViewBoth("screenshots");
+
+      void (async () => {
+        try {
+          const visible = await getCurrentWindow().isVisible();
+          if (!isCollapsedRef.current && visible) {
+            await resizeThumbWindowKeepingBottom(next.length);
+            startAutoHide();
+            return;
+          }
+        } catch {}
+
+        if (incomingRevealRef.current) return;
+        isCollapsedRef.current = false;
+        setIsCollapsed(false);
+        const reveal = openThumbnailWindow(next.length)
+          .then(() => startAutoHide())
+          .finally(() => {
+            if (incomingRevealRef.current === reveal) incomingRevealRef.current = null;
+          });
+        incomingRevealRef.current = reveal;
+        await reveal;
+      })();
+    });
+
+    registerIncomingScreenshotSaved((item, cloudPath) => {
+      if (pendingRemovalPathsRef.current.has(cloudPath)) return;
+      if (settingsRef.current.copyToClipboard) {
+        import("@/lib/sync/screenshots")
+          .then(({ copyScreenshotToClipboard }) =>
+            copyScreenshotToClipboard(cloudScreenshotPath(item.id, item.sha256)),
+          )
+          .then(() => toast.success("Screenshot copied to clipboard", { duration: 2000 }))
+          .catch((err) => console.error("Failed to copy synced screenshot:", err));
+      }
+    });
+
+    return () => {
+      registerIncomingScreenshotPreview(null);
+      registerIncomingScreenshotSaved(null);
+    };
+  }, [mergeThumbPages, openThumbnailWindow, setColumnViewBoth, startAutoHide, updateThumbs]);
+
+  // Sign-out clears only in-memory rail state. Firebase remains authoritative;
+  // no persistent screenshot library exists on this Mac.
   const prevAuthStateRef = useRef<string | null>(null);
   const syncAuthState = useSyncStore((s) => s.authState);
   useEffect(() => {
     const prev = prevAuthStateRef.current;
     prevAuthStateRef.current = syncAuthState;
     if (prev !== "signedIn" || syncAuthState !== "signedOut") return;
-    (async () => {
-      try {
-        const dir = settingsRef.current.saveDir;
-        if (dir) {
-          const files = await invoke<string[]>("list_screenshots", { dir });
-          await Promise.all(
-            files.map((p) => invoke("delete_file", { path: p }).catch(() => {})),
-          );
-        }
-      } catch (e) {
-        console.error("clear local screenshots on sign-out failed:", e);
-      }
-      updateThumbs(() => []);
-      clearThumbs();
-    })();
+    updateThumbs(() => []);
+    clearThumbs();
   }, [syncAuthState, updateThumbs]);
 
   // Auto-present the sign-in screen on launch when signed out. SyncShot is a
@@ -751,6 +977,7 @@ function MainApp() {
       let defaultDir = "";
       if (desktopRes.status === "fulfilled") {
         defaultDir = desktopRes.value;
+        setLegacyCacheDir(defaultDir);
       } else {
         console.error("Failed to get Desktop directory:", desktopRes.reason);
         const reason = desktopRes.reason;
@@ -823,152 +1050,97 @@ function MainApp() {
     // setMode("editing");
   }, []);
 
-  // Hydrate + watch the save dir — only while signed in. The first pass after
-  // sign-in loads existing files silently (no clipboard copy); later passes
-  // catch files added/removed outside this app (e.g. synced from the phone).
-  // Signed out, this never mounts: the column shows only session captures.
+  // One-time migration: upload any old unsynced private-cache files, then
+  // remove every confirmed cloud-backed file. Never scans or deletes Desktop
+  // or a user-selected directory.
+  const didMigrateCacheRef = useRef(false);
   useEffect(() => {
-    if (!saveDir || syncAuthState !== "signedIn") return;
-    let cancelled = false;
-    let firstPass = true;
-
-    const poll = async () => {
+    if (
+      didMigrateCacheRef.current ||
+      syncAuthState !== "signedIn" ||
+      !legacyCacheDir
+    ) return;
+    didMigrateCacheRef.current = true;
+    void (async () => {
       try {
-        const disk = await invoke<string[]>("list_screenshots", { dir: saveDir });
-        if (cancelled) return;
-
-        const isHydration = firstPass;
-        firstPass = false;
-
-        // BACKFILL: on the first pass after sign-in, publish the Mac's existing
-        // local screenshot library to Firebase. Captures are otherwise only
-        // uploaded by the live `new-screenshot` publisher, so anything taken
-        // before sign-in (or before this device ever published) would never
-        // reach users/{uid}/screenshots and the Mac would show empty on other
-        // devices. publishScreenshot dedupes by sha256 so this never double-
-        // uploads; skipped while sync is paused.
-        if (isHydration && disk.length > 0) {
-          const { uid, paused } = useSyncStore.getState();
-          if (uid && !paused) {
-            void Promise.all([
-              import("@/lib/sync/screenshots"),
-              import("@/lib/sync/engine"),
-            ]).then(([{ backfillScreenshots }, { getDevice }]) => {
-              const device = getDevice();
-              if (device) {
-                return backfillScreenshots(uid, device, disk).catch((e) =>
-                  console.error("screenshot backfill failed:", e),
-                );
-              }
-            });
+        const files = await invoke<string[]>("list_screenshots", {
+          dir: legacyCacheDir,
+        });
+        const confirmedCloud = files.filter(isSyncedCacheFile);
+        const unpublished = files.filter((path) => !isSyncedCacheFile(path));
+        await Promise.all(
+          confirmedCloud.map((path) =>
+            invoke("delete_file", { path }).catch(() => {}),
+          ),
+        );
+        if (unpublished.length > 0) {
+          const [{ backfillScreenshots }, { getDevice }] = await Promise.all([
+            import("@/lib/sync/screenshots"),
+            import("@/lib/sync/engine"),
+          ]);
+          const device = getDevice();
+          const uid = useSyncStore.getState().uid;
+          if (device && uid) {
+            await backfillScreenshots(uid, device, unpublished);
           }
         }
-
-        // Detect file add/remove by SET membership, not positional equality:
-        // the column is ordered by creation time (below), which differs from the
-        // mtime order `disk` arrives in, so a positional diff would fire every
-        // poll. Re-ordering on doc/createdAt updates is handled by its own effect.
-        const current = thumbsRef.current;
-        const currentSet = new Set(current);
-        const diskSet = new Set(disk);
-        const newOnes = disk.filter((p) => !currentSet.has(p));
-        const removed = current.some((p) => !diskSet.has(p));
-        const hasNew = newOnes.length > 0;
-        if (!hasNew && !removed) return;
-
-        // Order newest-first by true creation time (doc createdAt → shot_{ts} →
-        // mtime), NOT the raw mtime order `disk` comes in — see the bug where a
-        // re-downloaded phone shot's fresh mtime floated it above an older Mac
-        // capture on reopen.
-        const next = updateThumbs(() => orderScreenshotsByCreatedAt(disk));
-
-        // A normal decorated window (Library/Preferences) is showing — keep the
-        // thumb list current but don't switch mode or re-apply column geometry,
-        // or the open window collapses to the thin edge strip.
-        if (modeRef.current === "pairing" || modeRef.current === "preferences") {
-          return;
-        }
-
-        if (next.length > 0) {
-          setMode("thumbnail");
-          // Only a genuinely FRESH arrival (created within the window below)
-          // gets the full reaction: clipboard copy + toast + surface the rail.
-          // A BACKLOG page-in of old synced shots (post-sign-in catch-up
-          // downloads land a few files per poll tick) must update the list
-          // silently — reacting per tick re-copied the user's clipboard,
-          // re-surfaced the window and re-toasted every 2.5s for minutes.
-          const FRESH_MS = 120_000;
-          const newestIsFresh =
-            hasNew && isRecentScreenshot(newOnes[0], Date.now(), FRESH_MS);
-          if (hasNew && (isHydration || newestIsFresh)) {
-            // Copy the newest synced-in screenshot to this Mac's clipboard,
-            // mirroring local-capture behavior and the user's auto-copy
-            // setting — but not for pre-existing files on hydration.
-            if (!isHydration && settingsRef.current.copyToClipboard) {
-              invoke("copy_to_clipboard", { path: newOnes[0] })
-                .then(() => {
-                  toast.success("Screenshot copied to clipboard", { duration: 2000 });
-                })
-                .catch((err) => console.error("Failed to copy synced screenshot:", err));
-            }
-            isCollapsedRef.current = false;
-            setIsCollapsed(false);
-            await openThumbnailWindow(next.length);
-            startAutoHide();
-          } else if (hasNew && !isCollapsedRef.current && columnViewRef.current === "screenshots") {
-            // Stale adds while the screenshots column is expanded: just refit
-            // the window height to the new count — no reveal/copy/toast churn.
-            try {
-              if (await getCurrentWindow().isVisible()) {
-                await resizeThumbWindowKeepingBottom(next.length);
-              }
-            } catch {}
-          }
-        }
-      } catch {
-        // Dir may not exist yet / transient sync state — ignore.
+        await invoke("remove_legacy_screenshot_directory");
+      } catch (error) {
+        console.error("private screenshot cache migration failed:", error);
       }
-    };
+    })();
+  }, [legacyCacheDir, syncAuthState]);
 
-    poll(); // hydrate immediately on sign-in rather than waiting an interval
-    const interval = setInterval(poll, 2500);
-    return () => {
-      cancelled = true;
-      clearInterval(interval);
-    };
-  }, [saveDir, syncAuthState, updateThumbs, startAutoHide]);
-
-  // Re-order the column whenever the synced doc set changes. On quit/reopen the
-  // poll hydrates from disk BEFORE the Firebase subscription has loaded (it's
-  // deferred off the critical path), so a received `{docId}.png` shot can't yet
-  // resolve its createdAt and lands in mtime order. Once `screenshots` arrives,
-  // re-sort in place so the newest shot — Mac or phone — settles on top and the
-  // order is stable. Own `shot_{ts}` captures already sort right from the start
-  // (their epoch is in the filename); this fixes the doc-id-named ones.
-  //
-  // Plain store subscription, NOT a useScreenshots() hook: subscribing MainApp
-  // to the whole screenshots array re-rendered the entire app (and reconciled
-  // every column tile) on EVERY Firestore snapshot, even when the visible
-  // order didn't change. This only touches React state when the order really
-  // moved.
+  // Cloud-only rail. Firestore already delivers newest-first and grows only
+  // when the user scrolls. Keep short-lived capture/editor staging files until
+  // their upload maps them to a stable cloud id; never hydrate from disk.
   useEffect(() => {
-    const reorder = () => {
-      const cur = thumbsRef.current;
-      if (cur.length === 0) return;
-      const ordered = orderScreenshotsByCreatedAt(cur);
-      const same =
-        ordered.length === cur.length && ordered.every((p, i) => p === cur[i]);
-      if (!same) updateThumbs(() => ordered);
+    const syncCloudRail = () => {
+      const state = useSyncStore.getState();
+      if (state.authState !== "signedIn") return;
+      const cloudIds = new Set(state.screenshots.map((item) => item.id));
+      // Keep an edited screenshot's old cloud identity suppressed until the
+      // realtime snapshot confirms deletion. Clearing it when deleteDoc merely
+      // returns can expose old + edited tiles for one listener round-trip.
+      for (const path of pendingRemovalPathsRef.current) {
+        const id = cloudScreenshotId(path) ?? state.localCaptureDocIds[path];
+        if (id && !cloudIds.has(id)) pendingRemovalPathsRef.current.delete(path);
+      }
+      updateThumbs((current) => {
+        const staged = current.filter((path) => {
+          if (isCloudScreenshotPath(path)) return false;
+          const mapped = state.localCaptureDocIds[path];
+          // Publisher owns staged→cloud swap after it has cloned the already-
+          // decoded optimistic thumb. Keep staging visible until that callback.
+          return !mapped || !cloudIds.has(mapped) ||
+            !current.some((candidate) => cloudScreenshotId(candidate) === mapped);
+        });
+        const stagedCloudIds = new Set(
+          staged
+            .map((path) => state.localCaptureDocIds[path])
+            .filter((id): id is string => !!id),
+        );
+        const cloud = state.screenshots
+          .filter((item) => !stagedCloudIds.has(item.id))
+          .map((item) => cloudScreenshotPath(item.id, item.sha256));
+        const next = omitPendingPaths([...staged, ...cloud], pendingRemovalPathsRef.current);
+        const seen = new Set<string>();
+        return next.filter((path) => !seen.has(path) && !!seen.add(path));
+      });
     };
-    reorder();
+    syncCloudRail();
     return useSyncStore.subscribe((state, prevState) => {
-      if (state.screenshots !== prevState.screenshots) reorder();
+      if (
+        state.screenshots !== prevState.screenshots ||
+        state.localCaptureDocIds !== prevState.localCaptureDocIds ||
+        state.authState !== prevState.authState
+      ) syncCloudRail();
     });
   }, [updateThumbs]);
 
 
   const handleCapture = useCallback(async (captureMode: CaptureMode = "region") => {
-    if (isCapturing) return;
+    if (isCapturingRef.current) return;
 
     // Sign-in gate: SyncShot is sync-first, so capturing is blocked until the user
     // has an account. Read the live store (not a closure) so stale auth can't slip
@@ -988,24 +1160,24 @@ function MainApp() {
       return;
     }
 
-    setIsCapturing(true);
+    isCapturingRef.current = true;
 
     const appWindow = getCurrentWindow();
-    
+    // Keep the pre-capture surface so an Escape/capture/save failure always
+    // restores the pill instead of leaving the whole Tauri window hidden.
+    const wasCollapsedBeforeCapture = isCollapsedRef.current;
+    const hadThumbsBeforeCapture = thumbsRef.current.length > 0;
+
     // Read current settings from ref to avoid stale closure issues
-    const { saveDir: currentSaveDir, copyToClipboard: shouldCopyToClipboard, tempDir: currentTempDir } = settingsRef.current;
+    const { copyToClipboard: shouldCopyToClipboard, tempDir: currentTempDir } = settingsRef.current;
 
     try {
-      const hadThumbs = thumbsRef.current.length > 0;
-      // Was the column already on screen (expanded) before this capture? If so we
-      // prepend in place via geometry-only expand — no hide/reposition/re-show.
-      const wasVisible = hadThumbs && !isCollapsedRef.current;
-      if (hadThumbs) {
-        try { await appWindow.setContentProtected(true); } catch {}
-      } else {
-        await appWindow.hide();
-        await new Promise((resolve) => setTimeout(resolve, 400));
-      }
+      // Hide every form of the pill while the native capture picker is active,
+      // so it can never end up in the captured image. The failure path below is
+      // deliberately independent of the thumbnail count: an empty pill is still
+      // the app's control surface and must be restored too.
+      try { await appWindow.hide(); } catch {}
+      await new Promise((resolve) => setTimeout(resolve, 250));
 
       const commandMap: Record<CaptureMode, string> = {
         region: "native_capture_interactive",
@@ -1031,69 +1203,85 @@ function MainApp() {
 
       invoke("play_screenshot_sound").catch(console.error);
 
-      let finalPath = screenshotPath;
-      try {
-        finalPath = await invoke<string>("save_native_screenshot", {
-          sourcePath: screenshotPath,
-          saveDir: currentSaveDir,
-          copyToClip: shouldCopyToClipboard,
-        });
-        invoke("delete_file", { path: screenshotPath }).catch(() => {});
-      } catch (err) {
-        console.error("Failed to auto-save screenshot:", err);
-        toast.error("Failed to save screenshot", {
-          description: err instanceof Error ? err.message : String(err),
-          duration: 4000,
-        });
-      }
+      const finalPath = screenshotPath;
+      // Keep the staging file alive until NSPasteboard has copied its bytes.
+      // The upload publisher deletes this file, so starting both operations
+      // independently created a race on fast connections.
+      const clipboardReady = shouldCopyToClipboard
+        ? invoke("copy_to_clipboard", { path: finalPath }).catch((error) => {
+            console.error("capture clipboard copy failed:", error);
+            toast.error("Could not copy screenshot", { duration: 4000 });
+          })
+        : Promise.resolve();
 
       // Prepend the just-captured shot, then re-apply the creation-time order so
       // the session order matches what a quit/reopen will render. Its name is
       // `shot_{now}.png`, so its capture epoch ranks it on top — and it stays on
       // top after reopen (its createdAt/shot_{ts} outranks every existing shot).
-      const next = updateThumbs((prev) =>
-        orderScreenshotsByCreatedAt([finalPath, ...prev]),
-      );
-      setMode("thumbnail");
-      isCollapsedRef.current = false;
-      setIsCollapsed(false);
-      if (wasVisible) {
-        // Column was already visible: instantly prepend the new shot. Reset
-        // content protection in place (no hide) and only adjust geometry —
-        // skip show/reposition-to-cursor/openSignal so there's no flash or
-        // open-animation replay.
-        // In clipboard view the geometry already fits that list — keep it; the
-        // shot is saved + prepended and shows when the user switches back.
-        try { await appWindow.setContentProtected(false); } catch {}
-        await expandThumbWindow(columnWindowHeight(columnViewRef.current, next.length));
-      } else {
-        // Was hidden/collapsed / first screenshot: full reveal at the cursor.
-        await openThumbnailWindow(next.length, mouseX, mouseY);
-      }
+      const next = updateThumbs((prev) => [
+        finalPath,
+        ...prev.filter((path) => path !== finalPath),
+      ]);
+
+      // Upload starts immediately from the staging file. publishScreenshot
+      // switches the rail to cloud identity after the tiny thumb/doc lands,
+      // continues the full upload, then deletes this temp file.
+      void clipboardReady.then(() => Promise.all([
+        import("@/lib/sync/screenshots"),
+        import("@/lib/sync/engine"),
+      ])).then(([{ publishScreenshot }, { getDevice }]) => {
+        const { uid } = useSyncStore.getState();
+        const device = getDevice();
+        if (!uid || !device) throw new Error("Sync device unavailable");
+        return publishScreenshot(uid, device, finalPath);
+      }).catch((error) => {
+        console.error("capture cloud upload failed:", error);
+        toast.error("Screenshot upload failed", { duration: 5000 });
+      });
+      // The native window is hidden at this point, so requestAnimationFrame may
+      // be suspended indefinitely by WebKit. Commit the expanded React surface
+      // synchronously, then let openThumbnailWindow show it immediately.
+      flushSync(() => {
+        setMode("thumbnail");
+        isCollapsedRef.current = false;
+        setIsCollapsed(false);
+      });
+      await openThumbnailWindow(next.length, mouseX, mouseY);
       startAutoHide();
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : String(err);
-      if (thumbsRef.current.length > 0) {
-        // Restore the column to its prior collapsed/expanded state (and turn off
-        // content protection). Re-expanding unconditionally here left the window
-        // at full size while still rendering the collapsed dark handle — the big
-        // dark overlay bug on cancel/error from the collapsed pill.
-        if (isCollapsedRef.current) {
-          await showCollapsedThumbnail();
-        } else {
-          await openThumbnailWindow(thumbsRef.current.length);
-        }
+      // The native picker is allowed to fail/cancel, but it is never allowed to
+      // close the pill. Restore the exact prior form (or the collapsed control
+      // if the rail did not yet have content).
+      if (wasCollapsedBeforeCapture || !hadThumbsBeforeCapture) {
+        // Same hidden-window rule as the success path: never wait for an
+        // animation frame before calling show(). A hidden WebKit view may not
+        // produce one until the user manually reopens the app from the Dock.
+        flushSync(() => {
+          setMode("thumbnail");
+          isCollapsedRef.current = true;
+          setIsCollapsed(true);
+        });
+        await showCollapsedThumbnail();
       } else {
-        try { await appWindow.hide(); } catch {}
+        flushSync(() => {
+          setMode("thumbnail");
+          isCollapsedRef.current = false;
+          setIsCollapsed(false);
+        });
+        await openThumbnailWindow(thumbsRef.current.length);
+        startAutoHide();
       }
-      if (errorMessage.includes("cancelled") || errorMessage.includes("was cancelled")) {
+
+      const normalizedError = errorMessage.toLowerCase();
+      if (normalizedError.includes("cancelled")) {
         // user cancelled — silent
-      } else if (errorMessage.includes("already in progress")) {
+      } else if (normalizedError.includes("already in progress")) {
         toast.error("Please wait for the current screenshot to complete", { duration: 4000 });
       } else if (
-        errorMessage.toLowerCase().includes("permission") ||
-        errorMessage.toLowerCase().includes("access") ||
-        errorMessage.toLowerCase().includes("denied")
+        normalizedError.includes("permission") ||
+        normalizedError.includes("access") ||
+        normalizedError.includes("denied")
       ) {
         toast.error("Screen Recording permission required", {
           description:
@@ -1104,9 +1292,9 @@ function MainApp() {
         reportError(errorMessage);
       }
     } finally {
-      setIsCapturing(false);
+      isCapturingRef.current = false;
     }
-  }, [isCapturing, updateThumbs, reportError, openPairing]);
+  }, [updateThumbs, reportError, openPairing, openThumbnailWindow, startAutoHide]);
 
   // Setup hotkeys whenever settings change
   useEffect(() => {
@@ -1134,7 +1322,15 @@ function MainApp() {
           const action = actionMap[shortcut.action];
           if (action) {
             try {
-              await register(shortcut.shortcut, () => handleCapture(action));
+              await register(shortcut.shortcut, (event) => {
+                if (event.state === "Released") {
+                  shortcutKeysDownRef.current.delete(event.shortcut);
+                  return;
+                }
+                if (shortcutKeysDownRef.current.has(event.shortcut)) return;
+                shortcutKeysDownRef.current.add(event.shortcut);
+                void handleCapture(action);
+              });
               registeredShortcutsRef.current.add(shortcut.shortcut);
             } catch (err) {
               console.error(`Failed to register shortcut ${shortcut.shortcut}:`, err);
@@ -1155,6 +1351,7 @@ function MainApp() {
         unregister(shortcutsToUnregister).catch(console.error);
       }
       registeredShortcutsRef.current.clear();
+      shortcutKeysDownRef.current.clear();
     };
   }, [shortcuts, settingsVersion, handleCapture]);
 
@@ -1179,15 +1376,65 @@ function MainApp() {
         });
         setMode("preferences");
       });
-      unlisten5 = await listen<{ originalPath: string; newPath: string }>(
+      unlisten5 = await listen<{ originalPath: string; newPath: string; previewDataUrl?: string }>(
         "editor-saved",
-        async (event) => {
-          const { originalPath, newPath } = event.payload;
+        (event) => {
+          const { originalPath, newPath, previewDataUrl } = event.payload;
           if (!newPath) return;
-          updateThumbs((prev) => prev.map((p) => (p === originalPath ? newPath : p)));
+
+          // Editor sends a compact preview with the save event. Seed and swap
+          // synchronously: one edited tile replaces the original in one render,
+          // without local thumbnail generation or Firebase round-trips.
+          if (previewDataUrl) cacheThumbDataUrl(newPath, previewDataUrl);
           if (originalPath && originalPath !== newPath) {
-            invoke("delete_file", { path: originalPath }).catch(() => {});
+            pendingRemovalPathsRef.current.add(originalPath);
           }
+          updateThumbs((prev) => replaceRailPath(prev, originalPath, newPath));
+          dropThumb(originalPath);
+
+          const replacement = editorReplacementQueueRef.current
+            .catch(() => {})
+            .then(async () => {
+              const { uid } = useSyncStore.getState();
+              if (uid) {
+                const [{ deleteScreenshotByPath, findDocForCachePath, publishScreenshotReplacement }, { getDevice }] = await Promise.all([
+                  import("@/lib/sync/screenshots"),
+                  import("@/lib/sync/engine"),
+                ]);
+                const device = getDevice();
+                if (!device) throw new Error("Sync device unavailable");
+                // Upload replacement first. Old cloud image stays valid until
+                // the new thumb/full are safely stored.
+                const originalDocId = originalPath
+                  ? findDocForCachePath(originalPath)?.id ?? cloudScreenshotId(originalPath)
+                  : null;
+                const result = await publishScreenshotReplacement(uid, device, newPath);
+                // An unchanged export can dedupe to the original document.
+                // Never delete the document that now backs the replacement.
+                if (
+                  originalPath &&
+                  originalPath !== newPath &&
+                  result?.docId !== originalDocId
+                ) {
+                  await deleteScreenshotByPath(uid, originalPath);
+                }
+              } else if (originalPath && originalPath !== newPath) {
+                await invoke("delete_file", { path: originalPath });
+              }
+            });
+
+          editorReplacementQueueRef.current = replacement
+            .catch((error) => {
+              console.error("edited screenshot replacement failed:", error);
+              toast.error("Could not sync edited screenshot", { duration: 5000 });
+            })
+            .finally(() => {
+              if (originalPath && originalPath !== newPath) {
+                const state = useSyncStore.getState();
+                const id = cloudScreenshotId(originalPath) ?? state.localCaptureDocIds[originalPath];
+                if (!id) pendingRemovalPathsRef.current.delete(originalPath);
+              }
+            });
           toast.success("Screenshot copied to clipboard", { duration: 2000 });
         }
       );
@@ -1219,14 +1466,17 @@ function MainApp() {
           [mx, my] = await invoke<[number, number]>("get_mouse_position");
         } catch {}
         cachedMon = null;
+        cachedWorkArea = null;
         if (thumbsRef.current.length > 0) {
           isCollapsedRef.current = false;
           setIsCollapsed(false);
           await openThumbnailWindow(thumbsRef.current.length, mx, my);
         } else {
-          await showCollapsedThumbnail();
           isCollapsedRef.current = true;
           setIsCollapsed(true);
+          setMode("thumbnail");
+          await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+          await showCollapsedThumbnail();
         }
       });
       // Tray "Sign in & Sync" → straight into the single hosted auth window
@@ -1268,7 +1518,64 @@ function MainApp() {
     await restoreColumnAfterModal();
   }, [loadSettings, restoreColumnAfterModal]);
 
+  const handleAddImage = useCallback((file: File) => {
+    const state = useSyncStore.getState();
+    if (state.authState !== "signedIn" || !state.uid) {
+      toast.error("Sign in to SyncShot to add an image");
+      void openPairing();
+      return;
+    }
+    const supported = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
+    if (!supported.has(file.type.toLowerCase())) {
+      toast.error("Choose a PNG, JPEG, GIF, or WebP image");
+      return;
+    }
+    if (file.size === 0 || file.size > 64 * 1024 * 1024) {
+      toast.error(file.size === 0 ? "That image is empty" : "Image must be smaller than 64 MB");
+      return;
+    }
+
+    // Show the user's chosen bytes immediately from memory. No Application
+    // Support cache file is created; this temporary identity lives only until
+    // Firebase has the full image and the publisher swaps in its cloud id.
+    const stagingPath = importScreenshotPath();
+    cacheThumbBlob(stagingPath, file);
+    updateThumbs((prev) => [stagingPath, ...prev.filter((path) => path !== stagingPath)]);
+    startAutoHide();
+
+    void Promise.all([
+      import("@/lib/sync/screenshots"),
+      import("@/lib/sync/engine"),
+    ]).then(([{ publishImportedImage }, { getDevice }]) => {
+      const liveUid = useSyncStore.getState().uid;
+      const device = getDevice();
+      if (!liveUid || !device) throw new Error("Sync device unavailable");
+      return publishImportedImage(liveUid, device, stagingPath, file);
+    }).then(() => {
+      toast.success("Image added", { duration: 1800 });
+    }).catch(async (error) => {
+      const mappedId = useSyncStore.getState().localCaptureDocIds[stagingPath];
+      updateThumbs((prev) => prev.filter((path) =>
+        path !== stagingPath && (!mappedId || cloudScreenshotId(path) !== mappedId),
+      ));
+      dropThumb(stagingPath);
+      if (mappedId) {
+        const { deleteScreenshotByPath } = await import("@/lib/sync/screenshots");
+        await deleteScreenshotByPath(state.uid!, cloudScreenshotPath(mappedId)).catch(() => {});
+      }
+      console.error("manual image upload failed:", error);
+      toast.error("Could not add image", {
+        description: error instanceof Error ? error.message : "Upload failed — check your connection",
+        duration: 5000,
+      });
+    });
+  }, [openPairing, startAutoHide, updateThumbs]);
+
   const handleThumbnailItemEdit = useCallback(async (path: string) => {
+    if (!isManagedScreenshotPath(path, saveDir)) {
+      toast.info("Desktop screenshots are shown read-only");
+      return;
+    }
     if (licenseStatusRef.current?.state === "expired") {
       setShowPaywall(true);
       await showNormalWindow(getCurrentWindow(), 520, 640, {
@@ -1279,35 +1586,41 @@ function MainApp() {
     }
     // The editor is a reused singleton window (pre-warmed hidden at startup),
     // so at most ONE editor is ever open — set the counter, don't increment,
-    // or open→open→close would wedge it above zero forever (the auto-hide
-    // guard sees the hidden singleton as "an editor window exists").
+    // or open→open→close would wedge it above zero and pause display-follow.
     const label = "editor-main";
     try {
       openEditorsRef.current = 1;
       pauseAutoHide();
-      // Surface the (pre-warmed) editor IMMEDIATELY in its loading state; the
-      // real path follows via the pending-path slot once resolved, so even a
-      // cloud re-download never delays the window appearing.
-      await invoke("open_editor_window", { label, imagePath: "" });
-      // Make sure a local file is actually present. Own-device captures
-      // normally have their local capture file, but if it's been evicted (the
-      // same gap that strands the tile on "Unavailable") this re-downloads
-      // the cloud copy so the editor always has bytes to open.
-      let openPath = path;
-      try {
-        const { ensureLocalScreenshot } = await import("@/lib/sync/screenshots");
-        openPath = await ensureLocalScreenshot(path);
-      } catch (e) {
-        console.error("ensure local screenshot failed:", e);
+      let imageUrl: string | undefined;
+      let previewUrl: string | undefined;
+      if (isCloudScreenshotPath(path)) {
+        const {
+          findDocForCachePath,
+          resolveScreenshotFullImageUrl,
+          resolveScreenshotThumbnailUrl,
+        } = await import("@/lib/sync/screenshots");
+        const item = findDocForCachePath(path);
+        if (!item?.fullPath) throw new Error("Screenshot is still uploading");
+        // Use the SAME versioned URLs as the viewport preloader. Rust's RAM
+        // cache is URL-keyed; passing Firestore's raw unversioned URLs here
+        // caused every click to miss preloaded bytes and redownload for 2-3s.
+        const [resolvedImageUrl, resolvedPreviewUrl] = await Promise.all([
+          resolveScreenshotFullImageUrl(item),
+          resolveScreenshotThumbnailUrl(item),
+        ]);
+        if (!resolvedImageUrl) throw new Error("Screenshot is still uploading");
+        imageUrl = resolvedImageUrl;
+        previewUrl = resolvedPreviewUrl ?? undefined;
+      } else {
+        void invoke("copy_to_clipboard", { path })
+          .then(() => toast.success("Copied to clipboard", { duration: 1500 }))
+          .catch((e) => console.error("copy on open failed:", e));
       }
-      // Copy the screenshot to the clipboard on open (fire-and-forget so it
-      // never delays the editor window).
-      invoke("copy_to_clipboard", { path: openPath })
-        .then(() => toast.success("Copied to clipboard", { duration: 1500 }))
-        .catch((e) => console.error("copy on open failed:", e));
       await invoke("open_editor_window", {
         label,
-        imagePath: openPath,
+        imagePath: path,
+        imageUrl,
+        previewUrl,
       });
     } catch (err) {
       openEditorsRef.current = 0;
@@ -1315,9 +1628,14 @@ function MainApp() {
       console.error("open_editor_window failed:", err);
       toast.error("Failed to open editor");
     }
-  }, [pauseAutoHide, startAutoHide]);
+  }, [pauseAutoHide, saveDir, startAutoHide]);
 
   const handleThumbnailItemRemove = useCallback(async (path: string) => {
+    if (!isManagedScreenshotPath(path, saveDir)) {
+      toast.info("Desktop screenshots are shown read-only");
+      return;
+    }
+    pendingRemovalPathsRef.current.add(path);
     const remaining = updateThumbs((prev) => prev.filter((p) => p !== path));
     // Free (and revoke) the deleted shot's cached thumbnail blob URL.
     dropThumb(path);
@@ -1327,30 +1645,49 @@ function MainApp() {
     // hash, deletes the cloud doc/blobs, THEN deletes the local file — so we
     // must NOT delete the local file first or the hash lookup races it. Signed
     // out (no uid), there's no cloud doc; just drop the local file.
-    const { uid } = useSyncStore.getState();
-    if (uid) {
-      void import("@/lib/sync/screenshots").then(({ deleteScreenshotByPath }) =>
-        deleteScreenshotByPath(uid, path).catch((e) => {
-          console.error("cloud delete failed:", e);
-          invoke("delete_file", { path }).catch(() => {});
-        }),
-      );
-    } else {
-      invoke("delete_file", { path }).catch(() => {});
-    }
+    const remove = async () => {
+      try {
+        const { uid } = useSyncStore.getState();
+        if (uid) {
+          const { deleteScreenshotByPath } = await import("@/lib/sync/screenshots");
+          await deleteScreenshotByPath(uid, path);
+        } else {
+          await invoke("delete_file", { path });
+        }
+      } catch (error) {
+        // Deletion did not complete. Restore the tile instead of pretending it
+        // succeeded only for it to return after relaunch.
+        console.error("screenshot delete failed:", error);
+        pendingRemovalPathsRef.current.delete(path);
+        mergeThumbPages([path]);
+        toast.error("Could not delete screenshot", { duration: 5000 });
+        return;
+      }
+      pendingRemovalPathsRef.current.delete(path);
+      dropThumb(path);
+    };
+    void remove();
     if (remaining.length === 0) {
-      try { await getCurrentWindow().hide(); } catch {}
       if (autoHideTimerRef.current) {
         clearTimeout(autoHideTimerRef.current);
         autoHideTimerRef.current = null;
       }
-      setMode("main");
-      setIsCollapsed(false);
-      isCollapsedRef.current = false;
+      // Keep the launcher available after the last item is deleted rather than
+      // leaving the user with an invisible app surface.
+      isCollapsedRef.current = true;
+      setIsCollapsed(true);
+      setMode("thumbnail");
+      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+      try { await showCollapsedThumbnail(); } catch {}
     } else if (!isCollapsedRef.current) {
       await resizeThumbWindowKeepingBottom(remaining.length);
     }
-  }, [updateThumbs]);
+  }, [mergeThumbPages, saveDir, updateThumbs]);
+
+  const isReadOnlyScreenshot = useCallback(
+    (path: string) => !isManagedScreenshotPath(path, saveDir),
+    [saveDir],
+  );
 
   const handleToggleCollapsed = useCallback(async () => {
     const next = !isCollapsedRef.current;
@@ -1362,12 +1699,21 @@ function MainApp() {
       // COLLAPSE. triggerCollapse already played the genie-out so the column is
       // fully invisible (opacity:0, curled into the pill). Resize the native
       // window DOWN to the pill while the (invisible) column is still the rendered
-      // element, and ONLY THEN swap to the pill render. Doing it the other way —
-      // setIsCollapsed(true) before the resize — paints the full-screen pill box
-      // inside the still-column-sized window for a frame: that was the close flash.
+      // element. Switch React to the fixed-size pill before native IPC: a slow
+      // macOS resize must never leave the full screenshot column rendered in a
+      // narrow pill window.
       isCollapsedRef.current = true;
-      await showCollapsedThumbnail();
       setIsCollapsed(true);
+      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+      try {
+        await showCollapsedThumbnail();
+      } catch (error) {
+        // The render state must still change if the native window happens to
+        // reject a geometry update during an app/Space transition. Otherwise
+        // the user sees a rail that its close button cannot dismiss; the next
+        // pill interaction retries native placement.
+        console.error("collapse thumbnail window failed:", error);
+      }
     } else {
       // EXPAND. The column stayed MOUNTED through the collapse (display-hidden,
       // thumbs cached), so this swap is a pure CSS flip — no remount, no IPC, no
@@ -1382,7 +1728,7 @@ function MainApp() {
       await new Promise<void>((resolve) =>
         requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
       );
-      await expandThumbWindow(columnWindowHeight(columnViewRef.current, thumbsRef.current.length));
+      await expandThumbWindow(columnViewRef.current, thumbsRef.current.length);
       // One more frame so the resized geometry is composited before the reveal
       // starts (the genie must not unfurl inside a still-pill-sized window).
       await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
@@ -1403,19 +1749,23 @@ function MainApp() {
     }
   }, [mode]);
 
-  if (mode === "thumbnail" && thumbs.length > 0) {
+  if (mode === "thumbnail") {
     return (
       <ScreenshotThumbnail
         paths={thumbs}
         isCollapsed={isCollapsed}
-        collapseSignal={collapseSignal}
         openSignal={openSignal}
+        autoCollapseSignal={autoCollapseSignal}
         columnView={columnView}
         onColumnViewChange={handleColumnViewChange}
+        onAddImage={handleAddImage}
         onEdit={handleThumbnailItemEdit}
         onRemove={handleThumbnailItemRemove}
+        isReadOnly={isReadOnlyScreenshot}
         onToggleCollapsed={handleToggleCollapsed}
         onHoverChange={handleHoverChange}
+        onActivity={handleColumnActivity}
+        onLoadMore={loadOlderPillPage}
       />
     );
   }

@@ -1,6 +1,7 @@
 package com.app.syncshot
 
 import android.Manifest
+import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
@@ -18,6 +19,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.core.content.ContextCompat
 import com.app.syncshot.data.FirebaseRepo
 import com.google.firebase.Firebase
 import com.google.firebase.auth.auth
@@ -48,12 +50,22 @@ class MainActivity : ComponentActivity() {
                         onDispose { Firebase.auth.removeAuthStateListener(listener) }
                     }
 
+                    // The foreground service also receives remote screenshots, so it
+                    // runs while signed in even when media access is declined. Its
+                    // MediaStore observer is permission-gated internally; starting it
+                    // here must never crash on a denied runtime permission.
                     LaunchedEffect(signedIn) { if (signedIn) SyncService.start(ctx) }
 
                     if (signedIn) {
                         // Ask for runtime permissions only once the user is in, so
                         // they don't clutter the sign-in (Truecaller consent) screen.
-                        RequestPermissions()
+                        RequestPermissions(onMediaPermissionGranted = { granted ->
+                            // A service started before the permission result skipped
+                            // MediaStore observing. Starting it again lets its
+                            // onStartCommand attach the observer now that access is
+                            // available; this is a no-op when it was already attached.
+                            if (granted) SyncService.start(ctx)
+                        })
                         RootScreen(onSignedOut = { signedIn = false })
                     } else {
                         LoginScreen(onSignedIn = { signedIn = true })
@@ -65,19 +77,40 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
-private fun RequestPermissions() {
+private fun RequestPermissions(onMediaPermissionGranted: (Boolean) -> Unit) {
+    val ctx = LocalContext.current
     val launcher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
-    ) {}
+    ) { grants ->
+        val mediaPermission = if (Build.VERSION.SDK_INT >= 33) {
+            Manifest.permission.READ_MEDIA_IMAGES
+        } else {
+            Manifest.permission.READ_EXTERNAL_STORAGE
+        }
+        onMediaPermissionGranted(
+            grants[mediaPermission] ?: (
+                ContextCompat.checkSelfPermission(ctx, mediaPermission) == PackageManager.PERMISSION_GRANTED
+                )
+        )
+    }
     LaunchedEffect(Unit) {
+        val mediaPermission = if (Build.VERSION.SDK_INT >= 33) {
+            Manifest.permission.READ_MEDIA_IMAGES
+        } else {
+            Manifest.permission.READ_EXTERNAL_STORAGE
+        }
+        val mediaGranted =
+            ContextCompat.checkSelfPermission(ctx, mediaPermission) == PackageManager.PERMISSION_GRANTED
+        if (mediaGranted) onMediaPermissionGranted(true)
         val perms = buildList {
-            if (Build.VERSION.SDK_INT >= 33) {
-                add(Manifest.permission.READ_MEDIA_IMAGES)
+            if (!mediaGranted) add(mediaPermission)
+            if (Build.VERSION.SDK_INT >= 33 &&
+                ContextCompat.checkSelfPermission(ctx, Manifest.permission.POST_NOTIFICATIONS) !=
+                    PackageManager.PERMISSION_GRANTED
+            ) {
                 add(Manifest.permission.POST_NOTIFICATIONS)
-            } else {
-                add(Manifest.permission.READ_EXTERNAL_STORAGE)
             }
         }
-        launcher.launch(perms.toTypedArray())
+        if (perms.isNotEmpty()) launcher.launch(perms.toTypedArray())
     }
 }

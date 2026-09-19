@@ -1,4 +1,3 @@
 <resources>
     <string name="app_name">SyncShot</string>
-    <string name="accessibility_description">Lets SyncShot capture copied text in the background so it syncs to your other devices. SyncShot only reads the clipboard when you copy; nothing else is accessed.</string>
 </resources>

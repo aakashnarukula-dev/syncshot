@@ -21,6 +21,9 @@ import com.google.firebase.storage.StorageMetadata
 import com.google.firebase.storage.StorageReference
 import com.google.firebase.storage.storage
 import kotlinx.coroutines.channels.awaitClose
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.tasks.await
@@ -135,13 +138,12 @@ object FirebaseRepo {
 
     // --- SyncShot ----------------------------------------------------------
 
-    /** Cache a screenshot's full bytes on disk under received/<sha>.png — the same
-     *  path Receiver uses — so the capturing device's own new shot renders from the
-     *  local file immediately instead of waiting on a Storage round-trip (the
-     *  grey-tile fix), and the viewer opens it without re-downloading. */
-    private fun cacheFullLocally(ctx: Context, sha: String, full: ByteArray) {
+    /** Cache a screenshot's full bytes under their actual image extension — the
+     *  same location Receiver uses — so a local capture renders instantly without
+     *  mislabelling a JPEG/HEIC payload as PNG. */
+    private fun cacheFullLocally(ctx: Context, sha: String, full: ByteArray, mime: String) {
         runCatching {
-            val f = java.io.File(java.io.File(ctx.filesDir, "received").apply { mkdirs() }, "$sha.png")
+            val f = ImageFiles.receivedFile(ctx, sha, mime)
             if (!f.exists() || f.length() == 0L) f.writeBytes(full)
         }
     }
@@ -167,16 +169,23 @@ object FirebaseRepo {
     }
 
     /** Publish a screenshot: dedupe by sha256, thumbnail-first, then full. */
-    suspend fun publishScreenshot(ctx: Context, full: ByteArray) {
+    suspend fun publishScreenshot(ctx: Context, full: ByteArray) = coroutineScope {
         val uid = requireUid()
         val sha = Hashing.sha256(full)
-        cacheFullLocally(ctx, sha, full)
-
-        val existing = col("screenshots").whereEqualTo("sha256", sha).limit(1).get().await()
-        if (!existing.isEmpty) return
-
-        val thumb = Thumbs.make(full) ?: return
         val type = detectImageType(full)
+        cacheFullLocally(ctx, sha, full, type.mime)
+
+        // Thumbnail encoding is independent of the network dedupe lookup. Run
+        // them together so a fresh capture reaches the thumb upload as soon as
+        // the slower of the two completes, instead of paying both costs serially.
+        val preparedThumb = async(Dispatchers.Default) { Thumbs.make(full) }
+        val existing = col("screenshots").whereEqualTo("sha256", sha).limit(1).get().await()
+        if (!existing.isEmpty) {
+            preparedThumb.cancel()
+            return@coroutineScope
+        }
+
+        val thumb = preparedThumb.await() ?: return@coroutineScope
         val docRef = col("screenshots").document()
         val id = docRef.id
         val thumbPath = "users/$uid/screenshots/$id/thumb.webp"
@@ -210,7 +219,8 @@ object FirebaseRepo {
             )
         }
 
-        storage.getReference(thumbPath)
+        val thumbRef = storage.getReference(thumbPath)
+        thumbRef
             .putBytes(thumb.bytes, StorageMetadata.Builder().setContentType("image/webp").build())
             .await()
         docRef.set(
@@ -226,13 +236,21 @@ object FirebaseRepo {
             )
         ).await()
 
-        storage.getReference(fullPath)
+        val thumbUrlTask = async { thumbRef.downloadUrl.await().toString() }
+        val fullRef = storage.getReference(fullPath)
+        val fullUpload = async {
+            fullRef
             .putBytes(full, StorageMetadata.Builder().setContentType(type.mime).build())
             .await()
+        }
+        docRef.update("thumbUrl", thumbUrlTask.await()).await()
+        fullUpload.await()
+        val fullUrl = fullRef.downloadUrl.await().toString()
         docRef.update(
             mapOf(
                 "status" to "full",
                 "fullPath" to fullPath,
+                "fullUrl" to fullUrl,
                 "bytes" to full.size.toLong(),
             )
         ).await()

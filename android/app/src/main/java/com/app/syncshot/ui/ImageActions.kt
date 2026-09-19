@@ -9,9 +9,9 @@ import android.os.Environment
 import android.provider.MediaStore
 import androidx.core.content.FileProvider
 import com.app.syncshot.data.FirebaseRepo
+import com.app.syncshot.data.ImageFiles
 import com.app.syncshot.data.db.AppDb
 import com.app.syncshot.data.db.ScreenshotEntity
-import com.app.syncshot.sync.Receiver
 import java.io.File
 
 /** Image side-effects shared by the viewer and notifications. Blocking download;
@@ -19,12 +19,15 @@ import java.io.File
 object ImageActions {
 
     /** A real on-disk file for the image: the received copy if present, else the
-     *  full.png downloaded from Storage and cached by sha256. */
-    suspend fun ensureFile(ctx: Context, sha: String, fullPath: String): File {
-        val recv = Receiver.receivedFile(ctx, sha)
-        if (recv.exists()) return recv
-        val dir = File(ctx.cacheDir, "shared").apply { mkdirs() }
-        val out = File(dir, "$sha.png")
+     *  full-resolution Storage object cached with its true extension. */
+    suspend fun ensureFile(ctx: Context, sha: String, fullPath: String, mime: String): File {
+        ImageFiles.findReceivedFile(ctx, sha, mime)?.let {
+            return ImageFiles.canonicalize(it, ImageFiles.receivedFile(ctx, sha, mime))
+        }
+        ImageFiles.findSharedFile(ctx, sha, mime)?.let {
+            return ImageFiles.canonicalize(it, ImageFiles.sharedFile(ctx, sha, mime))
+        }
+        val out = ImageFiles.sharedFile(ctx, sha, mime)
         if (!out.exists() || out.length() == 0L) {
             out.writeBytes(FirebaseRepo.downloadFull(fullPath))
         }
@@ -34,7 +37,7 @@ object ImageActions {
     fun share(ctx: Context, file: File) {
         val uri = FileProvider.getUriForFile(ctx, "${ctx.packageName}.fileprovider", file)
         val send = Intent(Intent.ACTION_SEND).apply {
-            type = "image/png"
+            type = ImageFiles.mimeForFile(file)
             putExtra(Intent.EXTRA_STREAM, uri)
             clipData = ClipData.newUri(ctx.contentResolver, file.name, uri)
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
@@ -53,18 +56,18 @@ object ImageActions {
     suspend fun deleteEverywhere(ctx: Context, item: ScreenshotEntity) {
         FirebaseRepo.deleteScreenshot(item.id, item.thumbPath, item.fullPath)
         AppDb.get(ctx).screenshots().deleteById(item.id)
-        runCatching { Receiver.receivedFile(ctx, item.sha256).delete() }
-        runCatching { File(File(ctx.cacheDir, "shared"), "${item.sha256}.png").delete() }
+        runCatching { ImageFiles.deleteCachedCopies(ctx, item.sha256) }
     }
 
     fun saveToGallery(ctx: Context, file: File): Boolean {
         val bytes = file.readBytes()
-        val fname = if (file.name.endsWith(".png", true)) file.name else "${file.name}.png"
+        val mime = ImageFiles.mimeForFile(file)
+        val fname = file.name.ifBlank { "screenshot.${ImageFiles.extensionForMime(mime)}" }
         val resolver = ctx.contentResolver
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             val values = ContentValues().apply {
                 put(MediaStore.Images.Media.DISPLAY_NAME, fname)
-                put(MediaStore.Images.Media.MIME_TYPE, "image/png")
+                put(MediaStore.Images.Media.MIME_TYPE, mime)
                 put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/SyncShot")
                 put(MediaStore.Images.Media.IS_PENDING, 1)
             }

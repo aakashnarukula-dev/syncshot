@@ -108,6 +108,8 @@ interface AnnotationCanvasProps {
   onAnnotationDelete?: (id: string) => void;
   /** Apply a crop. Rect is in canvas/preview pixel coordinates. */
   onCrop?: (rect: { x: number; y: number; width: number; height: number }) => void;
+  /** Fires after the full-resolution bitmap has painted its first canvas frame. */
+  onReady?: () => void;
 }
 
 export const AnnotationCanvas = memo(function AnnotationCanvas({
@@ -122,11 +124,13 @@ export const AnnotationCanvas = memo(function AnnotationCanvas({
   onAnnotationUpdate,
   onAnnotationSelect,
   onCrop,
+  onReady,
 }: AnnotationCanvasProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const imageRef = useRef<HTMLImageElement | null>(null);
   const rafRef = useRef<number | null>(null);
+  const readyNotifiedRef = useRef(false);
   
   // Local state for drag operation - avoids store updates during drag
   const [imageLoaded, setImageLoaded] = useState(false);
@@ -161,6 +165,7 @@ export const AnnotationCanvas = memo(function AnnotationCanvas({
     }
 
     setImageLoaded(false);
+    readyNotifiedRef.current = false;
 
     const img = new Image();
     img.onload = () => {
@@ -704,7 +709,13 @@ export const AnnotationCanvas = memo(function AnnotationCanvas({
 
   useEffect(() => {
     redraw();
-  }, [redraw]);
+    if (!imageLoaded || readyNotifiedRef.current || !canvasRef.current || !imageRef.current) return;
+    readyNotifiedRef.current = true;
+    // Hidden WKWebViews throttle/suspend requestAnimationFrame. Waiting for a
+    // frame here can deadlock editor reveal forever: canvas draw above already
+    // completed synchronously, so signal readiness immediately afterward.
+    onReady?.();
+  }, [redraw, imageLoaded, onReady]);
 
   // Clear any pending crop when leaving the crop tool or swapping image
   useEffect(() => {

@@ -3,6 +3,10 @@ import { useSyncStore } from "@/stores/syncStore";
 import type { ScreenshotDoc } from "./types";
 import {
   cacheDocId,
+  cloudScreenshotPath,
+  importScreenshotPath,
+  isCloudScreenshotPath,
+  isImportScreenshotPath,
   isRecentScreenshot,
   isSyncedCacheFile,
   orderScreenshotsByCreatedAt,
@@ -170,5 +174,27 @@ describe("cacheDocId (re-exported through order)", () => {
     expect(cacheDocId("/cache/Abc123XYZ.png")).toBe("Abc123XYZ");
     expect(cacheDocId("noext")).toBe("noext");
     expect(cacheDocId("")).toBeNull();
+  });
+
+  it("resolves a cloud-only rail identity", () => {
+    const path = cloudScreenshotPath("Abc123XYZ");
+    expect(isCloudScreenshotPath(path)).toBe(true);
+    expect(cacheDocId(path)).toBe("Abc123XYZ");
+  });
+
+  it("keeps the doc identity while versioning edited thumbnail URLs", () => {
+    const path = cloudScreenshotPath("Abc123XYZ", "new-sha");
+    expect(path).toContain("?v=new-sha");
+    expect(cacheDocId(path)).toBe("Abc123XYZ");
+  });
+});
+
+describe("manual image staging identity", () => {
+  it("creates a unique non-cloud identity that never points at a local file", () => {
+    const first = importScreenshotPath();
+    const second = importScreenshotPath();
+    expect(isImportScreenshotPath(first)).toBe(true);
+    expect(isCloudScreenshotPath(first)).toBe(false);
+    expect(first).not.toBe(second);
   });
 });

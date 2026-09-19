@@ -1,6 +1,6 @@
 [package]
 name = "syncshot"
-version = "0.2.4"
+version = "0.2.16"
 description = "SyncShot — fast screenshot capture, edit, and share"
 authors = ["kartik labhshetwar"]
 edition = "2021"
@@ -40,10 +40,13 @@ xcap = "0.8"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.5"
+# Tauri 2.9's macOS Monitor.workArea currently preserves visibleFrame's size
+# but drops its vertical origin. Read NSScreen.visibleFrame directly so the
+# collapsed pill and expanded rail share the exact same usable-screen centre.
+objc2-modern = { package = "objc2", version = "0.6" }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSScreen"] }
 
 # Desktop-only: prevents a second app instance (autostart + manual launch) from
 # registering a duplicate global shortcut and spawning a second column window.
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-single-instance = "2"
-
-

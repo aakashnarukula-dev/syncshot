@@ -11,6 +11,26 @@ export interface WindowRange {
   end: number;
 }
 
+/** Number of older screenshots kept warm beyond the visible rail viewport. */
+export const RAIL_THUMB_BUFFER = 3;
+
+/**
+ * Forward-only preload range for a newest-first rail. Items below the viewport
+ * are older and are what a downward scroll reveals next. Items above were
+ * already visible/cached, so re-requesting them would steal bandwidth from the
+ * useful forward buffer.
+ */
+export function computePreloadRange(
+  visibleStart: number,
+  visibleEnd: number,
+  count: number,
+  buffer = RAIL_THUMB_BUFFER,
+): WindowRange {
+  const start = Math.max(0, Math.min(count, visibleStart));
+  const end = Math.max(start, Math.min(count, visibleEnd + Math.max(0, buffer)));
+  return { start, end };
+}
+
 export function computeWindowRange(
   scrollTop: number,
   viewportHeight: number,

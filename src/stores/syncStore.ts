@@ -169,6 +169,48 @@ export function renameCapturePath(from: string, to: string): void {
   renameCapturePathImpl?.(from, to);
 }
 
+// Remote screenshot delivery has two useful milestones:
+//   1. Firestore exposes the uploaded thumbnail — enough to paint/reveal the pill.
+//   2. The full cloud image is available — enough to copy/edit/drag it on demand.
+// Keep these callbacks outside reactive state, like the capture-path swapper
+// above: they are one-shot delivery signals, not durable application data.
+let incomingScreenshotPreviewImpl:
+  | ((item: ScreenshotDoc, cloudPath: string) => void)
+  | null = null;
+let incomingScreenshotSavedImpl:
+  | ((item: ScreenshotDoc, localPath: string) => void)
+  | null = null;
+
+/** App: register the low-latency remote-thumbnail delivery handler. */
+export function registerIncomingScreenshotPreview(
+  fn: ((item: ScreenshotDoc, cloudPath: string) => void) | null,
+): void {
+  incomingScreenshotPreviewImpl = fn;
+}
+
+/** Sync engine: surface a fresh remote shot as soon as its thumbnail exists. */
+export function incomingScreenshotPreview(
+  item: ScreenshotDoc,
+  cloudPath: string,
+): void {
+  incomingScreenshotPreviewImpl?.(item, cloudPath);
+}
+
+/** App: register the handler invoked after the full cloud image is available. */
+export function registerIncomingScreenshotSaved(
+  fn: ((item: ScreenshotDoc, localPath: string) => void) | null,
+): void {
+  incomingScreenshotSavedImpl = fn;
+}
+
+/** Sync engine: announce that a fresh remote shot is ready for local actions. */
+export function incomingScreenshotSaved(
+  item: ScreenshotDoc,
+  localPath: string,
+): void {
+  incomingScreenshotSavedImpl?.(item, localPath);
+}
+
 // Selector hooks (stable, minimal re-renders).
 export const useAuthState = () => useSyncStore((s) => s.authState);
 export const useAccountEmail = () => useSyncStore((s) => s.email);

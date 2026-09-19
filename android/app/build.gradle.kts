@@ -5,9 +5,12 @@ plugins {
     alias(libs.plugins.ksp)
 }
 
-// Apply Firebase's google-services plugin only when the config file is present,
-// so assembleDebug stays green without app/google-services.json.
-if (file("google-services.json").exists()) {
+// Prefer Firebase's generated Android config when it is available. The public
+// fallback values below keep local/debug APKs fully initialized as well; the
+// previous build silently omitted every Firebase resource and then crashed in
+// MainActivity the first time it accessed FirebaseAuth.
+val hasGoogleServicesConfig = file("google-services.json").exists()
+if (hasGoogleServicesConfig) {
     apply(plugin = "com.google.gms.google-services")
 }
 
@@ -30,8 +33,19 @@ android {
         applicationId = "com.app.syncshot"
         minSdk = 26
         targetSdk = 34
-        versionCode = 2
-        versionName = "2.0.0"
+        versionCode = 5
+        versionName = "2.0.3"
+
+        if (!hasGoogleServicesConfig) {
+            // Firebase client configuration is public (authorization is
+            // enforced by Auth + Firestore/Storage rules). These values belong
+            // to the registered syncshot-v2 Android app for com.app.syncshot.
+            resValue("string", "google_app_id", "1:424325660516:android:402841aebec1c1fbfec471")
+            resValue("string", "google_api_key", "AIzaSyApIWE3umXq6BDvxiB7fCm6NHgsZZfB4nE")
+            resValue("string", "gcm_defaultSenderId", "424325660516")
+            resValue("string", "project_id", "syncshot-v2")
+            resValue("string", "google_storage_bucket", "syncshot-v2.firebasestorage.app")
+        }
 
         buildConfigField("String", "TRUECALLER_PARTNER_KEY", "\"$truecallerPartnerKey\"")
         manifestPlaceholders["truecallerPartnerKey"] = truecallerPartnerKey

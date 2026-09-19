@@ -1,10 +1,9 @@
 /**
  * Firebase app initialization + typed service handles.
  *
- * Single source of truth for the Firebase JS SDK instances used by the sync
- * engine. Firestore is created with IndexedDB-backed offline persistence so
- * the screenshot/clipboard lists render instantly on cold start and writes are
- * queued while offline.
+ * Single source of truth for Firebase. Firestore uses a memory-only cache so
+ * screenshot metadata is never persisted on the Mac; Storage remains the sole
+ * screenshot library.
  *
  * Identity = phone sign-in. Phone + reCAPTCHA + OTP can't run inside the Tauri
  * webview: its `tauri://localhost` origin fails Firebase phone-auth's
@@ -28,8 +27,7 @@ import {
 } from "firebase/auth";
 import {
   initializeFirestore,
-  persistentLocalCache,
-  persistentSingleTabManager,
+  memoryLocalCache,
   type Firestore,
 } from "firebase/firestore";
 import { getStorage, type FirebaseStorage } from "firebase/storage";
@@ -39,16 +37,8 @@ export const app: FirebaseApp = initializeApp(firebaseConfig);
 
 export const auth: Auth = getAuth(app);
 
-// IndexedDB offline persistence (zero-latency cold render + offline writes).
-// persistentSingleTabManager: ONLY the main webview ever initializes Firestore
-// (the editor window renders EditorOnlyApp and never imports the sync layer),
-// so the multi-tab manager's periodic IndexedDB lease writes were pure
-// overhead. If a second Firestore-holding webview ever appears, persistence
-// activation fails soft (in-memory cache + console warning), not a crash.
 export const db: Firestore = initializeFirestore(app, {
-  localCache: persistentLocalCache({
-    tabManager: persistentSingleTabManager(undefined),
-  }),
+  localCache: memoryLocalCache(),
 });
 
 export const storage: FirebaseStorage = getStorage(app);

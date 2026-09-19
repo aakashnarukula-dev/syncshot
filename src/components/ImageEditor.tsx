@@ -2,7 +2,6 @@ import { useState, useRef, useEffect, useCallback } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow, LogicalSize, availableMonitors } from "@tauri-apps/api/window";
 import { emit, listen } from "@tauri-apps/api/event";
-import { Store } from "@tauri-apps/plugin-store";
 import { toast } from "sonner";
 import { AnnotationToolbar } from "./editor/AnnotationToolbar";
 import { AnnotationCanvas } from "./editor/AnnotationCanvas";
@@ -40,18 +39,52 @@ interface ImageEditorProps {
   imagePath: string;
 }
 
+interface EditorPendingSource {
+  imagePath: string;
+  imageUrl?: string | null;
+  previewUrl?: string | null;
+}
+
 /** URL sentinel the singleton window boots with before any image is chosen. */
 const PENDING_SENTINEL = "__pending__";
+
+/** Opaque screenshots do not need the expensive full-image alpha scan. */
+function hasTransparentOuterCorner(image: HTMLImageElement): boolean {
+  const w = image.naturalWidth;
+  const h = image.naturalHeight;
+  if (w < 1 || h < 1) return false;
+  const probe = document.createElement("canvas");
+  probe.width = 2;
+  probe.height = 2;
+  const ctx = probe.getContext("2d");
+  if (!ctx) return true;
+  ctx.drawImage(image, 0, 0, 1, 1, 0, 0, 1, 1);
+  ctx.drawImage(image, w - 1, 0, 1, 1, 1, 0, 1, 1);
+  ctx.drawImage(image, 0, h - 1, 1, 1, 0, 1, 1, 1);
+  ctx.drawImage(image, w - 1, h - 1, 1, 1, 1, 1, 1, 1);
+  const data = ctx.getImageData(0, 0, 2, 2).data;
+  return data[3] < 250 || data[7] < 250 || data[11] < 250 || data[15] < 250;
+}
+
+/** Small cross-window preview for an immediate rail replacement after save. */
+function makeOptimisticThumbnail(canvas: HTMLCanvasElement): string {
+  const maxEdge = 512;
+  const scale = Math.min(1, maxEdge / Math.max(canvas.width, canvas.height));
+  const thumb = document.createElement("canvas");
+  thumb.width = Math.max(1, Math.round(canvas.width * scale));
+  thumb.height = Math.max(1, Math.round(canvas.height * scale));
+  const ctx = thumb.getContext("2d");
+  if (!ctx) return "";
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = "high";
+  ctx.drawImage(canvas, 0, 0, thumb.width, thumb.height);
+  return thumb.toDataURL("image/webp", 0.78);
+}
 
 /** Where saves land — read fresh on every save so pref changes apply to a reused window. */
 async function loadSaveDir(): Promise<string> {
   try {
-    const store = await Store.load("settings.json");
-    const sd = await store.get<string>("saveDir");
-    if (sd) return sd;
-  } catch {}
-  try {
-    return await invoke<string>("get_desktop_directory");
+    return await invoke<string>("get_temp_directory");
   } catch {}
   return "";
 }
@@ -68,6 +101,8 @@ export function ImageEditor({ imagePath }: ImageEditorProps) {
   // in-memory base image, and canvas-local zoom/pan must reset per session).
   const [openReq, setOpenReq] = useState(() => ({
     path: imagePath && imagePath !== PENDING_SENTINEL ? imagePath : "",
+    url: "",
+    previewUrl: "",
     nonce: 0,
   }));
   // True from "new image requested" until the preview for it lands — the hook
@@ -83,7 +118,6 @@ export function ImageEditor({ imagePath }: ImageEditorProps) {
   // Save/copy state
   const [isSaving, setIsSaving] = useState(false);
   const [isCopying, setIsCopying] = useState(false);
-  const [tempDir, setTempDir] = useState<string>("/private/tmp");
   
   // OCR state
   const [isOCRProcessing, setIsOCRProcessing] = useState(false);
@@ -102,19 +136,22 @@ export function ImageEditor({ imagePath }: ImageEditorProps) {
   // Crop undo stack — base image isn't in the store, so crops undo locally.
   const cropUndoRef = useRef<Array<{ image: HTMLImageElement; annotations: Annotation[]; settings: EditorSettings }>>([]);
 
-  // Crop exports overwrite the same file within ONE editing session; reset
-  // per open so a reused window never clobbers a previous session's crop.
+  // Tracks the path represented by the latest persisted editor result. Every
+  // crop/save creates a replacement file; the main window serially removes the
+  // previous local/cloud version. Unique paths keep rapid edits race-free and
+  // force the thumbnail/webview to decode the new bytes immediately.
   const lastCropPathRef = useRef<string | null>(null);
+  const editorPersistQueueRef = useRef<Promise<void>>(Promise.resolve());
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
   // Toolbar wrapper — measured (not hardcoded) so the window height budget
   // matches the real toolbar row exactly. Fallback to 45 if unmeasurable.
   const toolbarRef = useRef<HTMLDivElement>(null);
-  // Guards the one-shot self-correcting window reconciliation to the nonce it
-  // ran for, so it fires at most once per open and can't feedback-loop on the
-  // resize it triggers.
-  const reconciledNonceRef = useRef<number>(-1);
+  // The native singleton is hidden on open. Reveal exactly once, only after the
+  // final full-resolution canvas has painted and its geometry is settled.
+  const revealedNonceRef = useRef<number>(-1);
+  const autoCopiedNonceRef = useRef<number>(-1);
 
   // Preview generator hook
   const { previewUrl, error: previewError, renderHighQualityCanvas } = usePreviewGenerator({
@@ -151,19 +188,24 @@ export function ImageEditor({ imagePath }: ImageEditorProps) {
     setLoadError(null);
   }, []);
 
-  const openImage = useCallback((path: string) => {
+  const openImage = useCallback((source: EditorPendingSource) => {
     resetEditorSession();
     editorActions.initialize();
     setAwaitingPreview(true);
-    setOpenReq((prev) => ({ path, nonce: prev.nonce + 1 }));
+    setOpenReq((prev) => ({
+      path: source.imagePath,
+      url: source.imageUrl ?? "",
+      previewUrl: source.previewUrl ?? "",
+      nonce: prev.nonce + 1,
+    }));
   }, [resetEditorSession]);
 
   // Close = reset + HIDE (never destroy) so the webview stays warm for the
   // next open. "editor-closed" must go out before the hide so the main
-  // window's open-editor counter and auto-hide resume reliably.
+  // window's open-editor counter resumes display-follow reliably.
   const closeEditor = useCallback(async () => {
     resetEditorSession();
-    setOpenReq((prev) => ({ path: "", nonce: prev.nonce + 1 }));
+    setOpenReq((prev) => ({ path: "", url: "", previewUrl: "", nonce: prev.nonce + 1 }));
     try { await emit("editor-closed"); } catch {}
     try { await getCurrentWindow().hide(); } catch {}
   }, [resetEditorSession]);
@@ -174,7 +216,7 @@ export function ImageEditor({ imagePath }: ImageEditorProps) {
   // the take on mount, and each request is consumed exactly once.
   const consumePendingOpen = useCallback(async () => {
     try {
-      const pending = await invoke<string | null>("take_editor_pending_path");
+      const pending = await invoke<EditorPendingSource | null>("take_editor_pending_path");
       if (pending) openImage(pending);
     } catch (e) {
       console.error("take_editor_pending_path failed:", e);
@@ -219,8 +261,7 @@ export function ImageEditor({ imagePath }: ImageEditorProps) {
   // an oversized window and leaves a thick black letterbox.
   useEffect(() => {
     if (!openReq.path) return;
-    // A fresh open gets a fresh one-shot reconciliation.
-    reconciledNonceRef.current = -1;
+    revealedNonceRef.current = -1;
     const restoreWindowState = async () => {
       const appWindow = getCurrentWindow();
       // Un-fullscreen / un-maximize first, each guarded so one failing (or a
@@ -237,13 +278,6 @@ export function ImageEditor({ imagePath }: ImageEditorProps) {
     };
     restoreWindowState();
   }, [openReq]);
-
-  // Get the system temp directory (once — it never changes)
-  useEffect(() => {
-    invoke<string>("get_temp_directory")
-      .then((dir) => setTempDir(dir))
-      .catch((err) => console.error("Failed to get temp directory:", err));
-  }, []);
 
   // The preview hook keeps the previous previewUrl until it regenerates for
   // the new image; any change after an open means the fresh one landed.
@@ -281,6 +315,10 @@ export function ImageEditor({ imagePath }: ImageEditorProps) {
       try {
         const w = img.naturalWidth;
         const h = img.naturalHeight;
+        // A four-pixel probe makes the common opaque screenshot path O(1).
+        // Only native window captures have transparent outer corners and need
+        // the full RGBA bounding-box pass below.
+        if (hasTransparentOuterCorner(img)) {
         const trimCanvas = document.createElement("canvas");
         trimCanvas.width = w;
         trimCanvas.height = h;
@@ -396,15 +434,12 @@ export function ImageEditor({ imagePath }: ImageEditorProps) {
             }
           }
         }
+        }
       } catch {
         // getImageData tainted (crossOrigin fallback) or any trim failure —
         // use the original image unchanged.
         baseImg = img;
       }
-
-      if (cancelled) return;
-      setScreenshotImage(baseImg);
-      setImageLoaded(true);
 
       try {
         // Size the window to the SCREENSHOT's own aspect ratio so the canvas
@@ -451,45 +486,27 @@ export function ImageEditor({ imagePath }: ImageEditorProps) {
         }
         await win.setSize(new LogicalSize(finalW, finalH));
         await win.center();
-
-        // Self-correcting reconciliation: after layout settles, if the canvas's
-        // ACTUAL rendered size (the authoritative contain-fit result) is smaller
-        // than the window content area, a black bar remains — shrink the window
-        // to the canvas once. Scoped to this nonce so it runs at most once per
-        // open and can't feedback-loop on the resize it triggers.
-        const nonceAtSize = openReq.nonce;
-        requestAnimationFrame(() => requestAnimationFrame(() => {
-          void (async () => {
-            if (reconciledNonceRef.current === nonceAtSize) return;
-            reconciledNonceRef.current = nonceAtSize;
-            try {
-              const canvasEl = document.querySelector<HTMLCanvasElement>("canvas[data-editor-canvas]");
-              if (!canvasEl) return;
-              const rect = canvasEl.getBoundingClientRect();
-              if (rect.width < 1 || rect.height < 1) return;
-              const tbH = toolbarRef.current?.offsetHeight || 45;
-              const targetW = Math.round(rect.width);
-              const targetH = Math.round(rect.height) + tbH;
-              // window.innerWidth/innerHeight = the webview content area (logical px).
-              const bufW = window.innerWidth;
-              const bufH = window.innerHeight;
-              if (bufW - targetW > 1 || bufH - targetH > 1) {
-                const w = getCurrentWindow();
-                await w.setSize(new LogicalSize(targetW, targetH));
-                await w.center();
-              }
-            } catch (e) {
-              console.error("Editor window reconciliation failed:", e);
-            }
-          })();
-        }));
       } catch (e) {
         console.error("Failed to size editor window:", e);
       }
+
+      if (cancelled) return;
+      // Mount the annotation canvas only after the hidden native window already
+      // has its final aspect-ratio-correct size. AnnotationCanvas reveals the
+      // window after its first full-resolution draw.
+      setScreenshotImage(baseImg);
+      setImageLoaded(true);
     };
     img.onerror = () => {
       if (cancelled) return;
       setLoadError(`Failed to load image from: ${imagePath}`);
+      void (async () => {
+        const win = getCurrentWindow();
+        try { await win.setSize(new LogicalSize(600, 320)); } catch {}
+        try { await win.center(); } catch {}
+        try { await win.show(); } catch {}
+        try { await win.setFocus(); } catch {}
+      })();
     };
 
     // PRIMARY: read the file's bytes over IPC and load a same-origin `blob:`
@@ -502,12 +519,32 @@ export function ImageEditor({ imagePath }: ImageEditorProps) {
     // save/copy/crop/OCR all keep working. Asset URL kept as a dev fallback.
     (async () => {
       try {
-        const buf = await invoke<ArrayBuffer>("read_image_bytes", { path: imagePath });
+        const buf = openReq.url
+          ? await invoke<ArrayBuffer>("read_remote_image_bytes", { url: openReq.url })
+          : await invoke<ArrayBuffer>("read_image_bytes", { path: imagePath });
         if (cancelled) return;
         objectUrl = URL.createObjectURL(new Blob([buf]));
         img.src = objectUrl;
+        // The read above populated Rust's short-lived memory cache. Auto-copy
+        // from that cache now, so opening a cloud image performs one Firebase
+        // download instead of two concurrent full-resolution downloads.
+        if (openReq.url && autoCopiedNonceRef.current !== openReq.nonce) {
+          autoCopiedNonceRef.current = openReq.nonce;
+          void invoke("copy_remote_image_to_clipboard", { url: openReq.url })
+            .then(() => toast.success("Copied to clipboard", { duration: 1500 }))
+            .catch((e) => console.error("copy on open failed:", e));
+        }
       } catch {
         if (cancelled) return;
+        if (openReq.url) {
+          setLoadError("Failed to download screenshot from Firebase");
+          const win = getCurrentWindow();
+          try { await win.setSize(new LogicalSize(600, 320)); } catch {}
+          try { await win.center(); } catch {}
+          try { await win.show(); } catch {}
+          try { await win.setFocus(); } catch {}
+          return;
+        }
         img.crossOrigin = "anonymous";
         img.src = convertFileSrc(imagePath);
       }
@@ -523,6 +560,67 @@ export function ImageEditor({ imagePath }: ImageEditorProps) {
       if (trimmedUrl) URL.revokeObjectURL(trimmedUrl);
     };
   }, [openReq]);
+
+  const revealReadyEditor = useCallback(async () => {
+    if (!openReq.path || revealedNonceRef.current === openReq.nonce) return;
+    revealedNonceRef.current = openReq.nonce;
+    const win = getCurrentWindow();
+    try {
+      // Canvas layout is authoritative. Correct any sub-pixel contain rounding
+      // while hidden, then reveal one complete frame—never resize after show.
+      const canvas = document.querySelector<HTMLCanvasElement>("canvas[data-editor-canvas]");
+      const rect = canvas?.getBoundingClientRect();
+      if (rect && rect.width >= 1 && rect.height >= 1) {
+        const toolbarH = toolbarRef.current?.offsetHeight || 45;
+        const targetW = Math.round(rect.width);
+        const targetH = Math.round(rect.height) + toolbarH;
+        if (window.innerWidth - targetW > 1 || window.innerHeight - targetH > 1) {
+          await win.setSize(new LogicalSize(targetW, targetH));
+          await win.center();
+        }
+      }
+    } catch (error) {
+      console.error("Editor final geometry failed:", error);
+    }
+    try { await win.show(); } catch {}
+    try { await win.setFocus(); } catch {}
+  }, [openReq.nonce, openReq.path]);
+
+  // Serialize crop/save writes inside the editor too. A crop export and a fast
+  // Save click can otherwise both read the same previous path, producing two
+  // sibling replacements before the main window has a chance to process them.
+  const persistEditedImage = useCallback((dataUrl: string, previewDataUrl = ""): Promise<string> => {
+    let resolvePath!: (path: string) => void;
+    let rejectPath!: (reason: unknown) => void;
+    const result = new Promise<string>((resolve, reject) => {
+      resolvePath = resolve;
+      rejectPath = reject;
+    });
+
+    editorPersistQueueRef.current = editorPersistQueueRef.current
+      .catch(() => {})
+      .then(async () => {
+        try {
+          const saveDir = await loadSaveDir();
+          if (!saveDir) throw new Error("Save directory not set");
+          const previousPath = lastCropPathRef.current ?? openReq.path;
+          const newPath = await invoke<string>("save_edited_image", {
+            imageData: dataUrl,
+            saveDir,
+            copyToClip: true,
+          });
+          lastCropPathRef.current = newPath;
+          try {
+            await emit("editor-saved", { originalPath: previousPath, newPath, previewDataUrl });
+          } catch {}
+          resolvePath(newPath);
+        } catch (error) {
+          rejectPath(error);
+        }
+      });
+
+    return result;
+  }, [openReq.path]);
 
   // Save handler — persists to the save dir + clipboard, notifies the main
   // window, then hides this one (was EditorOnlyApp's onSave + destroy).
@@ -545,17 +643,7 @@ export function ImageEditor({ imagePath }: ImageEditorProps) {
         reader.readAsDataURL(blob);
       });
 
-      const saveDir = await loadSaveDir();
-      if (!saveDir) {
-        toast.error("Save directory not set");
-        return;
-      }
-      const newPath = await invoke<string>("save_edited_image", {
-        imageData: dataUrl,
-        saveDir,
-        copyToClip: true,
-      });
-      try { await emit("editor-saved", { originalPath: openReq.path, newPath }); } catch {}
+      await persistEditedImage(dataUrl, makeOptimisticThumbnail(highQualityCanvas));
       await closeEditor();
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -564,9 +652,11 @@ export function ImageEditor({ imagePath }: ImageEditorProps) {
     } finally {
       setIsSaving(false);
     }
-  }, [screenshotImage, annotations, renderHighQualityCanvas, isSaving, isCopying, openReq.path, closeEditor]);
+  }, [screenshotImage, annotations, renderHighQualityCanvas, isSaving, isCopying, persistEditedImage, closeEditor]);
 
-  // Copy handler
+  // Copy commits the full rendered editor result too. This keeps the rail and
+  // Firebase on the exact image placed on the clipboard, including every
+  // annotation/effect—not only crops or explicit Save clicks.
   const handleCopy = useCallback(async () => {
     if (!screenshotImage || isSaving || isCopying) return;
     
@@ -580,12 +670,7 @@ export function ImageEditor({ imagePath }: ImageEditorProps) {
       }
 
       const dataUrl = highQualityCanvas.toDataURL("image/png");
-      
-      await invoke<string>("save_edited_image", {
-        imageData: dataUrl,
-        saveDir: tempDir,
-        copyToClip: true,
-      });
+      await persistEditedImage(dataUrl, makeOptimisticThumbnail(highQualityCanvas));
       
       toast.success("Screenshot copied to clipboard!", {
         duration: 2000,
@@ -600,7 +685,7 @@ export function ImageEditor({ imagePath }: ImageEditorProps) {
     } finally {
       setIsCopying(false);
     }
-  }, [screenshotImage, annotations, renderHighQualityCanvas, isSaving, isCopying, tempDir]);
+  }, [screenshotImage, annotations, renderHighQualityCanvas, isSaving, isCopying, persistEditedImage]);
 
   const handleOCRFullImage = useCallback(async () => {
     if (!screenshotImage || isOCRProcessing) return;
@@ -666,29 +751,18 @@ export function ImageEditor({ imagePath }: ImageEditorProps) {
     }
   }, [selectedAnnotation, actions]);
 
-  // Persist a crop without closing — overwrites the same file across crops in
-  // one session (was EditorOnlyApp's onExport; internal now that the window
-  // is reused and the shell's callbacks would destroy it).
-  const exportCrop = useCallback(async (dataUrl: string) => {
-    const saveDir = await loadSaveDir();
-    if (!saveDir) {
-      toast.error("Save directory not set");
-      return;
-    }
+  // Persist a crop without closing. The main window receives an explicit
+  // replacement event immediately; it swaps the live tile, removes the prior
+  // local/cloud object, and publishes only this cropped result.
+  const exportCrop = useCallback(async (dataUrl: string, previewDataUrl: string) => {
     try {
-      const path = await invoke<string>("save_edited_image", {
-        imageData: dataUrl,
-        saveDir,
-        copyToClip: true,
-        overwritePath: lastCropPathRef.current,
-      });
-      lastCropPathRef.current = path;
+      await persistEditedImage(dataUrl, previewDataUrl);
       toast.success("Cropped screenshot saved & copied", { duration: 2000 });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       toast.error("Failed to save crop", { description: msg, duration: 5000 });
     }
-  }, []);
+  }, [persistEditedImage]);
 
   // Crop — rect is in preview-pixel coordinates. Two outputs from the same rect:
   //   1. EXPORT: composite WITH annotations baked → saved to folder + clipboard.
@@ -708,20 +782,23 @@ export function ImageEditor({ imagePath }: ImageEditorProps) {
     const sh = Math.min(baked.height - sy, Math.round(rect.height));
     if (sw < 1 || sh < 1) return;
 
-    const cropTo = (src: CanvasImageSource): string => {
+    const cropTo = (src: CanvasImageSource) => {
       const c = document.createElement("canvas");
       c.width = sw;
       c.height = sh;
       c.getContext("2d")!.drawImage(src, sx, sy, sw, sh, 0, 0, sw, sh);
-      return c.toDataURL("image/png");
+      return {
+        dataUrl: c.toDataURL("image/png"),
+        previewDataUrl: makeOptimisticThumbnail(c),
+      };
     };
 
-    const exportDataUrl = cropTo(baked);
+    const exported = cropTo(baked);
 
     // 2. Annotation-free composite (the preview) becomes the editable base image.
     const baseSrc = new Image();
     baseSrc.onload = () => {
-      const baseDataUrl = cropTo(baseSrc);
+      const baseDataUrl = cropTo(baseSrc).dataUrl;
       const newBase = new Image();
       newBase.onload = () => {
         cropUndoRef.current.push({
@@ -742,7 +819,7 @@ export function ImageEditor({ imagePath }: ImageEditorProps) {
         setSelectedAnnotation(null);
         setSelectedTool("select");
         // Save to the screenshots folder + clipboard, like a normal capture.
-        void exportCrop(exportDataUrl);
+        void exportCrop(exported.dataUrl, exported.previewDataUrl);
       };
       newBase.src = baseDataUrl;
     };
@@ -883,14 +960,15 @@ export function ImageEditor({ imagePath }: ImageEditorProps) {
             onAnnotationSelect={setSelectedAnnotation}
             onAnnotationDelete={handleAnnotationDelete}
             onCrop={handleCrop}
+            onReady={revealReadyEditor}
           />
-        ) : imageLoaded ? (
-          <div className="text-muted-foreground text-base text-pretty">Generating preview...</div>
         ) : error ? (
           <div className="text-center text-red-400 p-5">
             <p className="mb-2 text-base font-medium text-balance">Could not load image</p>
             <small className="text-foreground0 text-xs text-pretty">{error}</small>
           </div>
+        ) : imageLoaded ? (
+          <div className="text-muted-foreground text-base text-pretty">Generating preview...</div>
         ) : (
           <div className="text-muted-foreground text-base text-pretty">Loading image...</div>
         )}

@@ -15,6 +15,36 @@
 import { useSyncStore } from "@/stores/syncStore";
 import type { ScreenshotDoc } from "./types";
 
+/** Stable rail identity for a screenshot whose bytes live only in Firebase. */
+export const CLOUD_SCREENSHOT_PREFIX = "syncshot-cloud://";
+export const IMPORT_SCREENSHOT_PREFIX = "syncshot-import://";
+
+/** Short-lived in-memory rail identity used while a manually selected image
+ * uploads. It never names a file on disk and is replaced by a cloud identity
+ * only after the full Firebase object is ready for edit/copy/delete actions. */
+export function importScreenshotPath(): string {
+  return `${IMPORT_SCREENSHOT_PREFIX}${crypto.randomUUID()}`;
+}
+
+export function isImportScreenshotPath(path: string): boolean {
+  return path.startsWith(IMPORT_SCREENSHOT_PREFIX);
+}
+
+export function cloudScreenshotPath(id: string, version?: string): string {
+  const suffix = version ? `?v=${encodeURIComponent(version)}` : "";
+  return `${CLOUD_SCREENSHOT_PREFIX}${id}${suffix}`;
+}
+
+export function cloudScreenshotId(path: string): string | null {
+  if (!path.startsWith(CLOUD_SCREENSHOT_PREFIX)) return null;
+  const id = path.slice(CLOUD_SCREENSHOT_PREFIX.length).split(/[?#]/, 1)[0];
+  return id || null;
+}
+
+export function isCloudScreenshotPath(path: string): boolean {
+  return cloudScreenshotId(path) !== null;
+}
+
 /**
  * The pill column knows screenshots by their local CACHE PATH, not their
  * Firestore id. A screenshot RECEIVED from another device is written to the
@@ -24,6 +54,8 @@ import type { ScreenshotDoc } from "./types";
  * match any doc id — the caller falls back to a content hash.
  */
 export function cacheDocId(path: string): string | null {
+  const cloudId = cloudScreenshotId(path);
+  if (cloudId) return cloudId;
   const base = path.split(/[\\/]/).pop() ?? "";
   const dot = base.lastIndexOf(".");
   const id = dot > 0 ? base.slice(0, dot) : base;

@@ -12,18 +12,19 @@ mod license;
 mod screenshot;
 mod utils;
 
-use commands::{
-    capture_all_monitors, capture_once, capture_region, copy_to_clipboard, cursor_display_bounds,
-    delete_file,
-    download_synced_image, get_desktop_directory, get_desktop_root, get_mouse_position,
-    file_exists, get_screenshot_thumbnail, get_screenshot_thumbnail_path, get_temp_directory,
-    list_screenshots, native_capture_fullscreen, native_capture_interactive,
-    read_image_bytes, stat_file, take_editor_pending_path,
-    native_capture_window, open_editor_window, play_screenshot_sound, save_edited_image,
-    save_edited_image_bytes,
-    rename_screenshot_to_doc_id, save_native_screenshot, set_clipboard_text,
-};
 use auth::{browser_auth_listen, close_auth_window};
+use commands::{
+    capture_all_monitors, capture_once, capture_region, clear_remote_image_cache,
+    copy_remote_image_to_clipboard, copy_to_clipboard, cursor_display_bounds, delete_file,
+    download_temporary_image, file_exists, get_desktop_directory, get_desktop_root,
+    get_mouse_position, get_screenshot_thumbnail, get_screenshot_thumbnail_path,
+    get_temp_directory, list_screenshot_sources, list_screenshots, list_screenshots_from_dirs,
+    native_capture_fullscreen, native_capture_interactive, native_capture_window,
+    open_editor_window, play_screenshot_sound, prefetch_remote_images, read_image_bytes,
+    read_remote_image_bytes, remove_legacy_screenshot_directory, rename_screenshot_to_doc_id,
+    save_edited_image, save_edited_image_bytes, save_image_to_downloads, save_native_screenshot,
+    set_clipboard_text, stat_file, take_editor_pending_path,
+};
 use license::{get_machine_id, keychain_delete, keychain_get, keychain_set};
 
 /// Port for the release-mode localhost server (see tauri_plugin_localhost below).
@@ -41,6 +42,7 @@ struct TrayState {
 /// When the window is VISIBLE, "Quit" (hides the window) is the trailing item:
 /// - signed IN  → Preferences, Log Out, sep, Quit
 /// - signed OUT → Sign in & Sync, Preferences, sep, Quit
+///
 /// When the window is HIDDEN, "Open App" (shows+focuses the window) is at the TOP,
 /// followed by a separator then the rest:
 /// - signed IN  → Open App, sep, Preferences, Log Out
@@ -227,6 +229,18 @@ pub fn run() {
             use tauri::Manager;
             use tauri_plugin_autostart::ManagerExt;
 
+            // Pre-cloud-only builds kept rendered screenshot thumbnails under
+            // ~/Library/Caches. Remove that exact app-owned directory once;
+            // current builds use TMPDIR and clean staging artifacts on delete.
+            if let Some(cache_root) = dirs::cache_dir() {
+                let legacy_thumbs = cache_root
+                    .join("com.aakashnarukula.syncshot")
+                    .join("thumbnails");
+                if legacy_thumbs.exists() {
+                    let _ = std::fs::remove_dir_all(legacy_thumbs);
+                }
+            }
+
             // Track auth + window visibility so the native tray menu (which does
             // not rebuild on open) can be rebuilt whenever either changes. The
             // window starts visible and signed-out.
@@ -264,27 +278,10 @@ pub fn run() {
             // emits `clipboard-changed` so the webview can sync copies.
             crate::clipboard::start_clipboard_watcher(app.handle().clone());
 
-            // Thumbnail backfill: one LOW-PRIORITY pass ~5s after launch that
-            // generates every missing cache thumbnail, so any later rail open
-            // over the whole library is a 100% cache hit instead of a cold
-            // decode storm. Own OS thread (not the tokio pool): the pass
-            // sleeps/yields for minutes and must never occupy a runtime
-            // worker. Serial, and starved by interactive requests by design.
-            std::thread::spawn(|| {
-                std::thread::sleep(std::time::Duration::from_secs(5));
-                match crate::utils::get_syncshot_dir() {
-                    Ok(dir) => {
-                        let (generated, skipped, failed) = crate::image::backfill_thumbnails(
-                            &dir,
-                            crate::image::BACKFILL_THUMB_MAX_PX,
-                        );
-                        eprintln!(
-                            "[thumb-backfill] pass complete: {generated} generated, {skipped} already cached, {failed} failed"
-                        );
-                    }
-                    Err(e) => eprintln!("[thumb-backfill] skipped: {e}"),
-                }
-            });
+            // Cloud screenshots are memory/URL-backed. Purge only exact
+            // app-owned temp derivatives left by a prior forced quit.
+            commands::cleanup_temporary_cloud_materializations();
+            crate::image::clear_temporary_thumbnail_cache();
 
             if let Some(window) = app.get_webview_window("main") {
                 let window_clone = window.clone();
@@ -428,16 +425,23 @@ pub fn run() {
             save_edited_image_bytes,
             save_native_screenshot,
             copy_to_clipboard,
+            copy_remote_image_to_clipboard,
+            prefetch_remote_images,
+            clear_remote_image_cache,
             delete_file,
             open_editor_window,
             take_editor_pending_path,
             get_desktop_directory,
+            remove_legacy_screenshot_directory,
             get_desktop_root,
             list_screenshots,
+            list_screenshots_from_dirs,
+            list_screenshot_sources,
             get_temp_directory,
             get_screenshot_thumbnail,
             get_screenshot_thumbnail_path,
             read_image_bytes,
+            read_remote_image_bytes,
             file_exists,
             stat_file,
             native_capture_interactive,
@@ -445,7 +449,8 @@ pub fn run() {
             native_capture_window,
             play_screenshot_sound,
             rename_screenshot_to_doc_id,
-            download_synced_image,
+            download_temporary_image,
+            save_image_to_downloads,
             set_clipboard_text,
             get_mouse_position,
             cursor_display_bounds,

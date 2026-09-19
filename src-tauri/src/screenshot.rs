@@ -1,7 +1,7 @@
 //! Screenshot capture module
 
 use serde::Serialize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use xcap::Monitor;
 
 use crate::utils::{ensure_dir, generate_filename_with_id, AppResult};
@@ -40,7 +40,7 @@ pub fn capture_all_monitors(save_dir: &str) -> AppResult<Vec<MonitorShot>> {
 }
 
 /// Capture a single monitor screenshot
-fn capture_single_monitor(monitor: &Monitor, save_path: &PathBuf) -> AppResult<MonitorShot> {
+fn capture_single_monitor(monitor: &Monitor, save_path: &Path) -> AppResult<MonitorShot> {
     let monitor_id = monitor
         .id()
         .map_err(|e| format!("Failed to get monitor id: {}", e))?;

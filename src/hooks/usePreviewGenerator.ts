@@ -306,6 +306,23 @@ export function usePreviewGenerator({
       clearTimeout(debounceTimerRef.current);
     }
 
+    // The default editor state has no padding or rounded mask. In that common
+    // case the decoded source already IS the exact preview; re-drawing a Retina
+    // screenshot and PNG-encoding it again can cost seconds before the editor
+    // becomes interactive.
+    if (padding === 0 && settings.borderRadius === 0) {
+      renderIdRef.current += 1;
+      pendingSettingsRef.current = null;
+      if (previewUrlRef.current) {
+        URL.revokeObjectURL(previewUrlRef.current);
+        previewUrlRef.current = null;
+      }
+      setError(null);
+      setIsGenerating(false);
+      setPreviewUrl(screenshotImage.src);
+      return;
+    }
+
     // Store pending settings
     pendingSettingsRef.current = settings;
 

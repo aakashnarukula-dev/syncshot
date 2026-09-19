@@ -148,16 +148,12 @@ describe("deleteScreenshotByPath", () => {
 });
 
 describe("deleteScreenshotDoc", () => {
-  it("deletes the doc, its blobs, and the local cache copy", async () => {
-    invokeMock.mockImplementation((cmd: string) =>
-      cmd === "get_desktop_directory" ? Promise.resolve("/cache") : Promise.resolve(undefined),
-    );
-
+  it("deletes the cloud doc and blobs without touching local storage", async () => {
     await deleteScreenshotDoc(UID, makeDoc());
 
     expect(deleteDoc).toHaveBeenCalledTimes(1);
     expect(deleteObject).toHaveBeenCalled();
-    expect(invokeMock).toHaveBeenCalledWith("delete_file", { path: "/cache/d1.png" });
+    expect(invokeMock).not.toHaveBeenCalled();
   });
 });
 
@@ -290,7 +286,7 @@ describe("backfillScreenshots", () => {
     expect(getDocs).not.toHaveBeenCalled();
   });
 
-  it("consults the persisted ledger: a file hashed once is never re-read on a later run", async () => {
+  it("deletes a migrated legacy file after confirming its cloud duplicate", async () => {
     invokeMock.mockImplementation((cmd: string) =>
       cmd === "read_image_bytes"
         ? Promise.resolve(new ArrayBuffer(4))
@@ -299,16 +295,10 @@ describe("backfillScreenshots", () => {
     sha256Hex.mockResolvedValue("dupe-sha");
     getDocs.mockResolvedValue({ empty: false, docs: [{ id: "exists" }] });
 
-    // First run pays the read+hash+dupe-query for the file…
     await backfillScreenshots(UID, DEVICE, ["/cache/legacy_1.png"]);
     expect(getDocs).toHaveBeenCalledTimes(1);
-    const bytesReads = () =>
-      invokeMock.mock.calls.filter((c) => c[0] === "read_image_bytes").length;
-    expect(bytesReads()).toBe(1);
-
-    // …a second run (next launch) hits the ledger and never touches the file.
-    await backfillScreenshots(UID, DEVICE, ["/cache/legacy_1.png"]);
-    expect(getDocs).toHaveBeenCalledTimes(1);
-    expect(bytesReads()).toBe(1);
+    expect(invokeMock).toHaveBeenCalledWith("delete_file", {
+      path: "/cache/legacy_1.png",
+    });
   });
 });

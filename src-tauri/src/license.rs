@@ -33,13 +33,7 @@ pub async fn get_machine_id() -> Result<String, String> {
 
 fn keychain_set_blocking(key: &str, value: &str) -> Result<(), String> {
     let _ = Command::new("security")
-        .args([
-            "delete-generic-password",
-            "-s",
-            KEYCHAIN_SERVICE,
-            "-a",
-            key,
-        ])
+        .args(["delete-generic-password", "-s", KEYCHAIN_SERVICE, "-a", key])
         .output();
     let status = Command::new("security")
         .args([
@@ -99,13 +93,7 @@ pub async fn keychain_get(key: String) -> Result<Option<String>, String> {
 
 fn keychain_delete_blocking(key: &str) -> Result<(), String> {
     let _ = Command::new("security")
-        .args([
-            "delete-generic-password",
-            "-s",
-            KEYCHAIN_SERVICE,
-            "-a",
-            key,
-        ])
+        .args(["delete-generic-password", "-s", KEYCHAIN_SERVICE, "-a", key])
         .output();
     Ok(())
 }

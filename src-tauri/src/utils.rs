@@ -13,20 +13,14 @@ pub fn get_desktop_path() -> AppResult<String> {
     Ok(desktop.to_string_lossy().into_owned())
 }
 
-/// Get the SyncShot local screenshot directory. Created if missing.
-///
-/// Firebase Storage is the source of truth for synced screenshots; this is a
-/// hidden, app-private cache (NOT a user-visible Desktop folder) under
-/// ~/Library/Application Support so the pill column, the editor and
-/// clipboard-paste have fast local access to recently captured/synced bytes.
-/// Falls back to a temp-dir subfolder if the data dir can't be resolved.
-pub fn get_syncshot_dir() -> AppResult<String> {
+/// Legacy persistent screenshot directory. New builds never create or write
+/// it; the path is exposed only so the frontend can migrate old files to cloud.
+pub fn get_syncshot_dir_path() -> String {
     let base = dirs::data_dir().unwrap_or_else(std::env::temp_dir);
-    let dir = base
-        .join("com.aakashnarukula.syncshot")
-        .join("Screenshots");
-    ensure_dir(&dir)?;
-    Ok(dir.to_string_lossy().into_owned())
+    base.join("com.aakashnarukula.syncshot")
+        .join("Screenshots")
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// Get current timestamp in milliseconds
@@ -99,9 +93,8 @@ mod tests {
 
     #[test]
     fn test_syncshot_dir_is_hidden_cache_not_desktop() {
-        let dir = get_syncshot_dir().expect("syncshot dir");
-        // Source of truth is Firebase Storage; the local dir must be a hidden
-        // app cache, never the user-visible Desktop.
+        let dir = get_syncshot_dir_path();
+        // Migration target is app-private, never the user-visible Desktop.
         assert!(dir.ends_with("Screenshots"), "got: {dir}");
         assert!(!dir.contains("Desktop"), "must not live on Desktop: {dir}");
     }

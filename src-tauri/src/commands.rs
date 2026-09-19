@@ -1,19 +1,141 @@
 //! Tauri commands module
 
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use tauri::AppHandle;
 
-use crate::clipboard::copy_image_to_clipboard;
-use crate::image::{copy_screenshot_to_dir, crop_image, save_base64_image, save_base64_image_to_path, CropRegion};
-use std::fs;
+use crate::clipboard::{copy_image_bytes_to_clipboard, copy_image_to_clipboard};
+use crate::image::{
+    copy_screenshot_to_dir, crop_image, save_base64_image, save_base64_image_to_path, CropRegion,
+};
 use crate::screenshot::{
     capture_all_monitors as capture_monitors, capture_primary_monitor, MonitorShot,
 };
-use crate::utils::{generate_filename, get_desktop_path, get_syncshot_dir};
+use crate::utils::{generate_filename, get_desktop_path, get_syncshot_dir_path};
+use std::fs;
 
 static SCREENCAPTURE_LOCK: Mutex<()> = Mutex::new(());
+
+/// Newest-first index for the rail's cache directory. The rail polls for new
+/// captures, but most polls see an unchanged directory; re-statting thousands
+/// of old files on every one of those polls was needless blocking I/O.
+struct ScreenshotDirIndex {
+    modified: std::time::SystemTime,
+    files: Vec<IndexedScreenshotPath>,
+}
+
+#[derive(Clone)]
+struct IndexedScreenshotPath {
+    path: PathBuf,
+    modified: std::time::SystemTime,
+}
+
+// Keep a separate index per source. The rail can safely combine the private
+// SyncShot cache with a user's pre-existing Desktop library without rescanning
+// thousands of files every polling interval.
+static SCREENSHOT_DIR_INDEX: OnceLock<Mutex<HashMap<PathBuf, ScreenshotDirIndex>>> =
+    OnceLock::new();
+
+fn screenshot_index_cache() -> &'static Mutex<HashMap<PathBuf, ScreenshotDirIndex>> {
+    SCREENSHOT_DIR_INDEX.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn directory_modified(path: &std::path::Path) -> Result<std::time::SystemTime, String> {
+    fs::metadata(path)
+        .map_err(|e| format!("Failed to stat dir: {e}"))?
+        .modified()
+        .map_err(|e| format!("Failed to read dir modification time: {e}"))
+}
+
+fn is_screenshot_extension(ext: &str) -> bool {
+    matches!(
+        ext,
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "heic" | "heif"
+    )
+}
+
+fn scan_screenshot_paths(path: &std::path::Path) -> Result<Vec<IndexedScreenshotPath>, String> {
+    let entries = fs::read_dir(path).map_err(|e| format!("Failed to read dir: {e}"))?;
+    let mut files: Vec<IndexedScreenshotPath> = Vec::new();
+    for entry in entries.flatten() {
+        let p = entry.path();
+        let ext = p
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|s| s.to_lowercase())
+            .unwrap_or_default();
+        if !is_screenshot_extension(&ext) {
+            continue;
+        }
+        // One metadata() call answers both is_file and mtime (the old
+        // p.is_file() was a second redundant stat per entry).
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        files.push(IndexedScreenshotPath {
+            path: p,
+            modified: meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+        });
+    }
+    files.sort_by_key(|entry| std::cmp::Reverse(entry.modified));
+    Ok(files)
+}
+
+fn indexed_screenshot_paths(path: &std::path::Path) -> Result<Vec<IndexedScreenshotPath>, String> {
+    let modified = directory_modified(path)?;
+    if let Ok(cache) = screenshot_index_cache().lock() {
+        if let Some(index) = cache.get(path) {
+            if index.modified == modified {
+                return Ok(index.files.clone());
+            }
+        }
+    }
+
+    let files = scan_screenshot_paths(path)?;
+    // Read the timestamp after the scan so an add/delete during the scan makes
+    // the next poll rebuild rather than trusting a half-old index.
+    let indexed_modified = directory_modified(path)?;
+    if let Ok(mut cache) = screenshot_index_cache().lock() {
+        cache.insert(
+            path.to_path_buf(),
+            ScreenshotDirIndex {
+                modified: indexed_modified,
+                files: files.clone(),
+            },
+        );
+    }
+    Ok(files)
+}
+
+/// Merge a small set of metadata-only indexes. Image bytes remain lazy: the
+/// webview requests them only for the virtualized tiles in its viewport.
+fn indexed_screenshot_paths_from_dirs(dirs: Vec<String>) -> Result<Vec<PathBuf>, String> {
+    let mut seen = HashSet::new();
+    let mut files = Vec::new();
+    for dir in dirs {
+        let path = PathBuf::from(dir);
+        if !path.exists() || !seen.insert(path.clone()) {
+            continue;
+        }
+        files.extend(indexed_screenshot_paths(&path)?);
+    }
+    files.sort_by_key(|entry| std::cmp::Reverse(entry.modified));
+    Ok(files.into_iter().map(|entry| entry.path).collect())
+}
+
+/// Resolve local display sources without relying on frontend startup state.
+/// The active capture root and Desktop are both display sources; duplicate
+/// paths are removed by the merged index. Desktop files remain read-only in
+/// the frontend and are never used for capture backfill.
+fn screenshot_source_dirs(primary_dir: String) -> Result<Vec<String>, String> {
+    Ok(vec![primary_dir, get_desktop_path()?])
+}
 
 /// Quick capture of primary monitor
 #[tauri::command]
@@ -176,56 +298,275 @@ fn synced_filename_for(name: &str, bytes: &[u8]) -> Result<String, String> {
     }
 }
 
-/// Persist raw image bytes into the local screenshot cache (hidden app-data dir,
-/// NOT the Desktop). Returns the saved path. Used by `download_synced_image`
-/// (bytes fetched in Rust). (The old `save_synced_image` command — the same
-/// bytes shipped as a JSON number array over IPC — was unused by the frontend
-/// and has been removed.)
-///
-/// Deliberately does NOT touch the clipboard: the post-sign-in catch-up can
-/// download dozens of shots back-to-back, and the old unconditional
-/// copy-per-download slammed NSPasteboard once per file (clobbering whatever
-/// the user had copied, ignoring the auto-copy preference, and burning CPU on
-/// multi-MB pasteboard writes for a backlog). The webview's save-dir poll owns
-/// the copy now — it copies only a genuinely FRESH arrival, gated by the
-/// user's auto-copy setting.
-fn persist_synced_image(bytes: &[u8], name: &str) -> Result<String, String> {
-    let dir = get_syncshot_dir()?;
-    let filename = synced_filename_for(name, bytes)?;
-    let path = PathBuf::from(&dir).join(&filename);
-    fs::write(&path, bytes).map_err(|e| format!("Failed to save synced image: {}", e))?;
-    Ok(path.to_string_lossy().into_owned())
+fn numbered_filename(name: &str, index: usize) -> String {
+    if index == 0 {
+        return name.to_string();
+    }
+    let path = Path::new(name);
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("SyncShot");
+    match path.extension().and_then(|value| value.to_str()) {
+        Some(extension) if !extension.is_empty() => format!("{stem} ({index}).{extension}"),
+        _ => format!("{stem} ({index})"),
+    }
 }
 
-/// Download a synced screenshot's bytes over HTTP from a Firebase Storage
-/// download URL and persist it into the local cache (same destination as
-/// `save_synced_image`). Returns the saved path.
-///
-/// The receive path resolves a tokenized `getDownloadURL()` in the webview — a
-/// capability URL that bypasses Storage security rules AND CORS — then hands it
-/// here. Fetching the raw bytes in Rust sidesteps the webview's CORS sandbox:
-/// `getBytes()`/`getBlob()` issue a cross-origin XHR the bucket blocks without
-/// CORS config, but Rust HTTP is not subject to webview CORS, so cross-device
-/// receives (e.g. an Android upload landing on this Mac) work with ZERO
-/// bucket-CORS setup.
-#[tauri::command]
-pub async fn download_synced_image(url: String, name: String) -> Result<String, String> {
-    let resp = reqwest::get(&url)
+/// Write a downloaded image without replacing an existing user file. Using
+/// create_new closes the race between checking a filename and creating it.
+fn write_image_to_directory(
+    directory: &Path,
+    requested_name: &str,
+    bytes: &[u8],
+) -> Result<PathBuf, String> {
+    fs::create_dir_all(directory)
+        .map_err(|e| format!("Failed to create download directory: {e}"))?;
+    let safe_name = synced_filename_for(requested_name, bytes)?;
+    for index in 0..10_000 {
+        let path = directory.join(numbered_filename(&safe_name, index));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                if let Err(error) = file.write_all(bytes) {
+                    drop(file);
+                    let _ = fs::remove_file(&path);
+                    return Err(format!("Failed to write downloaded image: {error}"));
+                }
+                return Ok(path);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("Failed to create downloaded image: {error}")),
+        }
+    }
+    Err("Too many files with the same name in Downloads".to_string())
+}
+
+const MAX_SYNCED_IMAGE_BYTES: u64 = 64 * 1024 * 1024;
+// One Firestore page contains 16 screenshots. Buffer that page in RAM when it
+// fits, but keep a hard byte ceiling so a library of thousands of screenshots
+// can never exhaust the machine. Nothing in this cache is written to disk.
+const MAX_REMOTE_IMAGE_CACHE_BYTES: usize = 256 * 1024 * 1024;
+const MAX_REMOTE_IMAGE_CACHE_ENTRIES: usize = 16;
+
+/// Full-resolution cloud images are never persisted on Mac. Keep only a tiny
+/// process-memory LRU so opening and copying the same screenshot share the
+/// bytes instead of issuing two Firebase downloads. The cache disappears when
+/// SyncShot exits and versioned URLs ensure an edit never reuses stale bytes.
+#[derive(Default)]
+struct RemoteImageMemoryCache {
+    entries: VecDeque<(String, Vec<u8>)>,
+    bytes: usize,
+}
+
+static REMOTE_IMAGE_MEMORY_CACHE: OnceLock<Mutex<RemoteImageMemoryCache>> = OnceLock::new();
+
+fn remote_image_memory_cache() -> &'static Mutex<RemoteImageMemoryCache> {
+    REMOTE_IMAGE_MEMORY_CACHE.get_or_init(|| Mutex::new(RemoteImageMemoryCache::default()))
+}
+
+fn cached_remote_image(url: &str) -> Option<Vec<u8>> {
+    let mut cache = remote_image_memory_cache().lock().ok()?;
+    let index = cache.entries.iter().position(|(key, _)| key == url)?;
+    let entry = cache.entries.remove(index)?;
+    let bytes = entry.1.clone();
+    cache.entries.push_back(entry);
+    Some(bytes)
+}
+
+fn cache_remote_image(url: &str, bytes: &[u8]) {
+    if bytes.len() > MAX_REMOTE_IMAGE_CACHE_BYTES {
+        return;
+    }
+    let Ok(mut cache) = remote_image_memory_cache().lock() else {
+        return;
+    };
+    if let Some(index) = cache.entries.iter().position(|(key, _)| key == url) {
+        if let Some((_, old)) = cache.entries.remove(index) {
+            cache.bytes = cache.bytes.saturating_sub(old.len());
+        }
+    }
+    cache.entries.push_back((url.to_owned(), bytes.to_vec()));
+    cache.bytes += bytes.len();
+    while cache.entries.len() > MAX_REMOTE_IMAGE_CACHE_ENTRIES
+        || cache.bytes > MAX_REMOTE_IMAGE_CACHE_BYTES
+    {
+        if let Some((_, old)) = cache.entries.pop_front() {
+            cache.bytes = cache.bytes.saturating_sub(old.len());
+        } else {
+            break;
+        }
+    }
+}
+
+fn synced_image_http_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(reqwest::Client::new)
+}
+
+/// Remove cloud copies materialized for a native drag by a previous process.
+/// Current captures/editor exports use different names and are never touched.
+pub fn cleanup_temporary_cloud_materializations() {
+    let Ok(entries) = fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_ours = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("syncshot-cloud-"));
+        if is_ours && path.is_file() {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+fn validate_synced_image_url(url: &str) -> Result<(), String> {
+    let parsed = reqwest::Url::parse(url).map_err(|e| format!("Invalid image URL: {e}"))?;
+    let host = parsed.host_str().unwrap_or_default();
+    if parsed.scheme() != "https"
+        || !matches!(
+            host,
+            "firebasestorage.googleapis.com" | "storage.googleapis.com"
+        )
+    {
+        return Err("Only Firebase Storage HTTPS image URLs are allowed".to_string());
+    }
+    Ok(())
+}
+
+async fn fetch_synced_image_bytes(url: &str) -> Result<Vec<u8>, String> {
+    validate_synced_image_url(url)?;
+    if let Some(bytes) = cached_remote_image(url) {
+        return Ok(bytes);
+    }
+    let resp = synced_image_http_client()
+        .get(url)
+        .send()
         .await
-        .map_err(|e| format!("Failed to fetch synced image: {}", e))?;
+        .map_err(|e| format!("Failed to fetch synced image: {e}"))?;
     if !resp.status().is_success() {
         return Err(format!(
             "Failed to fetch synced image: HTTP {}",
             resp.status()
         ));
     }
+    if resp.content_length().unwrap_or(0) > MAX_SYNCED_IMAGE_BYTES {
+        return Err("Synced image exceeds the 64 MB safety limit".to_string());
+    }
     let bytes = resp
         .bytes()
         .await
-        .map_err(|e| format!("Failed to read synced image body: {}", e))?;
-    tauri::async_runtime::spawn_blocking(move || persist_synced_image(&bytes, &name))
+        .map_err(|e| format!("Failed to read synced image body: {e}"))?;
+    if bytes.len() as u64 > MAX_SYNCED_IMAGE_BYTES {
+        return Err("Synced image exceeds the 64 MB safety limit".to_string());
+    }
+    let bytes = bytes.to_vec();
+    cache_remote_image(url, &bytes);
+    Ok(bytes)
+}
+
+/// Warm full-resolution Firebase images into the bounded process-memory LRU.
+/// The frontend sends only the currently loaded Firestore page(s), never the
+/// user's entire library. Three concurrent downloads keep the network busy
+/// without starving visible thumbnails or creating a 3,000-request burst.
+#[tauri::command]
+pub async fn prefetch_remote_images(urls: Vec<String>) -> Result<Vec<String>, String> {
+    let mut seen = HashSet::new();
+    let urls: Vec<String> = urls
+        .into_iter()
+        .filter(|url| seen.insert(url.clone()))
+        .take(64)
+        .collect();
+    let mut warmed = Vec::new();
+
+    for chunk in urls.chunks(3) {
+        let tasks: Vec<_> = chunk
+            .iter()
+            .cloned()
+            .map(|url| {
+                tauri::async_runtime::spawn(async move {
+                    fetch_synced_image_bytes(&url).await.map(|_| url)
+                })
+            })
+            .collect();
+        for task in tasks {
+            if let Ok(Ok(url)) = task.await {
+                warmed.push(url);
+            }
+        }
+    }
+
+    Ok(warmed)
+}
+
+/// Drop all preloaded cloud bytes (sign-out/app teardown). The cache is RAM
+/// only, but clearing it at the account boundary prevents cross-user reuse.
+#[tauri::command]
+pub fn clear_remote_image_cache() {
+    if let Ok(mut cache) = remote_image_memory_cache().lock() {
+        cache.entries.clear();
+        cache.bytes = 0;
+    }
+}
+
+/// Copy a Firebase screenshot straight from memory to NSPasteboard. No cache
+/// file is created, so cross-device auto-copy stays cloud-only.
+#[tauri::command]
+pub async fn copy_remote_image_to_clipboard(url: String) -> Result<(), String> {
+    let bytes = fetch_synced_image_bytes(&url).await?;
+    tauri::async_runtime::spawn_blocking(move || copy_image_bytes_to_clipboard(&bytes))
         .await
-        .map_err(|e| format!("Persist task failed: {}", e))?
+        .map_err(|e| format!("Clipboard task failed: {e}"))?
+}
+
+/// Materialize a cloud image only for a native operation that requires a file
+/// path (currently OS drag). The caller deletes this short-lived temp file.
+#[tauri::command]
+pub async fn download_temporary_image(url: String, name: String) -> Result<String, String> {
+    let bytes = fetch_synced_image_bytes(&url).await?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let safe = synced_filename_for(&name, &bytes)?;
+        let unique = crate::utils::get_timestamp()?;
+        let path = std::env::temp_dir().join(format!("syncshot-cloud-{unique}-{safe}"));
+        fs::write(&path, bytes).map_err(|e| format!("Failed to write temp image: {e}"))?;
+        Ok(path.to_string_lossy().into_owned())
+    })
+    .await
+    .map_err(|e| format!("Temp image task failed: {e}"))?
+}
+
+/// Save a full-resolution screenshot to the user's Downloads directory. Cloud
+/// images reuse the bounded RAM cache warmed by the rail; local staging images
+/// are read directly. Exactly one source must be supplied.
+#[tauri::command]
+pub async fn save_image_to_downloads(
+    path: Option<String>,
+    url: Option<String>,
+    name: String,
+) -> Result<String, String> {
+    let bytes = match (path, url) {
+        (None, Some(url)) => fetch_synced_image_bytes(&url).await?,
+        (Some(path), None) => tauri::async_runtime::spawn_blocking(move || {
+            fs::read(&path).map_err(|e| format!("Failed to read {path}: {e}"))
+        })
+        .await
+        .map_err(|e| format!("Download read task failed: {e}"))??,
+        _ => return Err("Exactly one image source is required".to_string()),
+    };
+    let downloads =
+        dirs::download_dir().ok_or_else(|| "Downloads directory is unavailable".to_string())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        write_image_to_directory(&downloads, &name, &bytes)
+            .map(|saved| saved.to_string_lossy().into_owned())
+    })
+    .await
+    .map_err(|e| format!("Download write task failed: {e}"))?
 }
 
 #[cfg(test)]
@@ -278,13 +619,22 @@ mod tests {
         // Receive path always asks for `{docId}.png`; JPEG bytes must override
         // the extension so the saved file gets a Finder preview.
         let jpeg = [0xFF, 0xD8, 0xFF, 0xE0];
-        assert_eq!(synced_filename_for("doc123.png", &jpeg).unwrap(), "doc123.jpg");
+        assert_eq!(
+            synced_filename_for("doc123.png", &jpeg).unwrap(),
+            "doc123.jpg"
+        );
 
         let png = b"\x89PNG\r\n\x1a\n";
-        assert_eq!(synced_filename_for("doc123.png", png).unwrap(), "doc123.png");
+        assert_eq!(
+            synced_filename_for("doc123.png", png).unwrap(),
+            "doc123.png"
+        );
 
         let webp = b"RIFF\x24\x00\x00\x00WEBPVP8 ";
-        assert_eq!(synced_filename_for("doc123.png", webp).unwrap(), "doc123.webp");
+        assert_eq!(
+            synced_filename_for("doc123.png", webp).unwrap(),
+            "doc123.webp"
+        );
     }
 
     #[test]
@@ -294,6 +644,89 @@ mod tests {
             synced_filename_for("doc123.png", b"not an image").unwrap(),
             "doc123.png"
         );
+    }
+
+    #[test]
+    fn download_write_preserves_existing_file_and_real_type() {
+        let dir = std::env::temp_dir().join(format!(
+            "syncshot-download-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let png = b"\x89PNG\r\n\x1a\n";
+
+        let first = write_image_to_directory(&dir, "shot.jpg", png).unwrap();
+        let second = write_image_to_directory(&dir, "shot.jpg", png).unwrap();
+
+        assert_eq!(first.file_name().unwrap(), "shot.png");
+        assert_eq!(second.file_name().unwrap(), "shot (1).png");
+        assert_eq!(fs::read(first).unwrap(), png);
+        assert_eq!(fs::read(second).unwrap(), png);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn scan_screenshot_paths_orders_real_extensions_newest_first() {
+        let dir = std::env::temp_dir().join(format!(
+            "syncshot-list-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("older.jpg"), b"jpg").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(dir.join("newer.heic"), b"heic").unwrap();
+        fs::write(dir.join("ignore.txt"), b"text").unwrap();
+
+        let names: Vec<String> = scan_screenshot_paths(&dir)
+            .unwrap()
+            .into_iter()
+            .map(|entry| {
+                entry
+                    .path
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+
+        assert_eq!(names, vec!["newer.heic", "older.jpg"]);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn merged_sources_page_newest_files_before_older_ones() {
+        let root = std::env::temp_dir().join(format!(
+            "syncshot-multi-source-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let cache = root.join("cache");
+        let desktop = root.join("desktop");
+        fs::create_dir_all(&cache).unwrap();
+        fs::create_dir_all(&desktop).unwrap();
+        fs::write(cache.join("older.png"), b"png").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(desktop.join("newer.jpg"), b"jpg").unwrap();
+
+        let names: Vec<String> = indexed_screenshot_paths_from_dirs(vec![
+            cache.to_string_lossy().into_owned(),
+            desktop.to_string_lossy().into_owned(),
+        ])
+        .unwrap()
+        .into_iter()
+        .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+
+        assert_eq!(names, vec!["newer.jpg", "older.png"]);
+        fs::remove_dir_all(root).unwrap();
     }
 }
 
@@ -319,6 +752,7 @@ pub async fn copy_to_clipboard(path: String) -> Result<(), String> {
 #[tauri::command]
 pub async fn delete_file(path: String) -> Result<(), String> {
     if std::path::Path::new(&path).exists() {
+        crate::image::delete_thumbnail_cache_for_source(&path);
         fs::remove_file(&path).map_err(|e| format!("Failed to delete file: {}", e))?;
     }
     Ok(())
@@ -327,19 +761,26 @@ pub async fn delete_file(path: String) -> Result<(), String> {
 /// The editor is a pre-warmed SINGLETON window: built once (hidden at app
 /// startup, or on first open), then reused — open = show + deliver the new
 /// image path, close = the frontend hides instead of destroying. The label
-/// must keep the "editor-" prefix: the main window's auto-hide guard
-/// reconciles its open-editor counter against windows whose label starts
-/// with "editor-", and the capability files scope IPC to "editor-*".
+/// must keep the "editor-" prefix because capability files scope IPC to
+/// "editor-*".
 pub const EDITOR_WINDOW_LABEL: &str = "editor-main";
 
 /// Image path waiting for the editor webview. Events emitted while the
 /// webview is still booting are silently dropped, so opens park the path
 /// here and the editor pulls it on mount AND on every "editor-open" ping
 /// (take semantics — each request is consumed exactly once).
-static EDITOR_PENDING_PATH: Mutex<Option<String>> = Mutex::new(None);
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EditorPendingSource {
+    image_path: String,
+    image_url: Option<String>,
+    preview_url: Option<String>,
+}
+
+static EDITOR_PENDING_PATH: Mutex<Option<EditorPendingSource>> = Mutex::new(None);
 
 #[tauri::command]
-pub fn take_editor_pending_path() -> Option<String> {
+pub fn take_editor_pending_path() -> Option<EditorPendingSource> {
     EDITOR_PENDING_PATH.lock().ok().and_then(|mut g| g.take())
 }
 
@@ -370,32 +811,38 @@ pub fn build_editor_window(
     .map_err(|e| format!("Failed to open editor window: {}", e))
 }
 
-/// Open the editor for the given screenshot path. An empty `image_path`
-/// means "surface the editor in its loading state now, path follows" —
-/// the frontend calls it that way before resolving a possibly-remote file.
+/// Open the editor for the given screenshot path. The singleton remains hidden
+/// while its webview decodes the full image, sizes itself to the final aspect
+/// ratio, and renders the first canvas frame. The frontend reveals it only
+/// after that handshake, preventing black/blurred/wrong-size flashes.
 #[tauri::command]
 pub async fn open_editor_window(
     app: tauri::AppHandle,
     label: String,
     image_path: String,
+    image_url: Option<String>,
+    preview_url: Option<String>,
 ) -> Result<(), String> {
     use tauri::{Emitter, Manager};
     let _ = label; // singleton now; parameter kept for IPC compatibility
     if !image_path.is_empty() {
         if let Ok(mut pending) = EDITOR_PENDING_PATH.lock() {
-            *pending = Some(image_path);
+            *pending = Some(EditorPendingSource {
+                image_path,
+                image_url: image_url.filter(|url| !url.is_empty()),
+                preview_url: preview_url.filter(|url| !url.is_empty()),
+            });
         }
     }
     if let Some(win) = app.get_webview_window(EDITOR_WINDOW_LABEL) {
         let _ = win.unminimize();
-        let _ = win.show();
-        let _ = win.set_focus();
+        let _ = win.hide();
         // Ping only — the webview pulls the path via take_editor_pending_path,
         // which also covers pings that land while it is still booting.
         let _ = app.emit("editor-open", ());
         return Ok(());
     }
-    build_editor_window(&app, true)?;
+    build_editor_window(&app, false)?;
     Ok(())
 }
 
@@ -439,9 +886,7 @@ pub async fn save_edited_image(
 /// Header values are percent-encoded so non-ASCII paths survive HTTP header
 /// transport. `save_edited_image` (data-URL string) keeps working unchanged.
 #[tauri::command]
-pub async fn save_edited_image_bytes(
-    request: tauri::ipc::Request<'_>,
-) -> Result<String, String> {
+pub async fn save_edited_image_bytes(request: tauri::ipc::Request<'_>) -> Result<String, String> {
     let bytes: Vec<u8> = match request.body() {
         tauri::ipc::InvokeBody::Raw(b) => b.clone(),
         _ => return Err("save_edited_image_bytes expects a raw byte body".to_string()),
@@ -481,13 +926,33 @@ pub async fn save_edited_image_bytes(
     .map_err(|e| format!("Save task failed: {}", e))?
 }
 
-/// Get the default screenshot directory: a hidden app-data cache (NOT the
-/// Desktop). Firebase Storage is the source of truth; this dir is the local
-/// cache that backs the pill column / editor / clipboard-paste. Created if
-/// missing. (Command name kept for IPC compatibility with the frontend.)
+/// Return the legacy app-data screenshot path without creating it. Command name
+/// is kept for migration/settings IPC compatibility.
 #[tauri::command]
 pub async fn get_desktop_directory() -> Result<String, String> {
-    get_syncshot_dir()
+    Ok(get_syncshot_dir_path())
+}
+
+/// Remove the legacy screenshot directory after its images have migrated.
+/// Refuses to remove a non-empty directory (apart from Finder's `.DS_Store`),
+/// so an upload failure can never erase the only remaining copy.
+#[tauri::command]
+pub async fn remove_legacy_screenshot_directory() -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let dir = PathBuf::from(get_syncshot_dir_path());
+        if !dir.exists() {
+            return Ok(());
+        }
+        let finder_metadata = dir.join(".DS_Store");
+        if finder_metadata.is_file() {
+            fs::remove_file(&finder_metadata)
+                .map_err(|e| format!("Failed to remove legacy Finder metadata: {e}"))?;
+        }
+        fs::remove_dir(&dir)
+            .map_err(|e| format!("Legacy screenshot directory is not empty; preserving it: {e}"))
+    })
+    .await
+    .map_err(|e| format!("Legacy cache cleanup task failed: {e}"))?
 }
 
 /// Get the raw user Desktop path (no subfolder). Used to detect legacy save dirs.
@@ -496,48 +961,85 @@ pub async fn get_desktop_root() -> Result<String, String> {
     get_desktop_path()
 }
 
-/// List screenshot files in a directory, newest first.
+/// List a newest-first page of screenshot files in a directory.
+///
+/// The frontend requests a small initial page for the edge rail, then asks for
+/// older pages while the user scrolls. Keeping the IPC response bounded prevents
+/// a large local cache from being copied into the webview on every poll.
 #[tauri::command]
-pub async fn list_screenshots(dir: String) -> Result<Vec<String>, String> {
-    // A 565-file dir listing with a stat per entry — blocking I/O.
+pub async fn list_screenshots(
+    dir: String,
+    offset: Option<usize>,
+    limit: Option<usize>,
+) -> Result<Vec<String>, String> {
+    // Directory scans and metadata I/O remain off the async runtime. An
+    // unchanged directory takes the cached index path (one directory stat),
+    // while capture/download/delete invalidates it through directory mtime.
     tauri::async_runtime::spawn_blocking(move || {
         let path = std::path::Path::new(&dir);
         if !path.exists() {
             return Ok(Vec::new());
         }
-        let entries = fs::read_dir(path).map_err(|e| format!("Failed to read dir: {}", e))?;
-        let mut files: Vec<(std::path::PathBuf, std::time::SystemTime)> = Vec::new();
-        for entry in entries.flatten() {
-            let p = entry.path();
-            let ext = p
-                .extension()
-                .and_then(|e| e.to_str())
-                .map(|s| s.to_lowercase())
-                .unwrap_or_default();
-            if !matches!(
-                ext.as_str(),
-                "png" | "jpg" | "jpeg" | "gif" | "webp" | "heic"
-            ) {
-                continue;
-            }
-            // One metadata() call answers both is_file and mtime (the old
-            // p.is_file() was a second redundant stat per entry).
-            let Ok(meta) = entry.metadata() else {
-                continue;
-            };
-            if !meta.is_file() {
-                continue;
-            }
-            let mtime = meta
-                .modified()
-                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-            files.push((p, mtime));
-        }
-        files.sort_by(|a, b| b.1.cmp(&a.1));
+        let files = indexed_screenshot_paths(path)?;
+        let offset = offset.unwrap_or(0);
+        let limit = limit.unwrap_or(usize::MAX);
         Ok(files
             .into_iter()
-            .map(|(p, _)| p.to_string_lossy().into_owned())
+            .skip(offset)
+            .take(limit)
+            .map(|entry| entry.path.to_string_lossy().into_owned())
             .collect())
+    })
+    .await
+    .map_err(|e| format!("List task failed: {}", e))?
+}
+
+/// List a newest-first page across several screenshot directories. Existing
+/// Desktop screenshots remain available after SyncShot moves new captures to
+/// its private cache; this only reads directory metadata and never copies,
+/// uploads, or decodes an image.
+#[tauri::command]
+pub async fn list_screenshots_from_dirs(
+    dirs: Vec<String>,
+    offset: Option<usize>,
+    limit: Option<usize>,
+) -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let offset = offset.unwrap_or(0);
+        let limit = limit.unwrap_or(usize::MAX);
+        Ok::<Vec<String>, String>(
+            indexed_screenshot_paths_from_dirs(dirs)?
+                .into_iter()
+                .skip(offset)
+                .take(limit)
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect(),
+        )
+    })
+    .await
+    .map_err(|e| format!("List task failed: {}", e))?
+}
+
+/// List the local screenshot sources for the active SyncShot write directory.
+/// Source selection happens natively, so it is reliable before React settings
+/// and Firebase auth have hydrated.
+#[tauri::command]
+pub async fn list_screenshot_sources(
+    dir: String,
+    offset: Option<usize>,
+    limit: Option<usize>,
+) -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let offset = offset.unwrap_or(0);
+        let limit = limit.unwrap_or(usize::MAX);
+        Ok::<Vec<String>, String>(
+            indexed_screenshot_paths_from_dirs(screenshot_source_dirs(dir)?)?
+                .into_iter()
+                .skip(offset)
+                .take(limit)
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect(),
+        )
     })
     .await
     .map_err(|e| format!("List task failed: {}", e))?
@@ -585,11 +1087,9 @@ pub async fn get_screenshot_thumbnail(
 /// `get_screenshot_thumbnail` is unchanged.
 #[tauri::command]
 pub async fn get_screenshot_thumbnail_path(path: String, max_px: u32) -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        crate::image::screenshot_thumbnail(&path, max_px)
-    })
-    .await
-    .map_err(|e| format!("Thumbnail task failed: {}", e))?
+    tauri::async_runtime::spawn_blocking(move || crate::image::screenshot_thumbnail(&path, max_px))
+        .await
+        .map_err(|e| format!("Thumbnail task failed: {}", e))?
 }
 
 /// Return a LOCAL file's raw, FULL-RES bytes as `tauri::ipc::Response` (the
@@ -609,6 +1109,14 @@ pub async fn read_image_bytes(path: String) -> Result<tauri::ipc::Response, Stri
     })
     .await
     .map_err(|e| format!("Read task failed: {}", e))??;
+    Ok(tauri::ipc::Response::new(bytes))
+}
+
+/// Return Firebase image bytes directly to the editor webview. The response is
+/// raw IPC bytes, never a local screenshot file.
+#[tauri::command]
+pub async fn read_remote_image_bytes(url: String) -> Result<tauri::ipc::Response, String> {
+    let bytes = fetch_synced_image_bytes(&url).await?;
     Ok(tauri::ipc::Response::new(bytes))
 }
 
@@ -641,7 +1149,8 @@ pub struct FileStat {
 #[tauri::command]
 pub async fn stat_file(path: String) -> Result<FileStat, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let meta = std::fs::metadata(&path).map_err(|e| format!("Failed to stat {}: {}", path, e))?;
+        let meta =
+            std::fs::metadata(&path).map_err(|e| format!("Failed to stat {}: {}", path, e))?;
         let mtime_ms = meta
             .modified()
             .map_err(|e| format!("Failed to read mtime of {}: {}", path, e))?
@@ -825,9 +1334,9 @@ mod cg_cursor {
             displays: *mut CGDirectDisplayID,
             matching_display_count: *mut u32,
         ) -> i32; // CGError; 0 == success
-        // Bounds in the GLOBAL display coordinate space: top-left origin,
-        // relative to the upper-left corner of the MAIN display, in points.
-        // This is exactly the space `screencapture -R<x,y,w,h>` expects.
+                  // Bounds in the GLOBAL display coordinate space: top-left origin,
+                  // relative to the upper-left corner of the MAIN display, in points.
+                  // This is exactly the space `screencapture -R<x,y,w,h>` expects.
         fn CGDisplayBounds(display: CGDirectDisplayID) -> CGRect;
     }
 
@@ -866,6 +1375,59 @@ mod cg_cursor {
                 w,
                 h,
             ))
+        }
+    }
+
+    /// Returns AppKit's usable display rectangle (the NSScreen visibleFrame)
+    /// in the same global, top-left-origin POINT coordinate space as
+    /// `CGDisplayBounds`. Unlike Tauri 2.9's macOS `Monitor.workArea`, this
+    /// retains the vertical origin, so menu-bar and Dock insets stay distinct.
+    pub fn visible_display_rect_for_point(point: CGPoint) -> Option<(i64, i64, i64, i64)> {
+        use objc2_app_kit::NSScreen;
+        use objc2_modern::MainThreadMarker;
+
+        let mtm = MainThreadMarker::new()?;
+        let screens = NSScreen::screens(mtm);
+        let main = NSScreen::mainScreen(mtm)?;
+        let main_height = main.frame().size.height;
+
+        for screen in screens.iter() {
+            let frame = screen.frame();
+            let left = frame.origin.x;
+            let top = main_height - frame.origin.y - frame.size.height;
+            let right = left + frame.size.width;
+            let bottom = top + frame.size.height;
+            if point.x < left || point.x >= right || point.y < top || point.y >= bottom {
+                continue;
+            }
+
+            let visible = screen.visibleFrame();
+            let visible_top = main_height - visible.origin.y - visible.size.height;
+            let width = visible.size.width.round() as i64;
+            let height = visible.size.height.round() as i64;
+            if width <= 0 || height <= 0 {
+                return None;
+            }
+            return Some((
+                visible.origin.x.round() as i64,
+                visible_top.round() as i64,
+                width,
+                height,
+            ));
+        }
+        None
+    }
+
+    /// AppKit visibleFrame for the display currently under the cursor.
+    pub fn cursor_visible_display_rect() -> Option<(i64, i64, i64, i64)> {
+        unsafe {
+            let event = CGEventCreate(std::ptr::null_mut());
+            if event.is_null() {
+                return None;
+            }
+            let point = CGEventGetLocation(event);
+            CFRelease(event as *const c_void);
+            visible_display_rect_for_point(point)
         }
     }
 
@@ -1005,19 +1567,23 @@ pub async fn get_mouse_position() -> Result<(f64, f64), String> {
     }
 }
 
-/// Returns the (x, y, width, height) rect — in the GLOBAL, top-left-origin
-/// display coordinate space, in POINTS (logical) — of the display containing
-/// the given point, or the display under the cursor when no point is supplied.
+/// Returns the usable (x, y, width, height) rect — in the GLOBAL,
+/// top-left-origin display coordinate space, in POINTS (logical) — of the
+/// display containing the given point, or the display under the cursor when no
+/// point is supplied. On macOS this is NSScreen.visibleFrame: below the menu bar
+/// and above/alongside the Dock.
 /// This is the same coordinate space Tauri's `LogicalPosition`/`LogicalSize`
 /// use, so the frontend can place windows on the correct physical display
 /// regardless of mixed per-display scale factors.
 #[tauri::command]
-pub async fn cursor_display_bounds(x: Option<f64>, y: Option<f64>) -> Option<(i64, i64, i64, i64)> {
+pub fn cursor_display_bounds(x: Option<f64>, y: Option<f64>) -> Option<(i64, i64, i64, i64)> {
     #[cfg(target_os = "macos")]
     {
         match (x, y) {
-            (Some(px), Some(py)) => cg_cursor::display_rect_for_point(cg_cursor::point(px, py)),
-            _ => cg_cursor::cursor_display_rect(),
+            (Some(px), Some(py)) => {
+                cg_cursor::visible_display_rect_for_point(cg_cursor::point(px, py))
+            }
+            _ => cg_cursor::cursor_visible_display_rect(),
         }
     }
     #[cfg(not(target_os = "macos"))]

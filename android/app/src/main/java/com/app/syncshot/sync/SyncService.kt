@@ -3,6 +3,7 @@ package com.app.syncshot.sync
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.database.ContentObserver
 import android.net.Uri
@@ -11,6 +12,7 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.provider.MediaStore
+import androidx.core.content.ContextCompat
 import com.app.syncshot.data.FirebaseRepo
 import com.app.syncshot.data.Prefs
 import com.app.syncshot.data.ScreenshotPaging
@@ -20,8 +22,10 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
+import java.util.Collections
 
 /** One foreground service does both directions:
  *  - observes new phone screenshots -> enqueues UploadWorker (publish to Firebase)
@@ -31,6 +35,7 @@ class SyncService : Service() {
     private var observer: ContentObserver? = null
     private var lastSeenId: Long = 0
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val uploadsInFlight = Collections.synchronizedSet(mutableSetOf<Long>())
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -43,8 +48,7 @@ class SyncService : Service() {
         } else {
             startForeground(1, notif)
         }
-        lastSeenId = latestImageId()
-        registerObserver()
+        startScreenshotObserverIfPermitted()
         startMirror()
     }
 
@@ -54,10 +58,23 @@ class SyncService : Service() {
             Fcm.registerToken(this@SyncService)
             watchOwnRevocation()
             val dao = AppDb.get(this@SyncService).screenshots()
+            // A previous session may have paged the entire library into Room. Do
+            // not render that stale, unbounded cache on a fresh launch: start
+            // with the newest Firestore page and grow only when the user scrolls.
+            // Optimistic local captures stay intact (clearSynced excludes them).
+            dao.clearSynced()
+            ScreenshotPaging.reset()
             // All devices share one auth uid — our own docs are identified by
             // the per-install deviceId, not the uid.
             val prefs = Prefs(this@SyncService)
             val myDeviceId = prefs.deviceId
+            // A force-stop/relaunch must treat the first server snapshot as a
+            // baseline, even when an old persisted watermark is 0. Otherwise
+            // every screenshot created while the app was away is replayed as a
+            // "new" notification. This marker deliberately lives only for this
+            // service session; later snapshots are the live-notification stream.
+            var notificationBaselineReady = false
+            var notificationHighWater = Long.MIN_VALUE
             // The grid grows ScreenshotPaging.limit as the user scrolls; each new
             // value re-subscribes the listener at the larger page size (collectLatest
             // cancels the prior listener). The newest `limit` docs are always
@@ -83,43 +100,39 @@ class SyncService : Service() {
                             dao.pruneWithinWindow(docs.map { it.id }, docs.minOf { it.createdAt })
                         }
                     }
-                    // Notify only for GENUINELY-NEW shots from another device, never
-                    // the login backlog. On (re)login the listener's first snapshot
-                    // carries the ENTIRE existing history; firing a notification per
-                    // doc floods the shade. Gate on a persisted high-water-mark
-                    // (newest handled createdAt):
-                    //  - mark < 0  → not initialized yet. Seed it from the first
-                    //    AUTHORITATIVE (server, !fromCache) snapshot: the whole
-                    //    current set is pre-existing backlog, so set the mark to its
-                    //    newest createdAt (0 if the account is empty) and notify
-                    //    nothing. Cache emissions are ignored until then so a cached
-                    //    backlog can't slip through before the mark exists.
-                    //  - otherwise → notify only docs with createdAt > mark, then
-                    //    advance the mark past them. We key on createdAt + status
-                    //    "full" (NOT documentChanges ADDED): a shot is first ADDED as
-                    //    "thumb" and only later MODIFIED to "full", so an ADDED-only
-                    //    filter would fire before the full image is downloadable.
-                    //    Advancing the mark ONLY from shots we actually notified means
-                    //    a thumb seen ahead of its full (and clock-skewed peers) still
-                    //    notifies once the full arrives. Receiver's received/<sha>.png
-                    //    existence check is the final dedupe so MetadataChanges cache
-                    //    re-delivery can't re-notify the same shot.
-                    val mark = prefs.screenshotHighWater
-                    if (mark < 0L) {
+                    // Notify only genuinely-new shots from another device, never
+                    // a force-stop/relaunch backlog. The first authoritative
+                    // snapshot establishes this SERVICE SESSION'S high-water mark
+                    // and emits no notifications; cache snapshots never establish
+                    // it. Later snapshots handle only "full" docs above that mark.
+                    if (!notificationBaselineReady) {
                         if (!page.fromCache) {
-                            prefs.screenshotHighWater = docs.maxOfOrNull { it.createdAt } ?: 0L
+                            notificationHighWater = docs.maxOfOrNull { it.createdAt } ?: 0L
+                            // Retain this only as diagnostic/legacy state. The
+                            // in-memory baseline above is authoritative at the
+                            // next service start, so stale values cannot replay a
+                            // whole library after force-stop.
+                            prefs.screenshotHighWater = notificationHighWater
+                            notificationBaselineReady = true
                         }
                     } else {
-                        var newMark = mark
-                        docs.forEach { doc ->
-                            if (doc.deviceId != myDeviceId && doc.status == "full" &&
-                                doc.createdAt > mark
-                            ) {
-                                scope.launch { Receiver.receive(this@SyncService, doc) }
-                                newMark = maxOf(newMark, doc.createdAt)
+                        // Process oldest-first so a failed download blocks the
+                        // cursor before newer timestamps can skip past it. The
+                        // next authoritative snapshot retries it; existing local
+                        // files make successful retries a cheap no-op.
+                        val pending = docs
+                            .asSequence()
+                            .filter {
+                                it.deviceId != myDeviceId && it.status == "full" &&
+                                    it.createdAt > notificationHighWater
                             }
+                            .sortedBy { it.createdAt }
+                            .toList()
+                        for (doc in pending) {
+                            if (!Receiver.receive(this@SyncService, doc)) break
+                            notificationHighWater = doc.createdAt
+                            prefs.screenshotHighWater = notificationHighWater
                         }
-                        if (newMark > mark) prefs.screenshotHighWater = newMark
                     }
                 }
             }
@@ -154,6 +167,25 @@ class SyncService : Service() {
         observer = obs
     }
 
+    /** The user may decline photo access (remote syncing should still work), or
+     * grant it after this foreground service has started. Never query MediaStore
+     * without the runtime grant, and make a later start command attach exactly
+     * one observer. */
+    private fun startScreenshotObserverIfPermitted() {
+        if (observer != null || !hasImagePermission()) return
+        lastSeenId = latestImageId()
+        registerObserver()
+    }
+
+    private fun hasImagePermission(): Boolean {
+        val permission = if (Build.VERSION.SDK_INT >= 33) {
+            android.Manifest.permission.READ_MEDIA_IMAGES
+        } else {
+            android.Manifest.permission.READ_EXTERNAL_STORAGE
+        }
+        return ContextCompat.checkSelfPermission(this, permission) == PackageManager.PERMISSION_GRANTED
+    }
+
     private fun latestImageId(): Long {
         val proj = arrayOf(MediaStore.Images.Media._ID)
         contentResolver.query(
@@ -183,12 +215,47 @@ class SyncService : Service() {
                 val where = (c.getString(pathCol) ?: "") + (c.getString(bucketCol) ?: "")
                 if (!where.contains("Screenshot", ignoreCase = true)) continue
                 val uri = Uri.withAppendedPath(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id.toString())
-                UploadWorker.enqueue(this, uri)
+                uploadImmediately(id, uri)
             }
         }
     }
 
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
+    /**
+     * The service is already a foreground process, so handing a live capture to
+     * WorkManager adds scheduler latency for no benefit. Read and publish it now;
+     * WorkManager remains the durable offline/process-death fallback only.
+     *
+     * MediaStore may notify while the screenshot writer is still finalizing the
+     * row. A few short retries cover that race without delaying the normal path.
+     */
+    private fun uploadImmediately(id: Long, uri: Uri) {
+        if (!uploadsInFlight.add(id)) return
+        scope.launch {
+            try {
+                var bytes: ByteArray? = null
+                for (attempt in 0 until 4) {
+                    bytes = runCatching {
+                        contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                    }.getOrNull()?.takeIf { it.isNotEmpty() }
+                    if (bytes != null) break
+                    delay(75L * (attempt + 1))
+                }
+                val image = bytes ?: error("Screenshot is not readable yet")
+                FirebaseRepo.publishScreenshot(this@SyncService, image)
+            } catch (_: Exception) {
+                UploadWorker.enqueue(this@SyncService, uri)
+            } finally {
+                uploadsInFlight.remove(id)
+            }
+        }
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // Re-check on every explicit start so granting image access from the UI
+        // after the service was already alive enables local screenshot uploads.
+        startScreenshotObserverIfPermitted()
+        return START_STICKY
+    }
 
     override fun onDestroy() {
         observer?.let { contentResolver.unregisterContentObserver(it) }

@@ -35,7 +35,12 @@ vi.mock("firebase/firestore", () => ({
   Timestamp: class {},
 }));
 
-import { saveReceivedScreenshot } from "./screenshots";
+import {
+  downloadScreenshotToDownloads,
+  resolveScreenshotFullImageUrl,
+  resolveScreenshotThumbnailUrl,
+  saveReceivedScreenshot,
+} from "./screenshots";
 
 function makeDoc(overrides: Partial<ScreenshotDoc> = {}): ScreenshotDoc {
   return {
@@ -63,7 +68,7 @@ describe("saveReceivedScreenshot", () => {
 
   it("resolves a download URL and fetches the bytes via the Rust HTTP command (no getBytes/CORS)", async () => {
     getDownloadURL.mockResolvedValue("https://firebasestorage.googleapis.com/full.png?token=t");
-    invokeMock.mockResolvedValue("/cache/doc123.png");
+    invokeMock.mockResolvedValue("/tmp/syncshot-cloud-doc123.png");
 
     const saved = await saveReceivedScreenshot(makeDoc());
 
@@ -71,11 +76,11 @@ describe("saveReceivedScreenshot", () => {
     expect(getDownloadURL).toHaveBeenCalledWith({
       fullPath: "users/u1/screenshots/doc123/full.png",
     });
-    expect(invokeMock).toHaveBeenCalledWith("download_synced_image", {
+    expect(invokeMock).toHaveBeenCalledWith("download_temporary_image", {
       url: "https://firebasestorage.googleapis.com/full.png?token=t",
       name: "doc123.png",
     });
-    expect(saved).toBe("/cache/doc123.png");
+    expect(saved).toBe("/tmp/syncshot-cloud-doc123.png");
   });
 
   it("saves a phone JPEG under a .jpg name (real mime), not a hardcoded .png", async () => {
@@ -86,7 +91,7 @@ describe("saveReceivedScreenshot", () => {
       makeDoc({ mime: "image/jpeg", fullPath: "users/u1/screenshots/doc123/full.jpg" }),
     );
 
-    expect(invokeMock).toHaveBeenCalledWith("download_synced_image", {
+    expect(invokeMock).toHaveBeenCalledWith("download_temporary_image", {
       url: "https://firebasestorage.googleapis.com/full.jpg?token=t",
       name: "doc123.jpg",
     });
@@ -100,7 +105,7 @@ describe("saveReceivedScreenshot", () => {
       makeDoc({ mime: "", fullPath: "users/u1/screenshots/doc123/full.webp" }),
     );
 
-    expect(invokeMock).toHaveBeenCalledWith("download_synced_image", {
+    expect(invokeMock).toHaveBeenCalledWith("download_temporary_image", {
       url: "https://firebasestorage.googleapis.com/full.webp?token=t",
       name: "doc123.webp",
     });
@@ -112,5 +117,49 @@ describe("saveReceivedScreenshot", () => {
     ).rejects.toThrow("no full image");
     expect(getDownloadURL).not.toHaveBeenCalled();
     expect(invokeMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("downloadScreenshotToDownloads", () => {
+  it("saves a local full-resolution image through the native Downloads command", async () => {
+    invokeMock.mockReset();
+    invokeMock.mockResolvedValue("/Users/test/Downloads/shot.png");
+
+    await expect(downloadScreenshotToDownloads("/tmp/shot.png")).resolves.toBe(
+      "/Users/test/Downloads/shot.png",
+    );
+    expect(invokeMock).toHaveBeenCalledWith("save_image_to_downloads", {
+      path: "/tmp/shot.png",
+      url: null,
+      name: "shot.png",
+    });
+  });
+});
+
+describe("editor/preload URL identity", () => {
+  it("versions direct Firestore URLs so editor hits preloaded Rust RAM bytes", async () => {
+    const item = makeDoc({
+      sha256: "sha-edited",
+      thumbUrl: "https://firebasestorage.googleapis.com/thumb.webp?token=t",
+      fullUrl: "https://firebasestorage.googleapis.com/full.png?token=t",
+    });
+
+    await expect(resolveScreenshotThumbnailUrl(item)).resolves.toBe(
+      "https://firebasestorage.googleapis.com/thumb.webp?token=t&syncshotVersion=sha-edited",
+    );
+    await expect(resolveScreenshotFullImageUrl(item)).resolves.toBe(
+      "https://firebasestorage.googleapis.com/full.png?token=t&syncshotVersion=sha-edited",
+    );
+    expect(getDownloadURL).not.toHaveBeenCalled();
+  });
+
+  it("does not append duplicate content versions", async () => {
+    const item = makeDoc({
+      sha256: "sha-edited",
+      fullUrl:
+        "https://firebasestorage.googleapis.com/full.png?token=t&syncshotVersion=sha-edited",
+    });
+
+    await expect(resolveScreenshotFullImageUrl(item)).resolves.toBe(item.fullUrl);
   });
 });

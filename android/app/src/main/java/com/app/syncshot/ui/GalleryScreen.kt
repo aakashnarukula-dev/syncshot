@@ -90,6 +90,7 @@ import coil.request.ImageRequest
 import android.content.Context
 import android.content.Intent
 import com.app.syncshot.data.FirebaseRepo
+import com.app.syncshot.data.ImageFiles
 import com.app.syncshot.data.ScreenshotPaging
 import com.app.syncshot.data.db.AppDb
 import com.app.syncshot.data.db.ScreenshotEntity
@@ -102,17 +103,12 @@ import kotlinx.coroutines.withContext
 import java.io.File
 import kotlin.math.abs
 
-/** A real on-disk copy of this shot, if one exists — the received/<sha>.png that
+/** A real on-disk copy of this shot, if one exists — the received/<sha>.<ext> that
  *  the capturing device cached or another device's full download, or the viewer's
  *  shared cache. Lets a brand-new shot render instantly instead of waiting on a
  *  Storage round-trip (which leaves the tile a grey placeholder). */
-private fun localFile(ctx: Context, sha: String): File? {
-    val recv = File(File(ctx.filesDir, "received"), "$sha.png")
-    if (recv.exists() && recv.length() > 0L) return recv
-    val shared = File(File(ctx.cacheDir, "shared"), "$sha.png")
-    if (shared.exists() && shared.length() > 0L) return shared
-    return null
-}
+private fun localFile(ctx: Context, sha: String, mime: String): File? =
+    ImageFiles.findReceivedFile(ctx, sha, mime) ?: ImageFiles.findSharedFile(ctx, sha, mime)
 
 /** Best available source for a tile/viewer: local file first, then the Storage
  *  thumb, then the full. Returns null only while the upload still lags (no thumb,
@@ -258,11 +254,11 @@ private fun GalleryTile(ctx: Context, item: ScreenshotEntity, onClick: () -> Uni
     // or a just-captured one mid-write), keep checking briefly so the tile switches
     // to the local image rather than staying stuck on a slow/missing network thumb.
     val local by produceState<File?>(
-        localFile(ctx, item.sha256), item.id, item.thumbPath, item.fullPath,
+        localFile(ctx, item.sha256, item.mime), item.id, item.mime, item.thumbPath, item.fullPath,
     ) {
         if (value == null) repeat(12) {
             delay(500)
-            localFile(ctx, item.sha256)?.let { value = it; return@produceState }
+            localFile(ctx, item.sha256, item.mime)?.let { value = it; return@produceState }
         }
     }
     val model = remember(item.id, item.thumbPath, item.fullPath, local) {
@@ -356,7 +352,7 @@ private fun FullScreenViewer(
             val pan = panAnim.value
             val isCurrent = page == pagerState.currentPage
             val model = remember(item.id, item.thumbPath, item.fullPath) {
-                imageModel(ctx, item, localFile(ctx, item.sha256), preferFull = true)
+                imageModel(ctx, item, localFile(ctx, item.sha256, item.mime), preferFull = true)
             }
             AsyncImage(
                 model = model,
@@ -494,7 +490,7 @@ private fun FullScreenViewer(
                 val path = item.fullPath ?: return@BottomAction
                 scope.launch {
                     val f = withContext(Dispatchers.IO) {
-                        runCatching { ImageActions.ensureFile(ctx, item.sha256, path) }.getOrNull()
+                        runCatching { ImageActions.ensureFile(ctx, item.sha256, path, item.mime) }.getOrNull()
                     }
                     if (f != null) ImageActions.share(ctx, f)
                     else Toast.makeText(ctx, "Couldn't load image", Toast.LENGTH_SHORT).show()
@@ -506,7 +502,7 @@ private fun FullScreenViewer(
                 scope.launch {
                     val ok = withContext(Dispatchers.IO) {
                         runCatching {
-                            ImageActions.saveToGallery(ctx, ImageActions.ensureFile(ctx, item.sha256, path))
+                            ImageActions.saveToGallery(ctx, ImageActions.ensureFile(ctx, item.sha256, path, item.mime))
                         }.getOrDefault(false)
                     }
                     Toast.makeText(

@@ -62,17 +62,6 @@
             android:excludeFromRecents="true"
             android:theme="@android:style/Theme.Translucent.NoTitleBar" />
 
-        <!-- Invisible 1px "foreground moment" used to read the clipboard while the app is
-             backgrounded (Android 10+ denies background clipboard reads). Own task,
-             no history, excluded from recents so it leaves no trace. -->
-        <activity
-            android:name=".sync.ClipReadActivity"
-            android:exported="false"
-            android:excludeFromRecents="true"
-            android:noHistory="true"
-            android:taskAffinity=""
-            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
-
         <!-- Share target: shared URLs/text from another app's share sheet route
              here (ACTION_SEND text/plain) and get saved via writeClipboard. This
              is the reliable capture path for a "share URL" action, which never
@@ -101,19 +90,6 @@
             <intent-filter>
                 <action android:name="com.google.firebase.MESSAGING_EVENT" />
             </intent-filter>
-        </service>
-
-        <service
-            android:name=".sync.ClipboardCaptureService"
-            android:exported="false"
-            android:label="SyncShot Clipboard"
-            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
-            <intent-filter>
-                <action android:name="android.accessibilityservice.AccessibilityService" />
-            </intent-filter>
-            <meta-data
-                android:name="android.accessibilityservice"
-                android:resource="@xml/accessibility_service_config" />
         </service>
 
         <receiver

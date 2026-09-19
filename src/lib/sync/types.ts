@@ -38,7 +38,11 @@ export interface ScreenshotDoc {
    *  preview — never assume PNG. */
   mime: string;
   thumbPath: string;
+  /** Token URL stored at upload time. Avoids a Storage metadata RPC per tile. */
+  thumbUrl?: string | null;
   fullPath: string | null;
+  /** Token URL stored after full upload. Opens editor without URL lookup. */
+  fullUrl?: string | null;
   status: "thumb" | "full";
 }
 
@@ -68,7 +72,7 @@ export function screenshotsSignature(
 ): string {
   let sig = hasMore ? "1" : "0";
   for (const i of items) {
-    sig += `|${i.id}:${i.status}:${i.createdAt ?? ""}:${i.thumbPath}:${i.fullPath ?? ""}`;
+    sig += `|${i.id}:${i.sha256}:${i.status}:${i.createdAt ?? ""}:${i.thumbPath}:${i.thumbUrl ?? ""}:${i.fullPath ?? ""}:${i.fullUrl ?? ""}`;
   }
   return sig;
 }

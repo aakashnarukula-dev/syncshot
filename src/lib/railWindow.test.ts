@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { computeWindowRange, windowItemTop, windowTotalHeight } from "./railWindow";
+import { computePreloadRange, computeWindowRange, windowItemTop, windowTotalHeight } from "./railWindow";
 
 const ITEM = 155;
 const GAP = 20;
@@ -64,5 +64,15 @@ describe("windowItemTop", () => {
   it("positions items on the stride grid", () => {
     expect(windowItemTop(0, ITEM, GAP)).toBe(0);
     expect(windowItemTop(5, ITEM, GAP)).toBe(5 * STRIDE);
+  });
+});
+
+describe("computePreloadRange", () => {
+  it("keeps visible items plus three older screenshots warm", () => {
+    expect(computePreloadRange(10, 15, 100)).toEqual({ start: 10, end: 18 });
+  });
+
+  it("clamps the buffer at the end without revisiting older cached items", () => {
+    expect(computePreloadRange(97, 100, 100)).toEqual({ start: 97, end: 100 });
   });
 });

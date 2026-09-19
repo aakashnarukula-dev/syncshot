@@ -13,10 +13,26 @@
  */
 
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { registerScreenshotLoadMore, useSyncStore } from "@/stores/syncStore";
+import {
+  incomingScreenshotPreview,
+  incomingScreenshotSaved,
+  registerScreenshotLoadMore,
+  useSyncStore,
+} from "@/stores/syncStore";
 import { logout, watchAuth } from "./firebase";
 import { loadSyncPrefs, saveDeviceId, saveDeviceName, savePaused } from "./persistence";
-import { publishScreenshot, reconcileLocalCache, saveReceivedScreenshot, subscribeScreenshots } from "./screenshots";
+import { registerDevice, watchDeviceRevocation } from "./devices";
+import {
+  cloudScreenshotPath,
+} from "./order";
+import {
+  backfillScreenshotThumbUrls,
+  clearPreloadedScreenshotImages,
+  preloadScreenshotImages,
+  publishScreenshot,
+  storageDownloadUrl,
+  subscribeScreenshots,
+} from "./screenshots";
 import { subscribeClipboard, writeClipboardEntry } from "./clipboard";
 import {
   clipboardSignature,
@@ -32,12 +48,11 @@ let deviceId: string | null = null;
 
 let unsubScreenshots: (() => void) | null = null;
 let unsubClipboard: (() => void) | null = null;
+let unsubDeviceRevocation: (() => void) | null = null;
 let unsubAuth: (() => void) | null = null;
 let unlistenNewShot: UnlistenFn | null = null;
 let unlistenClipChanged: UnlistenFn | null = null;
 
-// Full images already pulled to disk — avoids re-saving on every snapshot.
-const savedFullIds = new Set<string>();
 // Signature of the last snapshot written to the store. Firestore fires plenty
 // of echo snapshots (cache replays, latency-compensation double-fires) whose
 // rendered content is identical; skipping the store write for those avoids a
@@ -49,33 +64,14 @@ let lastClipboardSig: string | null = null;
 // Newest clipboard hash seen (any device) — suppresses echo when we re-copy a
 // remote entry (set_clipboard_text would otherwise bounce back via the poller).
 let recentClipHash: string | null = null;
-
-/**
- * Debounced local-cache reconcile. One upload produces ≥3 authoritative
- * snapshots, and each reconcile costs get_desktop_directory + list_screenshots
- * + delete IPCs — so snapshots within the debounce window collapse into ONE
- * trailing reconcile, and a doc-id set identical to the last completed
- * reconcile is skipped outright.
- */
-const RECONCILE_DEBOUNCE_MS = 2000;
-let reconcileTimer: ReturnType<typeof setTimeout> | null = null;
-let lastReconcileSig: string | null = null;
-let pendingReconcile: { ids: Set<string>; sig: string } | null = null;
-
-function scheduleReconcile(ids: Set<string>): void {
-  const sig = [...ids].sort().join("|");
-  if (reconcileTimer === null && sig === lastReconcileSig) return;
-  pendingReconcile = { ids, sig };
-  if (reconcileTimer !== null) clearTimeout(reconcileTimer);
-  reconcileTimer = setTimeout(() => {
-    reconcileTimer = null;
-    const p = pendingReconcile;
-    pendingReconcile = null;
-    if (!p) return;
-    lastReconcileSig = p.sig;
-    void reconcileLocalCache(p.ids);
-  }, RECONCILE_DEBOUNCE_MS);
-}
+// First authoritative snapshot is the launch baseline, never a stream of fresh
+// arrivals. Later remote docs above this server-timestamp mark are genuinely new
+// and may reveal the pill. Keeping the ids lets the full-download completion fire
+// exactly one local-ready callback for the same shot.
+let incomingBaselineReady = false;
+let incomingHighWater = Number.NEGATIVE_INFINITY;
+const freshIncomingIds = new Set<string>();
+const knownIncomingIds = new Set<string>();
 
 function store() {
   return useSyncStore.getState();
@@ -86,32 +82,55 @@ function handleScreenshots(
   hasMore: boolean,
   fromCache: boolean,
 ): void {
+  const uid = store().uid;
+  if (uid) backfillScreenshotThumbUrls(uid, items);
+  preloadScreenshotImages(items);
   const sig = screenshotsSignature(items, hasMore);
   if (sig !== lastScreenshotsSig) {
     lastScreenshotsSig = sig;
     store().setScreenshots(items, hasMore);
   }
 
-  // FULL-SET RECONCILE. The store list is full-replaced above, so the Library
-  // grid already reflects the current set — but a received shot's local cache
-  // file ({id}.<ext>) would linger and the edge rail (which polls the cache dir)
-  // would keep showing it as a stale / "Unavailable" ghost. We diff the WHOLE
-  // server set against the cache directory and purge every received-shot file no
-  // longer present — catching a BULK delete and even shots cached in a prior
-  // session that never paged into this window (which the old session-only diff
-  // missed and left as ghosts).
-  //
-  // Gated twice so we never delete a still-present shot:
-  //   • !fromCache — only an AUTHORITATIVE server snapshot is trusted; a local-
-  //     cache snapshot can replay a stale/empty set.
-  //   • !hasMore   — the window holds the WHOLE collection (came back short of
-  //     the limit); while capped, a missing id may have merely scrolled past it.
-  if (!fromCache && !hasMore) {
-    const currentIds = new Set(items.map((i) => i.id));
-    for (const id of savedFullIds) {
-      if (!currentIds.has(id)) savedFullIds.delete(id);
+  if (!fromCache) {
+    if (!incomingBaselineReady) {
+      incomingHighWater = items.reduce(
+        (latest, item) => Math.max(latest, item.createdAt ?? Number.NEGATIVE_INFINITY),
+        Number.NEGATIVE_INFINITY,
+      );
+      for (const item of items) knownIncomingIds.add(item.id);
+      incomingBaselineReady = true;
+    } else {
+      const fresh = items.filter(
+        (item) =>
+          !knownIncomingIds.has(item.id) &&
+          item.device.deviceId !== deviceId &&
+          item.createdAt !== null &&
+          item.createdAt >= incomingHighWater,
+      );
+      for (const item of fresh) {
+        freshIncomingIds.add(item.id);
+        // The thumbnail is already uploaded before the doc is written, so the
+        // pill can paint it now instead of waiting for the multi-megabyte full
+        // upload + download and the old 2.5-second directory poll.
+        if (item.thumbPath) {
+          // Start URL resolution + browser image fetch before React mounts the
+          // tile. ThumbnailItem shares the same memoized URL request and browser
+          // cache, so its fallback normally paints during the reveal animation.
+          void storageDownloadUrl(item.thumbPath)
+            .then((url) => {
+              const preview = new Image();
+              preview.src = url;
+            })
+            .catch(() => {});
+          incomingScreenshotPreview(item, cloudScreenshotPath(item.id, item.sha256));
+        }
+      }
+      incomingHighWater = items.reduce(
+        (latest, item) => Math.max(latest, item.createdAt ?? Number.NEGATIVE_INFINITY),
+        incomingHighWater,
+      );
+      for (const item of items) knownIncomingIds.add(item.id);
     }
-    scheduleReconcile(currentIds);
   }
 
   for (const item of items) {
@@ -119,13 +138,12 @@ function handleScreenshots(
       item.status === "full" &&
       item.fullPath &&
       item.device.deviceId !== deviceId &&
-      !savedFullIds.has(item.id)
+      freshIncomingIds.delete(item.id)
     ) {
-      savedFullIds.add(item.id);
-      saveReceivedScreenshot(item).catch((err) => {
-        savedFullIds.delete(item.id); // allow a retry on the next snapshot
-        console.error("save received screenshot failed:", err);
-      });
+      // Cloud-only Mac: no full-image download on arrival. The rail already
+      // paints the tiny Firebase thumbnail; full bytes are fetched only when
+      // the user opens/copies/drags the shot.
+      incomingScreenshotSaved(item, cloudScreenshotPath(item.id, item.sha256));
     }
   }
 }
@@ -140,28 +158,43 @@ function handleClipboard(items: ClipboardDoc[]): void {
 }
 
 function stopListeners(): void {
+  clearPreloadedScreenshotImages();
+  unsubDeviceRevocation?.();
+  unsubDeviceRevocation = null;
   unsubScreenshots?.();
   unsubScreenshots = null;
   registerScreenshotLoadMore(null);
   unsubClipboard?.();
   unsubClipboard = null;
-  // Drop the re-download guard so a re-subscribe (e.g. account switch) re-pulls
-  // the new account's shots instead of skipping ids the previous account saw.
-  savedFullIds.clear();
   lastScreenshotsSig = null;
   lastClipboardSig = null;
-  // Cancel any pending reconcile and forget the last reconciled set — a stale
-  // keep-set must never fire after sign-out / into the next account's cache.
-  if (reconcileTimer !== null) {
-    clearTimeout(reconcileTimer);
-    reconcileTimer = null;
-  }
-  pendingReconcile = null;
-  lastReconcileSig = null;
+  incomingBaselineReady = false;
+  incomingHighWater = Number.NEGATIVE_INFINITY;
+  freshIncomingIds.clear();
+  knownIncomingIds.clear();
 }
 
 function startListeners(uid: string): void {
   stopListeners();
+  const currentDevice = device;
+  if (currentDevice) {
+    // Presence is best-effort: an offline Mac still gets its cached Library and
+    // queues regular Firestore writes. The next online auth session refreshes it.
+    void registerDevice(currentDevice).catch((err) =>
+      console.error("device registration failed:", err),
+    );
+    unsubDeviceRevocation = watchDeviceRevocation(
+      currentDevice,
+      () => {
+        // A listener can fire more than once (cache/server metadata updates).
+        // Auth's signed-out transition tears this subscription down; avoid
+        // starting duplicate sign-out requests before that happens.
+        if (!device) return;
+        void logout().catch((err) => console.error("remote device sign-out failed:", err));
+      },
+      (err) => console.error("device revocation listener error:", err),
+    );
+  }
   const screenshots = subscribeScreenshots(uid, handleScreenshots, (err) =>
     console.error("screenshots listener error:", err),
   );
@@ -186,6 +219,7 @@ export async function updateDeviceName(name: string): Promise<void> {
   store().setDeviceName(trimmed);
   if (device) device.name = trimmed;
   await saveDeviceName(trimmed);
+  if (device) await registerDevice(device);
 }
 
 /** Current device reference (uid/deviceId/name/platform), or null before sign-in. */

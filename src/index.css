@@ -243,6 +243,38 @@ html.bs-transparent body {
   animation: bs-pill-in 200ms cubic-bezier(0.22, 1, 0.36, 1) both;
 }
 
+/* Native Sidebar vibrancy supplies the blur; these translucent tints give the
+   edge surfaces enough contrast on both bright wallpapers and dark windows.
+   The large right-side radii plus overflow clipping remove the square webview
+   corners that previously showed around the pill. */
+.bs-glass-rail {
+  background:
+    linear-gradient(112deg, rgb(18 22 30 / 0.46), rgb(8 10 15 / 0.30));
+  -webkit-backdrop-filter: blur(28px) saturate(150%);
+  backdrop-filter: blur(28px) saturate(150%);
+  box-shadow:
+    inset -1px 0 rgb(255 255 255 / 0.08),
+    inset 0 1px rgb(255 255 255 / 0.09),
+    8px 0 30px rgb(0 0 0 / 0.28);
+}
+
+.bs-edge-pill {
+  border-radius: 0 24px 24px 0;
+  clip-path: inset(0 round 0 24px 24px 0);
+  background:
+    radial-gradient(circle at 78% 24%, rgb(255 255 255 / 0.15), transparent 34%),
+    linear-gradient(105deg, rgb(18 22 30 / 0.72), rgb(31 37 48 / 0.52));
+  box-shadow:
+    inset -1px 0 rgb(255 255 255 / 0.14),
+    inset 0 1px rgb(255 255 255 / 0.11);
+}
+
+.bs-edge-pill:hover {
+  background:
+    radial-gradient(circle at 78% 24%, rgb(255 255 255 / 0.22), transparent 36%),
+    linear-gradient(105deg, rgb(29 35 46 / 0.78), rgb(43 51 64 / 0.60));
+}
+
 /* Thumbnail loading skeleton — dark slot with a gradient sweep. The sweep is a
    translateX on a pseudo-element (GPU transform only) so it stays cheap while
    many items shimmer during a fast scroll. */

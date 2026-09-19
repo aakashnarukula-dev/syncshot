@@ -6,10 +6,8 @@
  *   -> upload thumb -> setDoc(status:'thumb') -> upload full.png
  *   -> updateDoc(status:'full', fullPath, bytes)
  *
- * Receive path: subscribe to the newest 100 screenshots; once status flips to
- * 'full' the engine resolves the full image's tokenized getDownloadURL and asks
- * Rust to HTTP-download the bytes (sidesteps webview CORS — see
- * saveReceivedScreenshot) and save them into the local cache.
+ * Receive path: subscribe to a small newest-first page. Tiles stream the tiny
+ * cloud thumbnail directly; full bytes are fetched only for explicit actions.
  */
 
 import { invoke } from "@tauri-apps/api/core";
@@ -31,12 +29,18 @@ import {
 } from "firebase/firestore";
 import { deleteObject, getDownloadURL, ref, uploadBytes } from "firebase/storage";
 import { renameCapturePath, useSyncStore } from "@/stores/syncStore";
-import { isSyncedCacheFile } from "./order";
+import {
+  cloudScreenshotId,
+  cloudScreenshotPath,
+  isCloudScreenshotPath,
+  isSyncedCacheFile,
+} from "./order";
 import { db, storage } from "./firebase";
 import { sha256Hex } from "./hash";
 import { makeThumb } from "./thumbs";
 import { createDownloadUrlCache } from "./downloadUrlCache";
-import { createBackfillLedger, type FileStat } from "./backfillLedger";
+import { cacheThumbBlob, requestRemoteThumbUrl } from "@/lib/thumbCache";
+import { RAIL_THUMB_BUFFER } from "@/lib/railWindow";
 import {
   SCREENSHOTS_PAGE_SIZE,
   type DeviceRef,
@@ -81,7 +85,9 @@ function mapDoc(id: string, data: DocumentData): ScreenshotDoc {
     // the save/paste/download path write `.png` over JPEG bytes → no preview.
     mime: typeof data.mime === "string" && data.mime ? data.mime : "image/png",
     thumbPath: data.thumbPath ?? "",
+    thumbUrl: data.thumbUrl ?? null,
     fullPath: data.fullPath ?? null,
+    fullUrl: data.fullUrl ?? null,
     status: data.status === "full" ? "full" : "thumb",
   };
 }
@@ -178,23 +184,6 @@ export function subscribeScreenshots(
 }
 
 /**
- * Try to stat a local file (mtime+size) for the backfill ledger. The Rust
- * `stat_file` command may not exist yet — an "unknown command" error disables
- * further probes for this session; any other error just means "no stat for
- * this file". The ledger degrades gracefully to path-only keying either way.
- */
-let statUnavailable = false;
-async function statLocalFile(path: string): Promise<FileStat | null> {
-  if (statUnavailable) return null;
-  try {
-    return await invoke<FileStat>("stat_file", { path });
-  } catch (err) {
-    if (/not found|not allowed|unknown/i.test(String(err))) statUnavailable = true;
-    return null;
-  }
-}
-
-/**
  * Adopt the doc-id filename for a locally-captured cache file: rename its
  * on-disk file IN PLACE from the capture name (`shot_{ts}.png`, no embedded id)
  * to `{docId}.png`, then swap the pill column's path reference to match.
@@ -215,18 +204,11 @@ async function statLocalFile(path: string): Promise<FileStat | null> {
  * still backs the cloud fallback). The bytes are NOT re-read — a rename reuses
  * the file already on disk.
  */
-async function adoptDocIdFilename(path: string, docId: string): Promise<string> {
-  let newPath = path;
-  try {
-    const renamed = await invoke<string>("rename_screenshot_to_doc_id", { path, docId });
-    newPath = typeof renamed === "string" && renamed ? renamed : path;
-  } catch (err) {
-    console.error("adopt doc-id cache filename failed:", path, err);
-    newPath = path;
-  }
-  if (newPath !== path) renameCapturePath(path, newPath);
-  useSyncStore.getState().mapLocalCapture(newPath, docId);
-  return newPath;
+async function adoptCloudIdentity(path: string, docId: string, version?: string): Promise<string> {
+  const cloudPath = cloudScreenshotPath(docId, version);
+  useSyncStore.getState().mapLocalCapture(path, docId);
+  renameCapturePath(path, cloudPath);
+  return cloudPath;
 }
 
 /** What a publish attempt resolved to — used by backfill to feed its ledger. */
@@ -240,40 +222,76 @@ interface PublishOutcome {
   finalPath: string;
 }
 
-async function publishScreenshotDetailed(
+const IMPORT_IMAGE_MIMES = new Set([
+  "image/png",
+  "image/jpeg",
+  "image/gif",
+  "image/webp",
+]);
+
+function normalizedImageMime(mime: string): string {
+  const normalized = mime.toLowerCase();
+  if (!IMPORT_IMAGE_MIMES.has(normalized)) {
+    throw new Error("Choose a PNG, JPEG, GIF, or WebP image");
+  }
+  return normalized;
+}
+
+function extensionForMime(mime: string): string {
+  if (mime === "image/jpeg") return "jpg";
+  return mime.slice("image/".length);
+}
+
+function readBlobArrayBuffer(blob: Blob): Promise<ArrayBuffer> {
+  if (typeof blob.arrayBuffer === "function") return blob.arrayBuffer();
+  return new Promise<ArrayBuffer>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result as ArrayBuffer);
+    reader.onerror = () => reject(reader.error ?? new Error("Could not read image"));
+    reader.readAsArrayBuffer(blob);
+  });
+}
+
+async function publishBlobDetailed(
   uid: string,
   device: DeviceRef,
   path: string,
+  buf: ArrayBuffer,
+  blob: Blob,
+  mime: string,
+  eagerThumb = true,
+  adoptAfterFull = false,
 ): Promise<PublishOutcome> {
-  const buf = await readLocalBytes(path);
-  const blob = new Blob([buf]);
-  const sha256 = await sha256Hex(buf);
+  const shaPromise = sha256Hex(buf);
+  const thumbPromise = eagerThumb ? makeThumb(blob) : null;
+  const sha256 = await shaPromise;
 
-  // Content-addressed dedup — skip if this exact image is already synced.
   const dupes = await getDocs(
     query(screenshotsCol(uid), where("sha256", "==", sha256), limit(1)),
   );
   if (!dupes.empty) {
-    // Already synced (e.g. backfill re-run): adopt the doc-id cache filename so
-    // this own capture resolves its cloud copy by filename, exactly like a
-    // received shot (and swap the column path to the renamed file).
-    const finalPath = await adoptDocIdFilename(path, dupes.docs[0].id);
-    return { published: false, docId: dupes.docs[0].id, sha256, finalPath };
+    const existing = dupes.docs[0];
+    const existingData = typeof existing.data === "function" ? existing.data() : {};
+    const version = (existingData.sha256 as string | undefined) ?? sha256;
+    const cloudPath = cloudScreenshotPath(existing.id, version);
+    const preview = thumbPromise ? await thumbPromise.catch(() => null) : null;
+    if (preview) cacheThumbBlob(cloudPath, preview.thumb);
+    const finalPath = await adoptCloudIdentity(path, existing.id, version);
+    return { published: false, docId: existing.id, sha256, finalPath };
   }
 
-  const { width, height, thumb } = await makeThumb(blob);
-
-  // Allocate the doc id up front so the Storage path can use it.
+  const { width, height, thumb } = await (thumbPromise ?? makeThumb(blob));
   const docRef = doc(screenshotsCol(uid));
   const id = docRef.id;
-  // Remember capture-path → doc id immediately so the tile/open-handler can
-  // reach the cloud copy during the upload window, before the on-disk file is
-  // renamed below (own captures are cached as `shot_{ts}.png` with no embedded
-  // id — see syncStore.localCaptureDocIds).
   useSyncStore.getState().mapLocalCapture(path, id);
 
   const thumbRef = ref(storage, `users/${uid}/screenshots/${id}/thumb.webp`);
   await uploadBytes(thumbRef, thumb, { contentType: "image/webp" });
+  const thumbUrlPromise = getDownloadURL(thumbRef);
+
+  const cloudPath = cloudScreenshotPath(id, sha256);
+  cacheThumbBlob(cloudPath, thumb);
+  let finalPath = cloudPath;
 
   await setDoc(docRef, {
     sha256,
@@ -282,31 +300,89 @@ async function publishScreenshotDetailed(
     width,
     height,
     bytes: blob.size,
-    mime: "image/png",
+    mime,
     thumbPath: thumbRef.fullPath,
+    thumbUrl: null,
     fullPath: null,
+    fullUrl: null,
     status: "thumb",
   });
 
-  const fullRef = ref(storage, `users/${uid}/screenshots/${id}/full.png`);
-  await uploadBytes(fullRef, blob, { contentType: "image/png" });
+  // Keep the optimistic staging identity until Firestore contains its cloud
+  // replacement. Renaming before setDoc let the rail synchronizer observe a
+  // cloud path absent from the snapshot and briefly remove it (or show both).
+  if (!adoptAfterFull) finalPath = await adoptCloudIdentity(path, id, sha256);
+
+  const ext = extensionForMime(mime);
+  const fullRef = ref(storage, `users/${uid}/screenshots/${id}/full.${ext}`);
+  const fullUpload = uploadBytes(fullRef, blob, { contentType: mime });
+  const thumbUrl = await thumbUrlPromise;
+  await updateDoc(docRef, { thumbUrl });
+  await fullUpload;
+  const fullUrl = await getDownloadURL(fullRef);
 
   await updateDoc(docRef, {
     status: "full",
     fullPath: fullRef.fullPath,
+    fullUrl,
     bytes: blob.size,
   });
 
-  // Adopt the doc-id cache filename (`shot_{ts}.png` → `{docId}.png`) so the
-  // pill column's local file carries the id: tap-open / copy-link / the render
-  // fallback all resolve the cloud doc straight from the filename. Done AFTER
-  // the doc is created (not at capture time): the renamed file matches
-  // RECEIVED_CACHE_ID and so becomes subject to reconcileLocalCache — renaming
-  // before the doc exists on the server could let a reconcile snapshot whose
-  // keep-set lacks this fresh id delete the just-captured file.
-  const finalPath = await adoptDocIdFilename(path, id);
-
+  if (adoptAfterFull) finalPath = await adoptCloudIdentity(path, id, sha256);
   return { published: true, docId: id, sha256, finalPath };
+}
+
+export interface PublishScreenshotResult {
+  published: boolean;
+  docId: string;
+  cloudPath: string;
+}
+
+async function publishScreenshotDetailed(
+  uid: string,
+  device: DeviceRef,
+  path: string,
+  eagerThumb = true,
+  adoptAfterFull = false,
+): Promise<PublishOutcome> {
+  const buf = await readLocalBytes(path);
+  return publishBlobDetailed(
+    uid,
+    device,
+    path,
+    buf,
+    new Blob([buf], { type: "image/png" }),
+    "image/png",
+    eagerThumb,
+    adoptAfterFull,
+  );
+}
+
+/** Upload a manually selected image straight from browser memory. The source
+ * file is never copied into SyncShot's Application Support directory. */
+export async function publishImportedImage(
+  uid: string,
+  device: DeviceRef,
+  stagingPath: string,
+  file: File,
+): Promise<PublishScreenshotResult> {
+  const mime = normalizedImageMime(file.type);
+  const buf = await readBlobArrayBuffer(file);
+  const outcome = await publishBlobDetailed(
+    uid,
+    device,
+    stagingPath,
+    buf,
+    file,
+    mime,
+    true,
+    true,
+  );
+  return {
+    published: outcome.published,
+    docId: outcome.docId,
+    cloudPath: outcome.finalPath,
+  };
 }
 
 /**
@@ -318,7 +394,28 @@ export async function publishScreenshot(
   device: DeviceRef,
   path: string,
 ): Promise<boolean> {
-  return (await publishScreenshotDetailed(uid, device, path)).published;
+  const outcome = await publishScreenshotDetailed(uid, device, path, true, true);
+  // Captures and editor exports are staging files only. Firebase is the
+  // screenshot library; remove the staging file after full upload/dedupe.
+  await invoke("delete_file", { path }).catch(() => {});
+  return outcome.published;
+}
+
+/** Publish an editor replacement and reveal which cloud document owns it.
+ * The doc id matters when the edited bytes dedupe to the original: callers
+ * must not delete that same document after the upload resolves. */
+export async function publishScreenshotReplacement(
+  uid: string,
+  device: DeviceRef,
+  path: string,
+): Promise<PublishScreenshotResult> {
+  const outcome = await publishScreenshotDetailed(uid, device, path, true, true);
+  await invoke("delete_file", { path }).catch(() => {});
+  return {
+    published: outcome.published,
+    docId: outcome.docId,
+    cloudPath: outcome.finalPath,
+  };
 }
 
 /**
@@ -336,6 +433,11 @@ export async function shareScreenshotLink(
   device: DeviceRef,
   path: string,
 ): Promise<string> {
+  const cloudDoc = findDocForCachePath(path);
+  if (cloudDoc?.fullPath) return cloudDoc.fullUrl ?? downloadUrls.get(cloudDoc.fullPath);
+  if (isCloudScreenshotPath(path)) {
+    throw new Error("Screenshot is still uploading");
+  }
   const buf = await readLocalBytes(path);
   const blob = new Blob([buf]);
   const sha256 = await sha256Hex(buf);
@@ -358,12 +460,14 @@ export async function shareScreenshotLink(
       `users/${uid}/screenshots/${existing.id}/full.png`,
     );
     await uploadBytes(fullRef, blob, { contentType: "image/png" });
+    const fullUrl = await getDownloadURL(fullRef);
     await updateDoc(existing.ref, {
       status: "full",
       fullPath: fullRef.fullPath,
+      fullUrl,
       bytes: blob.size,
     });
-    return downloadUrls.get(fullRef.fullPath);
+    return fullUrl;
   }
 
   // Not synced yet: full publish (mirrors publishScreenshot's thumb-first path).
@@ -375,6 +479,7 @@ export async function shareScreenshotLink(
 
   const thumbRef = ref(storage, `users/${uid}/screenshots/${id}/thumb.webp`);
   await uploadBytes(thumbRef, thumb, { contentType: "image/webp" });
+  const thumbUrlPromise = getDownloadURL(thumbRef);
 
   await setDoc(docRef, {
     sha256,
@@ -385,20 +490,27 @@ export async function shareScreenshotLink(
     bytes: blob.size,
     mime: "image/png",
     thumbPath: thumbRef.fullPath,
+    thumbUrl: null,
     fullPath: null,
+    fullUrl: null,
     status: "thumb",
   });
 
   const fullRef = ref(storage, `users/${uid}/screenshots/${id}/full.png`);
-  await uploadBytes(fullRef, blob, { contentType: "image/png" });
+  const fullUpload = uploadBytes(fullRef, blob, { contentType: "image/png" });
+  const thumbUrl = await thumbUrlPromise;
+  await updateDoc(docRef, { thumbUrl });
+  await fullUpload;
+  const fullUrl = await getDownloadURL(fullRef);
 
   await updateDoc(docRef, {
     status: "full",
     fullPath: fullRef.fullPath,
+    fullUrl,
     bytes: blob.size,
   });
 
-  return downloadUrls.get(fullRef.fullPath);
+  return fullUrl;
 }
 
 /** Image extensions the cache / save / paste path recognizes (lowercase, no
@@ -446,9 +558,8 @@ export function receivedCacheName(item: ScreenshotDoc): string {
 }
 
 /**
- * Persist a received full screenshot to disk via Rust (saves into the local
- * screenshot cache; the save-dir poll then copies a FRESH arrival to the
- * clipboard per the user's auto-copy setting). Returns the saved file path.
+ * Materialize a received full screenshot in the system temp directory for a
+ * short-lived native operation. No persistent SyncShot cache is written.
  *
  * The raw bytes are fetched in RUST, not the webview: we resolve the full
  * image's tokenized `getDownloadURL` (a capability that bypasses Storage rules
@@ -464,7 +575,7 @@ export async function saveReceivedScreenshot(
   if (!item.fullPath) throw new Error("Screenshot has no full image yet");
   const url = await downloadUrls.get(item.fullPath);
   try {
-    return await invoke<string>("download_synced_image", {
+    return await invoke<string>("download_temporary_image", {
       url,
       name: receivedCacheName(item),
     });
@@ -482,6 +593,38 @@ export async function saveReceivedScreenshot(
  * total (in-flight dedup included) instead of one per tile per mount.
  */
 const downloadUrls = createDownloadUrlCache((p) => getDownloadURL(ref(storage, p)));
+const pendingThumbUrlBackfills = new Set<string>();
+
+/** Upgrade older visible docs with direct thumbnail/full URLs. This only
+ * resolves Storage metadata; it does not download or persist image bytes.
+ * Later rail paints and editor opens skip Storage RPCs entirely. */
+export function backfillScreenshotThumbUrls(uid: string, items: ScreenshotDoc[]): void {
+  // Match the five-item viewport plus one warm item. Resolving the entire page
+  // at once would slow visible thumbnails through avoidable contention.
+  for (const item of items.slice(0, 6)) {
+    const needsThumb = !!item.thumbPath && !item.thumbUrl;
+    const needsFull = !!item.fullPath && !item.fullUrl;
+    if ((!needsThumb && !needsFull) || pendingThumbUrlBackfills.has(item.id)) continue;
+    pendingThumbUrlBackfills.add(item.id);
+    const thumb = needsThumb
+      ? storageDownloadUrl(item.thumbPath, item.sha256)
+      : Promise.resolve(item.thumbUrl ?? null);
+    const full = needsFull
+      ? storageDownloadUrl(item.fullPath!, item.sha256)
+      : Promise.resolve(item.fullUrl ?? null);
+    void Promise.all([thumb, full])
+      .then(([thumbUrl, fullUrl]) => {
+        const patch: { thumbUrl?: string; fullUrl?: string } = {};
+        if (needsThumb && thumbUrl) patch.thumbUrl = thumbUrl;
+        if (needsFull && fullUrl) patch.fullUrl = fullUrl;
+        return Object.keys(patch).length > 0
+          ? updateDoc(doc(screenshotsCol(uid), item.id), patch)
+          : undefined;
+      })
+      .catch(() => {})
+      .finally(() => pendingThumbUrlBackfills.delete(item.id));
+  }
+}
 
 /**
  * Resolve a tokenized download URL for a Storage object (thumb or full image).
@@ -492,8 +635,251 @@ const downloadUrls = createDownloadUrlCache((p) => getDownloadURL(ref(storage, p
  *
  * Cached (~1h TTL + in-flight dedup) — call freely per tile render.
  */
-export async function storageDownloadUrl(storagePath: string): Promise<string> {
-  return downloadUrls.get(storagePath);
+export async function storageDownloadUrl(
+  storagePath: string,
+  contentVersion?: string,
+): Promise<string> {
+  const url = await downloadUrls.get(storagePath);
+  if (!contentVersion) return url;
+  const separator = url.includes("?") ? "&" : "?";
+  return `${url}${separator}syncshotVersion=${encodeURIComponent(contentVersion)}`;
+}
+
+// Five screenshots fit in the rail. Keep three more tiny thumbnails hot below
+// the viewport, while full-resolution bytes are buffered only for the visible
+// five. This is deliberately independent from Firestore's metadata page size:
+// loading 16 lightweight docs is cheap; downloading 16 multi-megabyte images
+// before the user can see five is not.
+export const RAIL_VISIBLE_SCREENSHOTS = 5;
+export const RAIL_THUMB_BUFFER_SCREENSHOTS = RAIL_THUMB_BUFFER;
+const MAX_RECENT_FULL_IMAGES = 16;
+
+const prefetchedFullImages = new Map<string, true>();
+let pendingFullUrls: string[] = [];
+let fullPreloadRunning = false;
+let fullPreloadDrain: Promise<void> = Promise.resolve();
+let imagePreloadGeneration = 0;
+
+function rememberFullImage(url: string): void {
+  prefetchedFullImages.delete(url);
+  prefetchedFullImages.set(url, true);
+  while (prefetchedFullImages.size > MAX_RECENT_FULL_IMAGES) {
+    const oldest = prefetchedFullImages.keys().next().value as string | undefined;
+    if (!oldest) break;
+    prefetchedFullImages.delete(oldest);
+  }
+}
+
+function hasFullImage(url: string): boolean {
+  if (!prefetchedFullImages.has(url)) return false;
+  rememberFullImage(url);
+  return true;
+}
+
+function versionedDirectUrl(url: string, version: string): string {
+  if (!version || url.includes("syncshotVersion=")) return url;
+  return `${url}${url.includes("?") ? "&" : "?"}syncshotVersion=${encodeURIComponent(version)}`;
+}
+
+/** Resolve exact versioned thumbnail URL used by both rail preloader and
+ * editor. Sharing one resolver matters because Rust's RAM cache is URL-keyed:
+ * an unversioned editor URL would miss bytes already warmed under the
+ * versioned URL and download the same image again on click. */
+export async function resolveScreenshotThumbnailUrl(
+  item: ScreenshotDoc,
+): Promise<string | null> {
+  if (item.thumbPath) {
+    return item.thumbUrl
+      ? versionedDirectUrl(item.thumbUrl, item.sha256)
+      : storageDownloadUrl(item.thumbPath, item.sha256);
+  }
+  // Legacy documents predate cloud thumbnails. They remain lazy and bounded,
+  // but use the full object as a last-resort source until rewritten by an edit.
+  if (!item.fullPath) return null;
+  return item.fullUrl
+    ? versionedDirectUrl(item.fullUrl, item.sha256)
+    : storageDownloadUrl(item.fullPath, item.sha256);
+}
+
+/** Resolve exact versioned full-image URL shared by prefetch, open, and copy. */
+export async function resolveScreenshotFullImageUrl(
+  item: ScreenshotDoc,
+): Promise<string | null> {
+  if (item.status !== "full" || !item.fullPath) return null;
+  return item.fullUrl
+    ? versionedDirectUrl(item.fullUrl, item.sha256)
+    : storageDownloadUrl(item.fullPath, item.sha256);
+}
+
+async function primeCloudThumbnail(item: ScreenshotDoc): Promise<void> {
+  const url = await resolveScreenshotThumbnailUrl(item);
+  if (!url) return;
+  const request = requestRemoteThumbUrl(
+    cloudScreenshotPath(item.id, item.sha256),
+    url,
+  );
+  try {
+    await request.promise;
+  } finally {
+    request.release();
+  }
+}
+
+function scheduleFullImageBuffer(urls: string[], generation: number): void {
+  const next = urls.filter((url) => !hasFullImage(url));
+  if (next.length === 0 || generation !== imagePreloadGeneration) return;
+
+  // Coalesce rapid scroll events. One active viewport may finish; any queued
+  // intermediate viewports are replaced by the newest one instead of forming
+  // an unbounded download queue behind the user's scroll position.
+  pendingFullUrls = [...new Set(next)];
+  if (fullPreloadRunning) return;
+
+  fullPreloadRunning = true;
+  fullPreloadDrain = (async () => {
+    try {
+      while (pendingFullUrls.length > 0) {
+        const batch = pendingFullUrls;
+        pendingFullUrls = [];
+        if (generation !== imagePreloadGeneration) continue;
+        try {
+          const warmed = await invoke<string[]>("prefetch_remote_images", { urls: batch });
+          if (generation !== imagePreloadGeneration) continue;
+          for (const url of warmed) rememberFullImage(url);
+        } catch {
+          // A future viewport entry retries; failures are never marked warm.
+        }
+      }
+    } finally {
+      fullPreloadRunning = false;
+    }
+  })();
+}
+
+/**
+ * Prime one rail viewport, not the whole Firestore page. Visible thumbnails
+ * enter the shared five-wide request gate first; three following thumbnails
+ * form the scroll buffer. Only after the visible thumbnails settle do the five
+ * nearby full images enter Rust's bounded RAM cache for instant open/copy.
+ */
+export function preloadScreenshotImages(
+  items: ScreenshotDoc[],
+  visibleCount = RAIL_VISIBLE_SCREENSHOTS,
+): void {
+  const generation = imagePreloadGeneration;
+  const visible = items.slice(0, Math.max(0, visibleCount));
+  const buffer = items.slice(
+    visible.length,
+    visible.length + RAIL_THUMB_BUFFER_SCREENSHOTS,
+  );
+
+  // Calling in this order enqueues all visible items ahead of buffer work.
+  const visibleThumbs = visible.map((item) => primeCloudThumbnail(item));
+  for (const item of buffer) void primeCloudThumbnail(item).catch(() => {});
+
+  void Promise.allSettled(visibleThumbs).then(async () => {
+    if (generation !== imagePreloadGeneration) return;
+    const fullUrls = (await Promise.all(
+      visible.map((item) => resolveScreenshotFullImageUrl(item).catch(() => null)),
+    )).filter((url): url is string => !!url);
+    scheduleFullImageBuffer(fullUrls, generation);
+  });
+}
+
+/** Prime the live virtual window after scroll. Visible paths come first, then
+ * the overscan paths; local/import staging entries are ignored. */
+export function preloadScreenshotPaths(
+  visiblePaths: string[],
+  bufferedPaths: string[],
+): void {
+  const visible = visiblePaths
+    .map((path) => findDocForCachePath(path))
+    .filter((item): item is ScreenshotDoc => !!item);
+  const visibleIds = new Set(visible.map((item) => item.id));
+  const buffer = bufferedPaths
+    .map((path) => findDocForCachePath(path))
+    .filter((item): item is ScreenshotDoc => !!item && !visibleIds.has(item.id));
+  preloadScreenshotImages(
+    [...visible, ...buffer.slice(0, RAIL_THUMB_BUFFER_SCREENSHOTS)],
+    visible.length,
+  );
+}
+
+/** Clear all image buffers at an auth boundary. Serialized after outstanding
+ * prefetch work so an old-account request cannot repopulate the native cache
+ * after it was cleared. */
+export function clearPreloadedScreenshotImages(): void {
+  imagePreloadGeneration += 1;
+  pendingFullUrls = [];
+  prefetchedFullImages.clear();
+  fullPreloadDrain = fullPreloadDrain
+    .catch(() => {})
+    .then(async () => {
+      await invoke("clear_remote_image_cache").catch(() => {});
+    });
+}
+
+/** Copy full-resolution screenshot bytes to NSPasteboard without persisting a
+ * Mac cache file. Local staging captures still use the existing file command. */
+export async function copyScreenshotToClipboard(path: string): Promise<void> {
+  const item = findDocForCachePath(path);
+  if (item?.fullPath) {
+    const url = await resolveScreenshotFullImageUrl(item);
+    if (!url) throw new Error("Screenshot is still uploading");
+    await invoke("copy_remote_image_to_clipboard", { url });
+    return;
+  }
+  if (isCloudScreenshotPath(path)) {
+    throw new Error("Screenshot is still uploading");
+  }
+  try {
+    await invoke("copy_to_clipboard", { path });
+  } catch (localError) {
+    // A local capture/editor export is only staging. If its Firebase publisher
+    // removed it between tile click and native fs::read, retry from the cloud
+    // document that replaced it instead of making the copy action flaky.
+    const replacement = findDocForCachePath(path);
+    if (!replacement?.fullPath) throw localError;
+    const url = await resolveScreenshotFullImageUrl(replacement);
+    if (!url) throw localError;
+    await invoke("copy_remote_image_to_clipboard", { url });
+  }
+}
+
+/** Save the original full-resolution image to the user's Downloads directory.
+ * Cloud screenshots stay cloud-only until this explicit user action and reuse
+ * the native in-memory preload buffer instead of downloading through WebKit. */
+export async function downloadScreenshotToDownloads(path: string): Promise<string> {
+  const saveCloudItem = async (item: ScreenshotDoc): Promise<string> => {
+    const url = await resolveScreenshotFullImageUrl(item);
+    if (!url) throw new Error("Screenshot is still uploading");
+    return invoke<string>("save_image_to_downloads", {
+      path: null,
+      url,
+      name: `SyncShot-${receivedCacheName(item)}`,
+    });
+  };
+
+  const item = findDocForCachePath(path);
+  if (item?.fullPath) return saveCloudItem(item);
+  if (isCloudScreenshotPath(path)) {
+    throw new Error("Screenshot is still uploading");
+  }
+
+  const name = path.split(/[\\/]/).pop() || "SyncShot.png";
+  try {
+    return await invoke<string>("save_image_to_downloads", {
+      path,
+      url: null,
+      name,
+    });
+  } catch (localError) {
+    // Publisher may remove a staging file between click and native read. Retry
+    // from its replacement cloud document, matching copy/open race handling.
+    const replacement = findDocForCachePath(path);
+    if (!replacement?.fullPath) throw localError;
+    return saveCloudItem(replacement);
+  }
 }
 
 /** Drop a cached download URL (e.g. after a consumer's <img> load 404'd). */
@@ -510,6 +896,8 @@ export function invalidateStorageDownloadUrl(storagePath: string): void {
  * match any doc id — the caller falls back to a content hash.
  */
 export function cacheDocId(path: string): string | null {
+  const cloudId = cloudScreenshotId(path);
+  if (cloudId) return cloudId;
   const base = path.split(/[\\/]/).pop() ?? "";
   const dot = base.lastIndexOf(".");
   const id = dot > 0 ? base.slice(0, dot) : base;
@@ -551,6 +939,8 @@ export function findDocForCachePath(path: string): ScreenshotDoc | null {
  * was evicted) we re-download the cloud full image into the cache and open that.
  * Falls back to the original path when no cloud doc can be resolved.
  */
+const temporaryCloudFiles = new Map<string, Promise<string>>();
+
 export async function ensureLocalScreenshot(path: string): Promise<string> {
   try {
     // Cheap existence probe in Rust — NOT a CORS `asset://` fetch (which always
@@ -562,13 +952,40 @@ export async function ensureLocalScreenshot(path: string): Promise<string> {
   }
   const docMatch = findDocForCachePath(path);
   if (docMatch?.fullPath) {
+    let pending = temporaryCloudFiles.get(path);
+    if (!pending) {
+      pending = (async () => {
+        const url = await resolveScreenshotFullImageUrl(docMatch);
+        if (!url) throw new Error("Screenshot is still uploading");
+        const localPath = await invoke<string>("download_temporary_image", {
+          url,
+          name: receivedCacheName(docMatch),
+        });
+        useSyncStore.getState().mapLocalCapture(localPath, docMatch.id);
+        return localPath;
+      })().catch((error) => {
+        temporaryCloudFiles.delete(path);
+        throw error;
+      });
+      temporaryCloudFiles.set(path, pending);
+    }
     try {
-      return await saveReceivedScreenshot(docMatch);
+      return await pending;
     } catch {
-      /* download failed — fall through to the original path */
+      /* download failed — fall through to the cloud identity */
     }
   }
   return path;
+}
+
+/** Release a native-action materialization and allow a later drag to fetch a
+ * fresh file. Safe to call repeatedly for duplicate drag-end notifications. */
+export async function releaseTemporaryScreenshot(
+  cloudPath: string,
+  localPath: string,
+): Promise<void> {
+  temporaryCloudFiles.delete(cloudPath);
+  await invoke("delete_file", { path: localPath }).catch(() => {});
 }
 
 /**
@@ -580,11 +997,10 @@ export async function ensureLocalScreenshot(path: string): Promise<string> {
  * reach `users/{uid}/screenshots`, so a freshly-paired Mac shows up empty on
  * other devices. This walks the local cache and publishes each file.
  *
- * Dedup + idempotency come free: `publishScreenshot` content-addresses by
- * sha256 and no-ops (returns false) when the image is already synced, so
- * re-running this is safe and never double-uploads. Returns the count newly
- * published. A small concurrency pool keeps a large library from issuing
- * hundreds of simultaneous hashes/uploads.
+ * Dedup + idempotency come free: publishing content-addresses by sha256, so
+ * re-running this is safe and never double-uploads. Successfully migrated
+ * files are deleted; failures stay available for retry. Returns the count newly
+ * published. A small concurrency pool bounds simultaneous work.
  *
  * PERF: files already named `{docId}.<ext>` (received shots AND published own
  * captures — renamed on publish) PROVABLY have a cloud doc, so they're skipped
@@ -592,8 +1008,7 @@ export async function ensureLocalScreenshot(path: string): Promise<string> {
  * bytes over IPC and re-hashed + dupe-queried each file (multi-GB of reads for
  * a few-hundred-shot library) just to no-op — the single biggest source of
  * "everything is laggy right after the rail opens". Only genuinely unpublished
- * names (`shot_…` etc.) are still checked; each drops out of the set once its
- * publish renames it.
+ * names (`shot_…` etc.) are still checked, uploaded, and removed.
  */
 export async function backfillScreenshots(
   uid: string,
@@ -604,45 +1019,24 @@ export async function backfillScreenshots(
   const candidates = allPaths.filter((p) => !isSyncedCacheFile(p));
   if (candidates.length === 0) return 0;
 
-  // LEDGER: a file that keeps a non-doc-id name after publish (rename failed,
-  // legacy editor saves) used to re-pay the full byte read + sha256 + dupe
-  // query EVERY launch. The persisted ledger (path → docId, validated against
-  // mtime+size when a stat is available) makes each file hash at most once.
-  const ledger = createBackfillLedger(uid);
-  ledger.prune(candidates);
-  const paths: string[] = [];
-  for (const path of candidates) {
-    const stat = await statLocalFile(path);
-    if (ledger.get(path, stat)) continue; // already published, unchanged
-    paths.push(path);
-  }
-
   let published = 0;
   let next = 0;
   async function worker(): Promise<void> {
-    while (next < paths.length) {
-      const path = paths[next++];
+    while (next < candidates.length) {
+      const path = candidates[next++];
       try {
-        const outcome = await publishScreenshotDetailed(uid, device, path);
+        // Backfill is duplicate-heavy by definition; never speculatively decode
+        // thumbnails for files whose sha256 query will short-circuit.
+        const outcome = await publishScreenshotDetailed(uid, device, path, false);
         if (outcome.published) published++;
-        // Only files that KEEP a non-doc-id name need a ledger entry — a
-        // renamed `{docId}.<ext>` file is already skipped by isSyncedCacheFile.
-        if (!isSyncedCacheFile(outcome.finalPath)) {
-          const stat = await statLocalFile(outcome.finalPath);
-          ledger.put(outcome.finalPath, {
-            docId: outcome.docId,
-            sha256: outcome.sha256,
-            ...(stat ?? {}),
-          });
-        }
+        await invoke("delete_file", { path }).catch(() => {});
       } catch (err) {
         console.error("backfill publish failed:", path, err);
       }
     }
   }
-  const workers = Math.max(1, Math.min(concurrency, paths.length));
+  const workers = Math.max(1, Math.min(concurrency, candidates.length));
   await Promise.all(Array.from({ length: workers }, () => worker()));
-  ledger.flush();
   return published;
 }
 
@@ -662,6 +1056,9 @@ async function deleteDocAndBlobs(
   const blobPaths = new Set<string>([
     `users/${uid}/screenshots/${id}/thumb.webp`,
     `users/${uid}/screenshots/${id}/full.png`,
+    `users/${uid}/screenshots/${id}/full.jpg`,
+    `users/${uid}/screenshots/${id}/full.gif`,
+    `users/${uid}/screenshots/${id}/full.webp`,
   ]);
   if (thumbPath) blobPaths.add(thumbPath);
   if (fullPath) blobPaths.add(fullPath);
@@ -750,7 +1147,6 @@ export async function deleteScreenshotDoc(
   item: ScreenshotDoc,
 ): Promise<void> {
   await deleteDocAndBlobs(uid, item.id, item.thumbPath, item.fullPath);
-  await deleteLocalCacheById(item.id);
 }
 
 /**
@@ -768,6 +1164,14 @@ export async function deleteScreenshotByPath(
   uid: string,
   path: string,
 ): Promise<void> {
+  const direct = findDocForCachePath(path);
+  if (direct) {
+    await deleteDocAndBlobs(uid, direct.id, direct.thumbPath, direct.fullPath);
+    if (!isCloudScreenshotPath(path)) {
+      await invoke("delete_file", { path }).catch(() => {});
+    }
+    return;
+  }
   let matched: { id: string; thumbPath?: string | null; fullPath?: string | null }[] = [];
   try {
     const buf = await readLocalBytes(path);

@@ -32,9 +32,9 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
@@ -50,6 +50,7 @@ import com.app.syncshot.data.Prefs
 import com.app.syncshot.data.db.AppDb
 import com.app.syncshot.sync.SyncService
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -64,10 +65,11 @@ fun ProfileScreen(onSignedOut: () -> Unit, onBack: (() -> Unit)? = null) {
     val myDeviceId = remember { Prefs(ctx).deviceId }
     val phone = remember { FirebaseRepo.phoneNumber }
 
-    val devices by produceState(initialValue = emptyList<DeviceDoc>(), Unit) {
-        if (!FirebaseRepo.signedIn) return@produceState
-        FirebaseRepo.deviceSnapshots().collect { value = it }
+    val devicesFlow = remember {
+        if (FirebaseRepo.signedIn) FirebaseRepo.deviceSnapshots()
+        else flowOf(emptyList<DeviceDoc>())
     }
+    val devices by devicesFlow.collectAsState(initial = emptyList())
     val others = remember(devices) { devices.filter { it.id != myDeviceId } }
 
     var confirmSignOut by remember { mutableStateOf(false) }

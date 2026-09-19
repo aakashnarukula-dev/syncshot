@@ -9,27 +9,71 @@ struct ClipboardChanged {
     text: String,
 }
 
-/// Copy an image file to the system clipboard with BOTH:
-///   - image data tagged with the UTI SNIFFED from the bytes (pastes as image
-///     into Messages, Slack, Notes, etc. — a JPEG must NOT be tagged public.png
-///     or the receiver decodes mislabeled data / shows no preview)
-///   - file URL (pastes as a file copy into Finder)
+/// Copy an image file to the system clipboard as self-contained image data.
+///
+/// Do not advertise the staging path as `public.file-url`: captures and editor
+/// exports are deleted after their Firebase upload. Apps which preferred that
+/// representation could paste once while the file existed and then fail on the
+/// next paste. NSPasteboard owns the bytes written below, so repeated pastes
+/// remain valid after the staging file is removed.
 #[cfg(target_os = "macos")]
 pub fn copy_image_to_clipboard(image_path: &str) -> AppResult<()> {
+    let bytes = std::fs::read(image_path).map_err(|e| format!("read image: {}", e))?;
+    write_image_to_clipboard(&bytes)
+}
+
+/// Copy image bytes without creating a local file. Cloud screenshots use this
+/// path so Firebase remains the only persistent screenshot store on the Mac.
+#[cfg(target_os = "macos")]
+pub fn copy_image_bytes_to_clipboard(bytes: &[u8]) -> AppResult<()> {
+    write_image_to_clipboard(bytes)
+}
+
+#[cfg(target_os = "macos")]
+static IMAGE_CLIPBOARD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// PNG is the most consistently accepted in-memory image representation across
+/// AppKit, Chromium and Electron targets. Keep the real encoded representation
+/// too (important for JPEG/GIF/WebP/HEIC), and add PNG when the image crate can
+/// decode the source without touching disk.
+#[cfg(target_os = "macos")]
+fn png_clipboard_fallback(bytes: &[u8]) -> Option<Vec<u8>> {
+    if crate::image::detect_image_kind(bytes) == Some(crate::image::ImageKind::Png) {
+        return None;
+    }
+    let decoded = image::load_from_memory(bytes).ok()?;
+    let mut output = std::io::Cursor::new(Vec::new());
+    decoded
+        .write_to(&mut output, image::ImageOutputFormat::Png)
+        .ok()?;
+    Some(output.into_inner())
+}
+
+#[cfg(target_os = "macos")]
+fn write_image_to_clipboard(bytes: &[u8]) -> AppResult<()> {
     use objc2::msg_send;
     use objc2::runtime::AnyObject;
     use std::ffi::CString;
 
-    let bytes = std::fs::read(image_path).map_err(|e| format!("read image: {}", e))?;
-    // Tag the pasteboard data with the REAL image type, not a hardcoded png —
-    // defaults to public.png for anything we don't recognize (legacy behavior).
-    let image_uti = crate::image::detect_image_kind(&bytes)
-        .map(|k| k.pasteboard_uti())
-        .unwrap_or("public.png");
+    if bytes.is_empty() {
+        return Err("Cannot copy an empty image".to_string());
+    }
+
+    // Serialize clear+write as one operation. Auto-copy, editor save and a tile
+    // copy can otherwise interleave on worker threads and leave a partial set
+    // of pasteboard representations behind.
+    let _write_guard = IMAGE_CLIPBOARD_LOCK
+        .lock()
+        .map_err(|_| "Image clipboard lock was poisoned".to_string())?;
+
+    // Tag the original bytes with their real UTI. Unrecognized bytes are
+    // rejected instead of being mislabeled as PNG and reported as a success.
+    let image_kind = crate::image::detect_image_kind(bytes)
+        .ok_or_else(|| "Unsupported or invalid image data".to_string())?;
+    let image_uti = image_kind.pasteboard_uti();
+    let png_fallback = png_clipboard_fallback(bytes);
     let c_image_type = CString::new(image_uti).unwrap();
-    let c_file_url_type = CString::new("public.file-url").unwrap();
-    let file_url_str = format!("file://{}", urlencoding::encode(image_path).replace("%2F", "/"));
-    let c_file_url = CString::new(file_url_str).map_err(|e| format!("url cstring: {}", e))?;
+    let c_png_type = CString::new("public.png").unwrap();
 
     unsafe {
         let ns_pasteboard_cls = objc2::runtime::AnyClass::get("NSPasteboard")
@@ -44,34 +88,77 @@ pub fn copy_image_to_clipboard(image_path: &str) -> AppResult<()> {
             return Err("Failed to get general pasteboard".to_string());
         }
 
-        // NSData for the PNG bytes
+        // NSData copies the source buffer; the pasteboard is independent of the
+        // Rust Vec and of any temporary capture/editor file.
         let data: *mut AnyObject = msg_send![
             ns_data_cls,
             dataWithBytes: bytes.as_ptr() as *const std::ffi::c_void,
             length: bytes.len()
         ];
 
-        // NSString for the file-url string (file:// form)
-        let ns_file_url_string: *mut AnyObject =
-            msg_send![ns_string_cls, stringWithUTF8String: c_file_url.as_ptr()];
-
-        // Image (sniffed UTI) and file-url types
         let image_type: *mut AnyObject =
             msg_send![ns_string_cls, stringWithUTF8String: c_image_type.as_ptr()];
-        let file_url_type: *mut AnyObject =
-            msg_send![ns_string_cls, stringWithUTF8String: c_file_url_type.as_ptr()];
 
-        // Clear pasteboard, then write both types
+        // Clear once, then atomically (under our process lock) add every
+        // self-contained representation. Check Cocoa's BOOL results so the UI
+        // never displays a false "Copied" success.
         let _: i64 = msg_send![pasteboard, clearContents];
-        let _: bool = msg_send![pasteboard, setData: data, forType: image_type];
-        let _: bool = msg_send![pasteboard, setString: ns_file_url_string, forType: file_url_type];
+        let original_written: bool = msg_send![pasteboard, setData: data, forType: image_type];
+        if !original_written {
+            return Err(format!(
+                "Failed to write {image_uti} image data to clipboard"
+            ));
+        }
+
+        if let Some(png_bytes) = png_fallback.as_ref() {
+            let png_data: *mut AnyObject = msg_send![
+                ns_data_cls,
+                dataWithBytes: png_bytes.as_ptr() as *const std::ffi::c_void,
+                length: png_bytes.len()
+            ];
+            let png_type: *mut AnyObject =
+                msg_send![ns_string_cls, stringWithUTF8String: c_png_type.as_ptr()];
+            let png_written: bool = msg_send![pasteboard, setData: png_data, forType: png_type];
+            if !png_written {
+                return Err("Failed to write PNG clipboard fallback".to_string());
+            }
+        }
     }
 
     Ok(())
 }
 
+#[cfg(all(test, target_os = "macos"))]
+mod image_clipboard_tests {
+    use super::png_clipboard_fallback;
+
+    #[test]
+    fn png_needs_no_duplicate_fallback() {
+        let png = include_bytes!("../icons/32x32.png");
+        assert!(png_clipboard_fallback(png).is_none());
+    }
+
+    #[test]
+    fn jpeg_gets_a_valid_png_fallback() {
+        let image = image::DynamicImage::new_rgb8(2, 2);
+        let mut jpeg = std::io::Cursor::new(Vec::new());
+        image
+            .write_to(&mut jpeg, image::ImageOutputFormat::Jpeg(80))
+            .unwrap();
+
+        let png = png_clipboard_fallback(jpeg.get_ref()).expect("PNG fallback");
+        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+        assert_eq!(image::load_from_memory(&png).unwrap().width(), 2);
+    }
+}
+
 #[cfg(not(target_os = "macos"))]
 pub fn copy_image_to_clipboard(_image_path: &str) -> AppResult<()> {
+    Err("clipboard image copy is only implemented on macOS".to_string())
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn copy_image_bytes_to_clipboard(_bytes: &[u8]) -> AppResult<()> {
     Err("clipboard image copy is only implemented on macOS".to_string())
 }
 
@@ -177,10 +264,8 @@ pub fn set_clipboard_string(text: &str) -> AppResult<()> {
             return Err("Failed to get general pasteboard".to_string());
         }
 
-        let ns_text: *mut AnyObject =
-            msg_send![str_cls, stringWithUTF8String: c_text.as_ptr()];
-        let ns_type: *mut AnyObject =
-            msg_send![str_cls, stringWithUTF8String: c_type.as_ptr()];
+        let ns_text: *mut AnyObject = msg_send![str_cls, stringWithUTF8String: c_text.as_ptr()];
+        let ns_type: *mut AnyObject = msg_send![str_cls, stringWithUTF8String: c_type.as_ptr()];
 
         let _: i64 = msg_send![pb, clearContents];
         let ok: bool = msg_send![pb, setString: ns_text, forType: ns_type];
