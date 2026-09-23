@@ -11,8 +11,10 @@ export interface WindowRange {
   end: number;
 }
 
-/** Number of older screenshots kept warm beyond the visible rail viewport. */
-export const RAIL_THUMB_BUFFER = 3;
+/** Number of older screenshots kept warm beyond the visible rail viewport.
+ * Tiny 320px WebP thumbnails are cheap; one viewport plus a full scroll-ahead
+ * page prevents fast trackpad movement from outrunning network decode. */
+export const RAIL_THUMB_BUFFER = 12;
 
 /**
  * Forward-only preload range for a newest-first rail. Items below the viewport
@@ -56,4 +58,18 @@ export function windowTotalHeight(count: number, itemHeight: number, gap: number
 
 export function windowItemTop(index: number, itemHeight: number, gap: number): number {
   return index * (itemHeight + gap);
+}
+
+/** Start the next Firestore metadata page while the preloaded thumbnail buffer
+ * is still ahead of the viewport, not after the user reaches the final tile. */
+export function shouldLoadMore(
+  scrollTop: number,
+  viewportHeight: number,
+  totalHeight: number,
+  itemStride: number,
+  buffer = RAIL_THUMB_BUFFER,
+): boolean {
+  if (totalHeight <= 0 || itemStride <= 0) return false;
+  const remaining = totalHeight - (Math.max(0, scrollTop) + Math.max(0, viewportHeight));
+  return remaining <= itemStride * Math.max(0, buffer);
 }

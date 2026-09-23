@@ -600,9 +600,11 @@ const pendingThumbUrlBackfills = new Set<string>();
  * Later rail paints skip Storage RPCs entirely. Full-image URL resolution is
  * deliberately action-only so it never competes with visible thumbnails. */
 export function backfillScreenshotThumbUrls(uid: string, items: ScreenshotDoc[]): void {
-  // Match the five-item viewport plus one warm item. Resolving the entire page
-  // at once would slow visible thumbnails through avoidable contention.
-  for (const item of items.slice(0, 6)) {
+  // Every item here belongs to the bounded, lazy Firestore window (16 docs per
+  // page), never the whole library. Backfill every loaded legacy doc once so
+  // later scrolling can render its direct URL immediately instead of repeating
+  // a slow Storage metadata lookup for each remounted tile.
+  for (const item of items) {
     const needsThumb = !!item.thumbPath && !item.thumbUrl;
     if (!needsThumb || pendingThumbUrlBackfills.has(item.id)) continue;
     pendingThumbUrlBackfills.add(item.id);
@@ -632,10 +634,11 @@ export async function storageDownloadUrl(
   return `${url}${separator}syncshotVersion=${encodeURIComponent(contentVersion)}`;
 }
 
-// Five screenshots fit in the rail. Keep three more tiny thumbnails hot below
-// the viewport. Full-resolution bytes are action-only: eager full-image
-// prefetch consumed the same network as thumbnails and fresh mobile auto-copy,
-// producing minute-long stalls on slower links.
+// Five screenshots fit in the rail. Keep twelve more tiny thumbnails hot below
+// the viewport so a fast trackpad scroll never outruns the download queue.
+// Full-resolution bytes are action-only: eager full-image prefetch consumed the
+// same network as thumbnails and fresh mobile auto-copy, producing minute-long
+// stalls on slower links.
 export const RAIL_VISIBLE_SCREENSHOTS = 5;
 export const RAIL_THUMB_BUFFER_SCREENSHOTS = RAIL_THUMB_BUFFER;
 
@@ -690,7 +693,7 @@ async function primeCloudThumbnail(item: ScreenshotDoc): Promise<void> {
 
 /**
  * Prime one rail viewport, not the whole Firestore page. Visible thumbnails
- * enter the shared request gate first; three following thumbnails form the
+ * enter the shared request gate first; twelve following thumbnails form the
  * scroll buffer. Full images stay idle until open/copy/download.
  */
 export function preloadScreenshotImages(

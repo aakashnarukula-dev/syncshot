@@ -6,8 +6,8 @@ import { Check, ChevronLeft, ClipboardList, Copy, Download, Image as ImageIcon, 
 import { toast } from "sonner";
 import { useSyncStore } from "@/stores/syncStore";
 import { ensureDragIconPath, getCachedThumbUrl, requestRemoteThumbUrl, requestThumbUrl } from "@/lib/thumbCache";
-import { isCloudScreenshotPath, isImportScreenshotPath } from "@/lib/sync/order";
-import { computePreloadRange, computeWindowRange, windowItemTop, windowTotalHeight, type WindowRange } from "@/lib/railWindow";
+import { cloudScreenshotId, isCloudScreenshotPath, isImportScreenshotPath } from "@/lib/sync/order";
+import { computePreloadRange, computeWindowRange, RAIL_THUMB_BUFFER, shouldLoadMore, windowItemTop, windowTotalHeight, type WindowRange } from "@/lib/railWindow";
 import type { ColumnView } from "@/App";
 
 // Lazy: the clipboard list transitively pulls Firebase (~715KB) via
@@ -447,10 +447,33 @@ function VirtualThumbList({ paths, revealed, revealSignal = 0, onEdit, onRemove,
     }).catch(() => {});
   }, [layout.visibleEnd, layout.visibleStart, paths, revealed]);
 
+  // First page holds 16 docs while viewport shows about five. Request the next
+  // metadata page immediately because the twelve-item image buffer reaches
+  // beyond that first page. Later pages remain lazy and grow only as scrolling
+  // approaches the buffered boundary.
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!revealed || !el) return;
+    const stride = layout.itemHeight + LIST_GAP;
+    if (shouldLoadMore(el.scrollTop, el.clientHeight, el.scrollHeight, stride)) {
+      onLoadMore?.();
+    }
+  }, [layout.itemHeight, onLoadMore, paths.length, revealed]);
+
   const handleScroll = () => {
     onActivity?.();
     const el = scrollRef.current;
-    if (el && el.scrollTop + el.clientHeight >= el.scrollHeight - layout.itemHeight * 2) {
+    const stride = layout.itemHeight + LIST_GAP;
+    if (
+      el &&
+      shouldLoadMore(
+        el.scrollTop,
+        el.clientHeight,
+        el.scrollHeight,
+        stride,
+        RAIL_THUMB_BUFFER,
+      )
+    ) {
       onLoadMore?.();
     }
     if (rafRef.current) return;
@@ -567,10 +590,22 @@ function withTimeout<T>(p: Promise<T>, ms: number): Promise<T | null> {
 // (path string + App-level useCallback handlers).
 export const ThumbnailItem = memo(function ThumbnailItem({ path, onEdit, onRemove, readOnly }: ThumbnailItemProps) {
   const isUploading = isImportScreenshotPath(path);
+  const cloudId = cloudScreenshotId(path);
+  // New Mac/Android uploads persist a tokenized thumbnail URL in Firestore.
+  // Select only this primitive so unrelated realtime snapshots do not rerender
+  // the tile. Rendering it immediately removes Firebase metadata + native IPC
+  // from the visible path; native RAM preloading races in parallel as backup.
+  const directRemoteSrc = useSyncStore((state) => {
+    if (!cloudId) return "";
+    const item = state.screenshots.find((candidate) => candidate.id === cloudId);
+    const url = item?.thumbUrl ?? "";
+    if (!url || !item?.sha256 || url.includes("syncshotVersion=")) return url;
+    return `${url}${url.includes("?") ? "&" : "?"}syncshotVersion=${encodeURIComponent(item.sha256)}`;
+  });
   // Cache-first: a tile whose thumbnail blob URL is already in the module
   // cache commits it in its INITIAL state — remounting (scroll-back, or a
   // future column remount) paints with zero IPC, zero effects-first flash.
-  const [src, setSrc] = useState<string>(() => getCachedThumbUrl(path) ?? "");
+  const [src, setSrc] = useState<string>(() => getCachedThumbUrl(path) ?? directRemoteSrc);
   // URL availability is not pixel availability. Keep the shimmer visible until
   // WebKit actually decodes and paints the image (onLoad), including direct
   // Firebase URLs restored from Firestore.
@@ -585,6 +620,8 @@ export const ThumbnailItem = memo(function ThumbnailItem({ path, onEdit, onRemov
   const [isDownloading, setIsDownloading] = useState(false);
   const copiedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const exitingRef = useRef(false);
+  const readyRef = useRef(false);
+  const remoteFallbackRef = useRef<Promise<string | null> | null>(null);
 
   // Resolve a Firebase Storage token URL for this tile when its local cache
   // file is missing or won't decode — a synced (remote) shot whose Rust
@@ -636,18 +673,35 @@ export const ThumbnailItem = memo(function ThumbnailItem({ path, onEdit, onRemov
       let cancelled = false;
       let request: ReturnType<typeof requestRemoteThumbUrl> | null = null;
       void (async () => {
-        // Bound Firebase's metadata lookup too. Its SDK retries can otherwise
-        // keep a tile shimmering for a minute on a weak connection. A fresh
-        // Android doc may initially contain only thumbPath; retry briefly so a
-        // concurrently-written direct thumbUrl can take over from a stuck SDK
-        // metadata request without remounting the memoized tile.
-        let remote: string | null = null;
-        for (let attempt = 0; attempt < 3 && !cancelled && !remote; attempt += 1) {
-          remote = await withTimeout(resolveFallbackUrl(), REMOTE_TIMEOUT_MS);
-          if (!remote && attempt < 2) {
-            await new Promise((resolve) => setTimeout(resolve, 300 * (attempt + 1)));
+        // Direct Firestore URL paints now. Simultaneously warm native RAM; if
+        // WebKit's request fails or native wins the race, swap to ready blob
+        // bytes without waiting for another scroll/mount cycle.
+        if (directRemoteSrc) {
+          setSrc(directRemoteSrc);
+          setReady(false);
+          readyRef.current = false;
+          setFailed(false);
+          request = requestRemoteThumbUrl(path, directRemoteSrc);
+          remoteFallbackRef.current = request.promise;
+          try {
+            const url = await request.promise;
+            if (cancelled || !url) return;
+            remoteFallbackRef.current = null;
+            if (!readyRef.current) {
+              setSrc(url);
+              setReady(false);
+              setFailed(false);
+            }
+          } catch {
+            if (!cancelled) remoteFallbackRef.current = null;
           }
+          return;
         }
+        // Bound legacy Firebase metadata lookup once. Repeating the SDK call
+        // kept a tile shimmering for 15+ seconds and competed with visible
+        // thumbnails. The independent backfill writes `thumbUrl`; its realtime
+        // snapshot changes `directRemoteSrc` and retries this effect immediately.
+        const remote = await withTimeout(resolveFallbackUrl(), REMOTE_TIMEOUT_MS);
         if (cancelled) return;
         if (!remote) {
           setFailed(true);
@@ -674,6 +728,7 @@ export const ThumbnailItem = memo(function ThumbnailItem({ path, onEdit, onRemov
       })();
       return () => {
         cancelled = true;
+        remoteFallbackRef.current = null;
         request?.release();
       };
     }
@@ -730,7 +785,7 @@ export const ThumbnailItem = memo(function ThumbnailItem({ path, onEdit, onRemov
       request.release();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [path]);
+  }, [directRemoteSrc, path]);
 
   // Drag icon comes from the already-cached thumbnail BYTES (one temp-file
   // write, memoized per path) — not the old canvas draw + toDataURL + serial
@@ -910,6 +965,7 @@ export const ThumbnailItem = memo(function ThumbnailItem({ path, onEdit, onRemov
           }`}
           draggable={!isUploading}
           onLoad={() => {
+            readyRef.current = true;
             setReady(true);
             setFailed(false);
           }}
@@ -918,11 +974,27 @@ export const ThumbnailItem = memo(function ThumbnailItem({ path, onEdit, onRemov
             if (!isUploading) beginDrag();
           }}
           onError={() => {
-            // Every on-DOM src either came from our own thumbnail bytes or was
-            // probed-good off-DOM, so a failure here — e.g. cache eviction
-            // between commit and paint — is terminal: looping back through the
-            // cascade would risk a local↔remote ping-pong.
+            readyRef.current = false;
             setReady(false);
+            const cached = getCachedThumbUrl(path);
+            if (cached && cached !== src) {
+              setSrc(cached);
+              setFailed(false);
+              return;
+            }
+            const pending = remoteFallbackRef.current;
+            if (pending) {
+              setSrc("");
+              void pending.then((url) => {
+                if (url) {
+                  setSrc(url);
+                  setFailed(false);
+                } else {
+                  setFailed(true);
+                }
+              }, () => setFailed(true));
+              return;
+            }
             setFailed(true);
           }}
           onClick={() => {

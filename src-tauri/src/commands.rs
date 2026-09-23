@@ -1394,13 +1394,22 @@ mod cg_cursor {
 
         let mtm = MainThreadMarker::new()?;
         let screens = NSScreen::screens(mtm);
-        let main = NSScreen::mainScreen(mtm)?;
-        let main_height = main.frame().size.height;
+        // AppKit's global display space is bottom-left-origin, while
+        // CoreGraphics/Tauri window positions are top-left-origin. The Y-axis
+        // conversion must always use the PRIMARY display (frame origin 0,0) as
+        // its baseline. `NSScreen::mainScreen` is the screen containing the key
+        // window and changes as focus moves between monitors; using its height
+        // shifted the pill vertically whenever that monitor had a different
+        // height from the primary display.
+        let coordinate_base_height = screens.iter().find_map(|screen| {
+            let frame = screen.frame();
+            (frame.origin.x.abs() < 0.5 && frame.origin.y.abs() < 0.5).then_some(frame.size.height)
+        })?;
 
         for screen in screens.iter() {
             let frame = screen.frame();
             let left = frame.origin.x;
-            let top = main_height - frame.origin.y - frame.size.height;
+            let top = coordinate_base_height - frame.origin.y - frame.size.height;
             let right = left + frame.size.width;
             let bottom = top + frame.size.height;
             if point.x < left || point.x >= right || point.y < top || point.y >= bottom {
@@ -1408,7 +1417,7 @@ mod cg_cursor {
             }
 
             let visible = screen.visibleFrame();
-            let visible_top = main_height - visible.origin.y - visible.size.height;
+            let visible_top = coordinate_base_height - visible.origin.y - visible.size.height;
             let width = visible.size.width.round() as i64;
             let height = visible.size.height.round() as i64;
             if width <= 0 || height <= 0 {

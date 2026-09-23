@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { computePreloadRange, computeWindowRange, windowItemTop, windowTotalHeight } from "./railWindow";
+import {
+  computePreloadRange,
+  computeWindowRange,
+  shouldLoadMore,
+  windowItemTop,
+  windowTotalHeight,
+} from "./railWindow";
 
 const ITEM = 155;
 const GAP = 20;
@@ -68,11 +74,24 @@ describe("windowItemTop", () => {
 });
 
 describe("computePreloadRange", () => {
-  it("keeps visible items plus three older screenshots warm", () => {
-    expect(computePreloadRange(10, 15, 100)).toEqual({ start: 10, end: 18 });
+  it("keeps visible items plus twelve older screenshots warm", () => {
+    expect(computePreloadRange(10, 15, 100)).toEqual({ start: 10, end: 27 });
   });
 
   it("clamps the buffer at the end without revisiting older cached items", () => {
     expect(computePreloadRange(97, 100, 100)).toEqual({ start: 97, end: 100 });
+  });
+});
+
+describe("shouldLoadMore", () => {
+  it("requests metadata before the warm thumbnail buffer is exhausted", () => {
+    expect(shouldLoadMore(0, 5 * STRIDE, 16 * STRIDE, STRIDE)).toBe(true);
+    expect(shouldLoadMore(0, 5 * STRIDE, 32 * STRIDE, STRIDE)).toBe(false);
+    expect(shouldLoadMore(15 * STRIDE, 5 * STRIDE, 32 * STRIDE, STRIDE)).toBe(true);
+  });
+
+  it("rejects unmeasured lists", () => {
+    expect(shouldLoadMore(0, 500, 0, STRIDE)).toBe(false);
+    expect(shouldLoadMore(0, 500, 1000, 0)).toBe(false);
   });
 });
