@@ -172,9 +172,8 @@ fun GalleryScreen(onViewerOpenChange: (Boolean) -> Unit) {
     var selected by remember { mutableStateOf<ScreenshotEntity?>(null) }
     val gridState = rememberLazyGridState()
     var refreshing by remember { mutableStateOf(false) }
-    // Extra bottom space so the last row can scroll clear of the floating glass pill
-    // (pill height + spacing) and above the system gesture inset.
-    val pillClearance = 96.dp + WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()
+    // Extra bottom space so the last row can scroll clear of the gesture inset.
+    val bottomClearance = 16.dp + WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()
 
     // Keep the host (RootScreen) in sync so it can hide the bottom nav while the
     // image viewer is open.
@@ -212,7 +211,7 @@ fun GalleryScreen(onViewerOpenChange: (Boolean) -> Unit) {
                         columns = GridCells.Adaptive(110.dp),
                         modifier = Modifier.fillMaxSize(),
                         contentPadding = PaddingValues(
-                            start = 10.dp, top = 10.dp, end = 10.dp, bottom = 10.dp + pillClearance,
+                            start = 10.dp, top = 10.dp, end = 10.dp, bottom = 10.dp + bottomClearance,
                         ),
                     ) {
                         if (shots.itemCount == 0) {
@@ -222,7 +221,7 @@ fun GalleryScreen(onViewerOpenChange: (Boolean) -> Unit) {
                                     contentAlignment = Alignment.Center,
                                 ) {
                                     Text(
-                                        "No screenshots yet.\nTake one on any paired device.",
+                                        "No screenshots yet.\nTake one on this phone or your Mac.",
                                         textAlign = androidx.compose.ui.text.style.TextAlign.Center,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                                     )

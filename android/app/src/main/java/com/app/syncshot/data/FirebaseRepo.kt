@@ -223,6 +223,7 @@ object FirebaseRepo {
         thumbRef
             .putBytes(thumb.bytes, StorageMetadata.Builder().setContentType("image/webp").build())
             .await()
+        val thumbUrl = thumbRef.downloadUrl.await().toString()
         docRef.set(
             mapOf(
                 "sha256" to sha,
@@ -232,18 +233,17 @@ object FirebaseRepo {
                 "height" to thumb.height,
                 "mime" to type.mime,
                 "thumbPath" to thumbPath,
+                "thumbUrl" to thumbUrl,
                 "status" to "thumb",
             )
         ).await()
 
-        val thumbUrlTask = async { thumbRef.downloadUrl.await().toString() }
         val fullRef = storage.getReference(fullPath)
         val fullUpload = async {
             fullRef
             .putBytes(full, StorageMetadata.Builder().setContentType(type.mime).build())
             .await()
         }
-        docRef.update("thumbUrl", thumbUrlTask.await()).await()
         fullUpload.await()
         val fullUrl = fullRef.downloadUrl.await().toString()
         docRef.update(
