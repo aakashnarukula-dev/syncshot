@@ -180,6 +180,12 @@ function cacheRect(rect: DisplayRect, workArea: DisplayRect = rect) {
   cachedWorkArea = workArea;
 }
 
+function centeredPillY(workArea: DisplayRect): number {
+  return Math.round(
+    workArea.top + Math.max(0, (workArea.height - COLLAPSED_HEIGHT) / 2),
+  );
+}
+
 // Resolve the usable rect of the physical display under a point (or the cursor
 // when no point is given) via CoreGraphics hit-testing + NSScreen.visibleFrame.
 // winit's availableMonitors() reports positions in a single global PHYSICAL
@@ -303,7 +309,7 @@ async function showCollapsedThumbnail() {
     if (rect) {
       const x = rect.left;
       cacheRect(rect, rect);
-      const y = rect.top + Math.max(0, (rect.height - COLLAPSED_HEIGHT) / 2);
+      const y = centeredPillY(rect);
       await appWindow.setPosition(new LogicalPosition(x, y));
     }
   } catch {}
@@ -550,16 +556,30 @@ function MainApp() {
         if (!(await w.isVisible())) return; // hidden → nothing to move
         const rect = await cursorDisplayRect(); // cursor's current display
         if (!rect) return;
-        // Already on this display? (origins are integer CGDisplayBounds points.)
-        if (cachedMon && rect.left === cachedMon.left && rect.top === cachedMon.top) return;
-        // Don't yank the window out from under an active hover/interaction.
-        if (await cursorInsideWindow()) return;
         // `rect` is the true usable work area, so both states share its centre.
+        // Re-check geometry even on the same display. macOS can reposition a
+        // borderless window after Space/Dock changes; the old display-only
+        // early return permanently preserved that vertical drift.
         const x = rect.left;
         const workArea = rect;
         cacheRect(rect, workArea);
+        const [position, size, scaleFactor] = await Promise.all([
+          w.outerPosition(),
+          w.outerSize(),
+          w.scaleFactor(),
+        ]);
+        const currentX = position.x / scaleFactor;
+        const currentY = position.y / scaleFactor;
+        const currentWidth = size.width / scaleFactor;
+        const currentHeight = size.height / scaleFactor;
         if (isCollapsedRef.current) {
-          const y = workArea.top + Math.max(0, (workArea.height - COLLAPSED_HEIGHT) / 2);
+          const y = centeredPillY(workArea);
+          const alreadyPlaced =
+            Math.abs(currentX - x) < 1 &&
+            Math.abs(currentY - y) < 1 &&
+            Math.abs(currentWidth - COLLAPSED_WIDTH) < 1 &&
+            Math.abs(currentHeight - COLLAPSED_HEIGHT) < 1;
+          if (alreadyPlaced || await cursorInsideWindow()) return;
           await Promise.all([
             w.setSize(new LogicalSize(COLLAPSED_WIDTH, COLLAPSED_HEIGHT)),
             w.setPosition(new LogicalPosition(x, y)),
@@ -569,6 +589,12 @@ function MainApp() {
             columnViewRef.current,
             workArea,
           );
+          const alreadyPlaced =
+            Math.abs(currentX - x) < 1 &&
+            Math.abs(currentY - y) < 1 &&
+            Math.abs(currentWidth - THUMB_WIDTH) < 1 &&
+            Math.abs(currentHeight - height) < 1;
+          if (alreadyPlaced || await cursorInsideWindow()) return;
           await Promise.all([
             w.setSize(new LogicalSize(THUMB_WIDTH, height)),
             w.setPosition(new LogicalPosition(x, y)),

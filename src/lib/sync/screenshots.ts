@@ -595,32 +595,19 @@ export async function saveReceivedScreenshot(
 const downloadUrls = createDownloadUrlCache((p) => getDownloadURL(ref(storage, p)));
 const pendingThumbUrlBackfills = new Set<string>();
 
-/** Upgrade older visible docs with direct thumbnail/full URLs. This only
+/** Upgrade older visible docs with direct thumbnail URLs. This only
  * resolves Storage metadata; it does not download or persist image bytes.
- * Later rail paints and editor opens skip Storage RPCs entirely. */
+ * Later rail paints skip Storage RPCs entirely. Full-image URL resolution is
+ * deliberately action-only so it never competes with visible thumbnails. */
 export function backfillScreenshotThumbUrls(uid: string, items: ScreenshotDoc[]): void {
   // Match the five-item viewport plus one warm item. Resolving the entire page
   // at once would slow visible thumbnails through avoidable contention.
   for (const item of items.slice(0, 6)) {
     const needsThumb = !!item.thumbPath && !item.thumbUrl;
-    const needsFull = !!item.fullPath && !item.fullUrl;
-    if ((!needsThumb && !needsFull) || pendingThumbUrlBackfills.has(item.id)) continue;
+    if (!needsThumb || pendingThumbUrlBackfills.has(item.id)) continue;
     pendingThumbUrlBackfills.add(item.id);
-    const thumb = needsThumb
-      ? storageDownloadUrl(item.thumbPath, item.sha256)
-      : Promise.resolve(item.thumbUrl ?? null);
-    const full = needsFull
-      ? storageDownloadUrl(item.fullPath!, item.sha256)
-      : Promise.resolve(item.fullUrl ?? null);
-    void Promise.all([thumb, full])
-      .then(([thumbUrl, fullUrl]) => {
-        const patch: { thumbUrl?: string; fullUrl?: string } = {};
-        if (needsThumb && thumbUrl) patch.thumbUrl = thumbUrl;
-        if (needsFull && fullUrl) patch.fullUrl = fullUrl;
-        return Object.keys(patch).length > 0
-          ? updateDoc(doc(screenshotsCol(uid), item.id), patch)
-          : undefined;
-      })
+    void storageDownloadUrl(item.thumbPath, item.sha256)
+      .then((thumbUrl) => updateDoc(doc(screenshotsCol(uid), item.id), { thumbUrl }))
       .catch(() => {})
       .finally(() => pendingThumbUrlBackfills.delete(item.id));
   }
@@ -646,35 +633,11 @@ export async function storageDownloadUrl(
 }
 
 // Five screenshots fit in the rail. Keep three more tiny thumbnails hot below
-// the viewport, while full-resolution bytes are buffered only for the visible
-// five. This is deliberately independent from Firestore's metadata page size:
-// loading 16 lightweight docs is cheap; downloading 16 multi-megabyte images
-// before the user can see five is not.
+// the viewport. Full-resolution bytes are action-only: eager full-image
+// prefetch consumed the same network as thumbnails and fresh mobile auto-copy,
+// producing minute-long stalls on slower links.
 export const RAIL_VISIBLE_SCREENSHOTS = 5;
 export const RAIL_THUMB_BUFFER_SCREENSHOTS = RAIL_THUMB_BUFFER;
-const MAX_RECENT_FULL_IMAGES = 16;
-
-const prefetchedFullImages = new Map<string, true>();
-let pendingFullUrls: string[] = [];
-let fullPreloadRunning = false;
-let fullPreloadDrain: Promise<void> = Promise.resolve();
-let imagePreloadGeneration = 0;
-
-function rememberFullImage(url: string): void {
-  prefetchedFullImages.delete(url);
-  prefetchedFullImages.set(url, true);
-  while (prefetchedFullImages.size > MAX_RECENT_FULL_IMAGES) {
-    const oldest = prefetchedFullImages.keys().next().value as string | undefined;
-    if (!oldest) break;
-    prefetchedFullImages.delete(oldest);
-  }
-}
-
-function hasFullImage(url: string): boolean {
-  if (!prefetchedFullImages.has(url)) return false;
-  rememberFullImage(url);
-  return true;
-}
 
 function versionedDirectUrl(url: string, version: string): string {
   if (!version || url.includes("syncshotVersion=")) return url;
@@ -701,7 +664,7 @@ export async function resolveScreenshotThumbnailUrl(
     : storageDownloadUrl(item.fullPath, item.sha256);
 }
 
-/** Resolve exact versioned full-image URL shared by prefetch, open, and copy. */
+/** Resolve the exact versioned full-image URL shared by open/copy/download. */
 export async function resolveScreenshotFullImageUrl(
   item: ScreenshotDoc,
 ): Promise<string | null> {
@@ -725,48 +688,15 @@ async function primeCloudThumbnail(item: ScreenshotDoc): Promise<void> {
   }
 }
 
-function scheduleFullImageBuffer(urls: string[], generation: number): void {
-  const next = urls.filter((url) => !hasFullImage(url));
-  if (next.length === 0 || generation !== imagePreloadGeneration) return;
-
-  // Coalesce rapid scroll events. One active viewport may finish; any queued
-  // intermediate viewports are replaced by the newest one instead of forming
-  // an unbounded download queue behind the user's scroll position.
-  pendingFullUrls = [...new Set(next)];
-  if (fullPreloadRunning) return;
-
-  fullPreloadRunning = true;
-  fullPreloadDrain = (async () => {
-    try {
-      while (pendingFullUrls.length > 0) {
-        const batch = pendingFullUrls;
-        pendingFullUrls = [];
-        if (generation !== imagePreloadGeneration) continue;
-        try {
-          const warmed = await invoke<string[]>("prefetch_remote_images", { urls: batch });
-          if (generation !== imagePreloadGeneration) continue;
-          for (const url of warmed) rememberFullImage(url);
-        } catch {
-          // A future viewport entry retries; failures are never marked warm.
-        }
-      }
-    } finally {
-      fullPreloadRunning = false;
-    }
-  })();
-}
-
 /**
  * Prime one rail viewport, not the whole Firestore page. Visible thumbnails
- * enter the shared five-wide request gate first; three following thumbnails
- * form the scroll buffer. Only after the visible thumbnails settle do the five
- * nearby full images enter Rust's bounded RAM cache for instant open/copy.
+ * enter the shared request gate first; three following thumbnails form the
+ * scroll buffer. Full images stay idle until open/copy/download.
  */
 export function preloadScreenshotImages(
   items: ScreenshotDoc[],
   visibleCount = RAIL_VISIBLE_SCREENSHOTS,
 ): void {
-  const generation = imagePreloadGeneration;
   const visible = items.slice(0, Math.max(0, visibleCount));
   const buffer = items.slice(
     visible.length,
@@ -774,16 +704,8 @@ export function preloadScreenshotImages(
   );
 
   // Calling in this order enqueues all visible items ahead of buffer work.
-  const visibleThumbs = visible.map((item) => primeCloudThumbnail(item));
+  for (const item of visible) void primeCloudThumbnail(item).catch(() => {});
   for (const item of buffer) void primeCloudThumbnail(item).catch(() => {});
-
-  void Promise.allSettled(visibleThumbs).then(async () => {
-    if (generation !== imagePreloadGeneration) return;
-    const fullUrls = (await Promise.all(
-      visible.map((item) => resolveScreenshotFullImageUrl(item).catch(() => null)),
-    )).filter((url): url is string => !!url);
-    scheduleFullImageBuffer(fullUrls, generation);
-  });
 }
 
 /** Prime the live virtual window after scroll. Visible paths come first, then
@@ -805,18 +727,9 @@ export function preloadScreenshotPaths(
   );
 }
 
-/** Clear all image buffers at an auth boundary. Serialized after outstanding
- * prefetch work so an old-account request cannot repopulate the native cache
- * after it was cleared. */
+/** Clear native full-image bytes at an auth boundary. */
 export function clearPreloadedScreenshotImages(): void {
-  imagePreloadGeneration += 1;
-  pendingFullUrls = [];
-  prefetchedFullImages.clear();
-  fullPreloadDrain = fullPreloadDrain
-    .catch(() => {})
-    .then(async () => {
-      await invoke("clear_remote_image_cache").catch(() => {});
-    });
+  void invoke("clear_remote_image_cache").catch(() => {});
 }
 
 /** Copy full-resolution screenshot bytes to NSPasteboard without persisting a

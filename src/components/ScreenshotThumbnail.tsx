@@ -6,7 +6,7 @@ import { Check, ChevronLeft, ClipboardList, Copy, Download, Image as ImageIcon, 
 import { toast } from "sonner";
 import { useSyncStore } from "@/stores/syncStore";
 import { ensureDragIconPath, getCachedThumbUrl, requestRemoteThumbUrl, requestThumbUrl } from "@/lib/thumbCache";
-import { findDocForCachePath, isCloudScreenshotPath, isImportScreenshotPath } from "@/lib/sync/order";
+import { isCloudScreenshotPath, isImportScreenshotPath } from "@/lib/sync/order";
 import { computePreloadRange, computeWindowRange, windowItemTop, windowTotalHeight, type WindowRange } from "@/lib/railWindow";
 import type { ColumnView } from "@/App";
 
@@ -221,7 +221,7 @@ export const ScreenshotThumbnail = memo(function ScreenshotThumbnail({
         onWheel={onActivity}
       >
         {/* Same edge pill as the collapsed handle, locked to true rail center. */}
-        <div className="absolute left-0 top-1/2 z-30 -translate-y-1/2">
+        <div className="absolute left-0 z-30" style={{ top: "calc(50% - 36px)" }}>
           <button
             type="button"
             onClick={triggerCollapse}
@@ -246,33 +246,33 @@ export const ScreenshotThumbnail = memo(function ScreenshotThumbnail({
                 if (file) onAddImage(file);
               }}
             />
-            <div className="flex items-stretch gap-1.5">
-              <div className="flex min-w-0 flex-1 gap-0.5 rounded-md bg-white/[0.07] p-0.5 ring-1 ring-inset ring-white/[0.08] backdrop-blur-sm">
+            <div className="flex h-8 items-center gap-1.5">
+              <div className="flex h-full min-w-0 flex-1 items-center gap-0.5 rounded-md bg-white/[0.07] p-0.5 ring-1 ring-inset ring-white/[0.08] backdrop-blur-sm">
                 <button
                   type="button"
                   onClick={() => onColumnViewChange("screenshots")}
                   aria-pressed={columnView === "screenshots"}
-                  className={`flex-1 flex items-center justify-center gap-1.5 rounded px-2 py-1 text-xs cursor-pointer transition-colors ${
+                  className={`flex h-full flex-1 items-center justify-center gap-1.5 rounded px-2 text-xs leading-none cursor-pointer transition-colors ${
                     columnView === "screenshots"
                       ? "bg-white/[0.16] text-white shadow-sm"
                       : "text-white/50 hover:bg-white/[0.06] hover:text-white/85"
                   }`}
                 >
-                  <ImageIcon className="size-3.5" aria-hidden="true" />
-                  Screenshots
+                  <ImageIcon className="size-3.5 shrink-0" aria-hidden="true" />
+                  <span className="leading-none">Screenshots</span>
                 </button>
                 <button
                   type="button"
                   onClick={() => onColumnViewChange("clipboard")}
                   aria-pressed={columnView === "clipboard"}
-                  className={`flex-1 flex items-center justify-center gap-1.5 rounded px-2 py-1 text-xs cursor-pointer transition-colors ${
+                  className={`flex h-full flex-1 items-center justify-center gap-1.5 rounded px-2 text-xs leading-none cursor-pointer transition-colors ${
                     columnView === "clipboard"
                       ? "bg-white/[0.16] text-white shadow-sm"
                       : "text-white/50 hover:bg-white/[0.06] hover:text-white/85"
                   }`}
                 >
-                  <ClipboardList className="size-3.5" aria-hidden="true" />
-                  Text
+                  <ClipboardList className="size-3.5 shrink-0" aria-hidden="true" />
+                  <span className="leading-none">Text</span>
                 </button>
               </div>
               <button
@@ -283,7 +283,7 @@ export const ScreenshotThumbnail = memo(function ScreenshotThumbnail({
                 }}
                 aria-label="Add image"
                 title="Add image"
-                className="flex w-8 shrink-0 items-center justify-center rounded-md border border-white/[0.12] bg-white/[0.07] text-white/75 shadow-sm transition-colors hover:bg-white/[0.14] hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/60 cursor-pointer"
+                className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-white/[0.12] bg-white/[0.07] text-white/75 shadow-sm transition-colors hover:bg-white/[0.14] hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/60 cursor-pointer"
               >
                 <ImagePlus className="size-3.5" aria-hidden="true" />
               </button>
@@ -515,7 +515,7 @@ interface ThumbnailItemProps {
 // Bound both the Firebase URL resolve and the remote image load so the remote
 // fallback ALWAYS reaches a terminal state (rendered or "unavailable"). Local
 // thumbnail requests are NOT time-bounded — see thumbCache.
-const REMOTE_TIMEOUT_MS = 8000;
+const REMOTE_TIMEOUT_MS = 5000;
 
 // Test-load `url` in an off-DOM <img> and resolve true only if it actually
 // decoded (false on error or after `timeoutMs`). Used for the two FALLBACK
@@ -570,9 +570,7 @@ export const ThumbnailItem = memo(function ThumbnailItem({ path, onEdit, onRemov
   // Cache-first: a tile whose thumbnail blob URL is already in the module
   // cache commits it in its INITIAL state — remounting (scroll-back, or a
   // future column remount) paints with zero IPC, zero effects-first flash.
-  const [src, setSrc] = useState<string>(() =>
-    getCachedThumbUrl(path) ?? findDocForCachePath(path)?.thumbUrl ?? "",
-  );
+  const [src, setSrc] = useState<string>(() => getCachedThumbUrl(path) ?? "");
   // URL availability is not pixel availability. Keep the shimmer visible until
   // WebKit actually decodes and paints the image (onLoad), including direct
   // Firebase URLs restored from Firestore.
@@ -638,7 +636,18 @@ export const ThumbnailItem = memo(function ThumbnailItem({ path, onEdit, onRemov
       let cancelled = false;
       let request: ReturnType<typeof requestRemoteThumbUrl> | null = null;
       void (async () => {
-        const remote = await resolveFallbackUrl();
+        // Bound Firebase's metadata lookup too. Its SDK retries can otherwise
+        // keep a tile shimmering for a minute on a weak connection. A fresh
+        // Android doc may initially contain only thumbPath; retry briefly so a
+        // concurrently-written direct thumbUrl can take over from a stuck SDK
+        // metadata request without remounting the memoized tile.
+        let remote: string | null = null;
+        for (let attempt = 0; attempt < 3 && !cancelled && !remote; attempt += 1) {
+          remote = await withTimeout(resolveFallbackUrl(), REMOTE_TIMEOUT_MS);
+          if (!remote && attempt < 2) {
+            await new Promise((resolve) => setTimeout(resolve, 300 * (attempt + 1)));
+          }
+        }
         if (cancelled) return;
         if (!remote) {
           setFailed(true);

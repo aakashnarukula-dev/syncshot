@@ -25,7 +25,10 @@ import { TaskGate } from "./taskGate";
 export const THUMB_MAX_PX = 512;
 
 const CACHE_CAP = 300;
-const MAX_INFLIGHT = 5;
+// Cloud thumbnails are tiny (~320px WebP). Eight parallel slots fill the rail
+// quickly on a cold open without letting the 16-item Firestore page fan out
+// without a bound.
+const MAX_INFLIGHT = 8;
 
 /** Definite local-thumbnail failure (Rust rejected) — the only case where the
  * tile may fall back to the remote Firebase URL. */

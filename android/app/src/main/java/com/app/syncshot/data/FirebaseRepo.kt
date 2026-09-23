@@ -185,11 +185,26 @@ object FirebaseRepo {
             return@coroutineScope
         }
 
-        val thumb = preparedThumb.await() ?: return@coroutineScope
         val docRef = col("screenshots").document()
         val id = docRef.id
         val thumbPath = "users/$uid/screenshots/$id/thumb.webp"
         val fullPath = "users/$uid/screenshots/$id/full.${type.ext}"
+        val fullRef = storage.getReference(fullPath)
+
+        // Start the multi-megabyte original immediately. It runs alongside the
+        // tiny thumbnail encode/upload instead of waiting behind it, so the Mac
+        // clipboard can receive the original within seconds of the rail preview.
+        val fullUpload = async {
+            fullRef
+                .putBytes(full, StorageMetadata.Builder().setContentType(type.mime).build())
+                .await()
+        }
+
+        val thumb = preparedThumb.await()
+        if (thumb == null) {
+            fullUpload.cancel()
+            return@coroutineScope
+        }
 
         // Optimistic local row: the grid mirrors Room, so writing the row now (with
         // status "local") makes the just-captured shot appear and render from its
@@ -223,7 +238,6 @@ object FirebaseRepo {
         thumbRef
             .putBytes(thumb.bytes, StorageMetadata.Builder().setContentType("image/webp").build())
             .await()
-        val thumbUrl = thumbRef.downloadUrl.await().toString()
         docRef.set(
             mapOf(
                 "sha256" to sha,
@@ -233,27 +247,33 @@ object FirebaseRepo {
                 "height" to thumb.height,
                 "mime" to type.mime,
                 "thumbPath" to thumbPath,
-                "thumbUrl" to thumbUrl,
+                "thumbUrl" to null,
+                // The path is deterministic and safe to publish while bytes
+                // finish uploading. Status remains "thumb" until completion.
+                "fullPath" to fullPath,
+                "fullUrl" to null,
                 "status" to "thumb",
             )
         ).await()
 
-        val fullRef = storage.getReference(fullPath)
-        val fullUpload = async {
-            fullRef
-            .putBytes(full, StorageMetadata.Builder().setContentType(type.mime).build())
-            .await()
+        val thumbUrlUpdate = async {
+            runCatching {
+                docRef.update("thumbUrl", thumbRef.downloadUrl.await().toString()).await()
+            }
         }
         fullUpload.await()
-        val fullUrl = fullRef.downloadUrl.await().toString()
         docRef.update(
             mapOf(
                 "status" to "full",
                 "fullPath" to fullPath,
-                "fullUrl" to fullUrl,
                 "bytes" to full.size.toLong(),
             )
         ).await()
+
+        // URL metadata is an optimization, never a delivery gate. Storage paths
+        // are already usable by both apps if either lookup is briefly slow.
+        thumbUrlUpdate.await()
+        runCatching { docRef.update("fullUrl", fullRef.downloadUrl.await().toString()).await() }
     }
 
     suspend fun downloadFull(path: String, maxBytes: Long = 64L * 1024 * 1024): ByteArray =

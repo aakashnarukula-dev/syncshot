@@ -405,7 +405,13 @@ fn cache_remote_image(url: &str, bytes: &[u8]) {
 
 fn synced_image_http_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    CLIENT.get_or_init(reqwest::Client::new)
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(3))
+            .timeout(std::time::Duration::from_secs(8))
+            .build()
+            .expect("valid SyncShot HTTP client")
+    })
 }
 
 /// Remove cloud copies materialized for a native drag by a previous process.

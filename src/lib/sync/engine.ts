@@ -30,7 +30,6 @@ import {
   clearPreloadedScreenshotImages,
   preloadScreenshotImages,
   publishScreenshot,
-  storageDownloadUrl,
   subscribeScreenshots,
 } from "./screenshots";
 import { subscribeClipboard, writeClipboardEntry } from "./clipboard";
@@ -94,12 +93,9 @@ function touchCurrentDevice(force = false): void {
 function markFreshIncoming(item: ScreenshotDoc): void {
   freshIncomingIds.add(item.id);
   if (item.thumbPath) {
-    void storageDownloadUrl(item.thumbPath)
-      .then((url) => {
-        const preview = new Image();
-        preview.src = url;
-      })
-      .catch(() => {});
+    // preloadScreenshotImages already owns the bounded Rust thumbnail fetch.
+    // A second WebKit <img> request here duplicated traffic at the exact moment
+    // the fresh full image needed bandwidth for automatic clipboard delivery.
     incomingScreenshotPreview(item, cloudScreenshotPath(item.id, item.sha256));
   }
 }
