@@ -264,9 +264,17 @@ private fun GalleryTile(ctx: Context, item: ScreenshotEntity, onClick: () -> Uni
         // Grid: thumb (or local) only — never the full image — decoded small.
         imageModel(ctx, item, local, preferFull = false, thumbOnly = true, targetSizePx = 384)
     }
-    // Spinner only while actively loading. Error (e.g. a 404 from a blob deleted on
-    // the cloud) settles to the grey surface instead of spinning forever.
+    // Spinner only for a short cold start. A fresh phone screenshot already has
+    // a local cached file behind this tile; keeping the progress ring up until
+    // every cloud/thumb state settles makes the image feel stuck even though the
+    // bitmap is visible. Hide quickly for local/optimistic rows and never spin
+    // forever on slow Storage refs.
     var loading by remember(item.id, item.thumbPath, item.fullPath, local) { mutableStateOf(model != null) }
+    LaunchedEffect(item.id, item.status, local, model) {
+        val maxSpinnerMs = if (local != null || item.status == "local") 250L else 900L
+        delay(maxSpinnerMs)
+        loading = false
+    }
     Box(
         Modifier
             .padding(4.dp)
