@@ -429,10 +429,23 @@ private fun FullScreenViewer(
                             val down = awaitFirstDown(requireUnconsumed = false)
                             var maxPointers = 1
                             var moved = false
+                            var maxTravel = 0f
                             var event: PointerEvent
                             do {
                                 event = awaitPointerEvent()
                                 maxPointers = maxOf(maxPointers, event.changes.count { it.pressed })
+                                val primary = event.changes.firstOrNull()
+                                if (primary != null) {
+                                    maxTravel = maxOf(
+                                        maxTravel,
+                                        (primary.position - down.position).getDistance(),
+                                    )
+                                }
+                                // Finger jitter during a tap still produces tiny pan
+                                // deltas. Treat movement as a drag only after touch slop;
+                                // otherwise second tap while zoomed gets rejected and
+                                // double-tap cannot return image to fit-to-screen.
+                                if (maxPointers > 1 || maxTravel > slop) moved = true
                                 val zoom = event.calculateZoom()
                                 val panChange = event.calculatePan()
                                 if (zoom != 1f) {
@@ -454,10 +467,8 @@ private fun FullScreenViewer(
                                         panAnim.snapTo(next)
                                     }
                                     event.changes.forEach { if (it.positionChanged()) it.consume() }
-                                    if (panChange.getDistance() > 0f) moved = true
                                 } else if (abs(panChange.y) > abs(panChange.x)) {
                                     dismissY += panChange.y
-                                    if (abs(panChange.y) > slop) moved = true
                                 }
                             } while (event.changes.any { it.pressed })
 
@@ -476,7 +487,7 @@ private fun FullScreenViewer(
 
                             // Tap = single pointer, no significant movement. Count taps
                             // manually to detect a double-tap toggle in BOTH directions.
-                            if (maxPointers == 1 && !moved) {
+                            if (completedGestureIsTap(maxPointers, maxTravel, slop) && !moved) {
                                 val up = event.changes.firstOrNull() ?: down
                                 val now = up.uptimeMillis
                                 val pos = up.position
@@ -547,6 +558,12 @@ private fun FullScreenViewer(
         }
     }
 }
+
+internal fun completedGestureIsTap(
+    maxPointers: Int,
+    maxTravel: Float,
+    touchSlop: Float,
+): Boolean = maxPointers == 1 && maxTravel <= touchSlop
 
 @Composable
 private fun BottomAction(icon: ImageVector, label: String, onClick: () -> Unit) {
