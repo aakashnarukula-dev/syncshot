@@ -33,8 +33,8 @@ android {
         applicationId = "com.app.syncshot"
         minSdk = 26
         targetSdk = 34
-        versionCode = 5
-        versionName = "2.0.3"
+        versionCode = 6
+        versionName = "2.0.4"
 
         if (!hasGoogleServicesConfig) {
             // Firebase client configuration is public (authorization is
@@ -105,16 +105,7 @@ dependencies {
     implementation(libs.androidx.paging.runtime.ktx)
     implementation(libs.androidx.paging.compose)
 
-    implementation(libs.androidx.camera.core)
-    implementation(libs.androidx.camera.camera2)
-    implementation(libs.androidx.camera.lifecycle)
-    implementation(libs.androidx.camera.view)
-    implementation(libs.androidx.concurrent.futures.ktx)
-    implementation(libs.guava)
-    implementation(libs.mlkit.barcode.scanning)
-
     implementation(libs.kotlinx.coroutines.play.services)
-    implementation(libs.zxing.core)
 
     debugImplementation(libs.androidx.ui.tooling)
     testImplementation(libs.junit)
