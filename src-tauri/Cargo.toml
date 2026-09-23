@@ -1,6 +1,6 @@
 [package]
 name = "syncshot"
-version = "0.2.16"
+version = "0.2.17"
 description = "SyncShot — fast screenshot capture, edit, and share"
 authors = ["kartik labhshetwar"]
 edition = "2021"

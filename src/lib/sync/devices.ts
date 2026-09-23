@@ -33,6 +33,15 @@ export async function registerDevice(device: DeviceRef): Promise<void> {
   );
 }
 
+/** Refresh presence without touching display-name/platform fields. */
+export async function touchDevice(device: DeviceRef): Promise<void> {
+  await setDoc(
+    deviceRef(device),
+    { lastSeenAt: serverTimestamp() },
+    { merge: true },
+  );
+}
+
 /** Watch this device's profile document for a remote sign-out request. */
 export function watchDeviceRevocation(
   device: DeviceRef,

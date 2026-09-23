@@ -213,16 +213,15 @@ export const ScreenshotThumbnail = memo(function ScreenshotThumbnail({
       ) : null}
       <div
         ref={colRef}
-        className={`bs-glass-rail h-full w-full min-h-0 overflow-hidden select-none flex-row rounded-r-[20px] border border-l-0 border-white/[0.14] ${isCollapsed ? "hidden" : "flex"}`}
+        className={`bs-glass-rail relative h-full w-full min-h-0 overflow-hidden select-none flex-row rounded-r-[20px] border border-l-0 border-white/[0.14] ${isCollapsed ? "hidden" : "flex"}`}
         style={{ transformOrigin: "left center", opacity: 0 }}
         onMouseEnter={() => onHoverChange?.(true)}
         onMouseMove={() => onHoverChange?.(true)}
         onMouseLeave={() => onHoverChange?.(false)}
         onWheel={onActivity}
       >
-        {/* Same edge pill as the collapsed handle, vertically centered on the left,
-            flipped arrow — click to close. */}
-        <div className="shrink-0 flex items-center">
+        {/* Same edge pill as the collapsed handle, locked to true rail center. */}
+        <div className="absolute left-0 top-1/2 z-30 -translate-y-1/2">
           <button
             type="button"
             onClick={triggerCollapse}
@@ -232,7 +231,7 @@ export const ScreenshotThumbnail = memo(function ScreenshotThumbnail({
             <ChevronLeft className="size-3.5" aria-hidden="true" />
           </button>
         </div>
-        <div className="flex-1 min-w-0 flex flex-col">
+        <div className="flex-1 min-w-0 flex flex-col pl-[24px]">
           {/* Screenshots / Text segmented toggle, pinned above the active list. */}
           <div className="shrink-0 pt-3 pb-1.5 pr-3 pl-1">
             <input

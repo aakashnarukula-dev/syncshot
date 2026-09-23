@@ -952,6 +952,17 @@ export async function ensureLocalScreenshot(path: string): Promise<string> {
   }
   const docMatch = findDocForCachePath(path);
   if (docMatch?.fullPath) {
+    const ownStagingPath = Object.entries(useSyncStore.getState().localCaptureDocIds)
+      .find(([, id]) => id === docMatch.id)?.[0];
+    if (ownStagingPath) {
+      try {
+        if (await invoke<boolean>("file_exists", { path: ownStagingPath })) {
+          return ownStagingPath;
+        }
+      } catch {
+        /* staging probe failed → use cloud materialization below */
+      }
+    }
     let pending = temporaryCloudFiles.get(path);
     if (!pending) {
       pending = (async () => {

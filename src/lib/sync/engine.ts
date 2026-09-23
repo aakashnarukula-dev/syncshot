@@ -21,7 +21,7 @@ import {
 } from "@/stores/syncStore";
 import { logout, watchAuth } from "./firebase";
 import { loadSyncPrefs, saveDeviceId, saveDeviceName, savePaused } from "./persistence";
-import { registerDevice, watchDeviceRevocation } from "./devices";
+import { registerDevice, touchDevice, watchDeviceRevocation } from "./devices";
 import {
   cloudScreenshotPath,
 } from "./order";
@@ -72,9 +72,36 @@ let incomingBaselineReady = false;
 let incomingHighWater = Number.NEGATIVE_INFINITY;
 const freshIncomingIds = new Set<string>();
 const knownIncomingIds = new Set<string>();
+let listenerStartedAt = 0;
+let lastPresenceTouchAt = 0;
+let presenceTimer: ReturnType<typeof setInterval> | null = null;
 
 function store() {
   return useSyncStore.getState();
+}
+
+function touchCurrentDevice(force = false): void {
+  const current = device;
+  if (!current) return;
+  const now = Date.now();
+  if (!force && now - lastPresenceTouchAt < 60_000) return;
+  lastPresenceTouchAt = now;
+  void touchDevice(current).catch((err) =>
+    console.error("device presence update failed:", err),
+  );
+}
+
+function markFreshIncoming(item: ScreenshotDoc): void {
+  freshIncomingIds.add(item.id);
+  if (item.thumbPath) {
+    void storageDownloadUrl(item.thumbPath)
+      .then((url) => {
+        const preview = new Image();
+        preview.src = url;
+      })
+      .catch(() => {});
+    incomingScreenshotPreview(item, cloudScreenshotPath(item.id, item.sha256));
+  }
 }
 
 function handleScreenshots(
@@ -97,7 +124,16 @@ function handleScreenshots(
         (latest, item) => Math.max(latest, item.createdAt ?? Number.NEGATIVE_INFINITY),
         Number.NEGATIVE_INFINITY,
       );
-      for (const item of items) knownIncomingIds.add(item.id);
+      for (const item of items) {
+        knownIncomingIds.add(item.id);
+        if (
+          item.device.deviceId !== deviceId &&
+          item.createdAt !== null &&
+          item.createdAt >= listenerStartedAt
+        ) {
+          markFreshIncoming(item);
+        }
+      }
       incomingBaselineReady = true;
     } else {
       const fresh = items.filter(
@@ -105,25 +141,10 @@ function handleScreenshots(
           !knownIncomingIds.has(item.id) &&
           item.device.deviceId !== deviceId &&
           item.createdAt !== null &&
-          item.createdAt >= incomingHighWater,
+          (item.createdAt >= incomingHighWater || item.createdAt >= listenerStartedAt),
       );
       for (const item of fresh) {
-        freshIncomingIds.add(item.id);
-        // The thumbnail is already uploaded before the doc is written, so the
-        // pill can paint it now instead of waiting for the multi-megabyte full
-        // upload + download and the old 2.5-second directory poll.
-        if (item.thumbPath) {
-          // Start URL resolution + browser image fetch before React mounts the
-          // tile. ThumbnailItem shares the same memoized URL request and browser
-          // cache, so its fallback normally paints during the reveal animation.
-          void storageDownloadUrl(item.thumbPath)
-            .then((url) => {
-              const preview = new Image();
-              preview.src = url;
-            })
-            .catch(() => {});
-          incomingScreenshotPreview(item, cloudScreenshotPath(item.id, item.sha256));
-        }
+        markFreshIncoming(item);
       }
       incomingHighWater = items.reduce(
         (latest, item) => Math.max(latest, item.createdAt ?? Number.NEGATIVE_INFINITY),
@@ -163,6 +184,8 @@ function stopListeners(): void {
   unsubDeviceRevocation = null;
   unsubScreenshots?.();
   unsubScreenshots = null;
+  if (presenceTimer) clearInterval(presenceTimer);
+  presenceTimer = null;
   registerScreenshotLoadMore(null);
   unsubClipboard?.();
   unsubClipboard = null;
@@ -172,10 +195,12 @@ function stopListeners(): void {
   incomingHighWater = Number.NEGATIVE_INFINITY;
   freshIncomingIds.clear();
   knownIncomingIds.clear();
+  listenerStartedAt = 0;
 }
 
 function startListeners(uid: string): void {
   stopListeners();
+  listenerStartedAt = Date.now() - 10_000;
   const currentDevice = device;
   if (currentDevice) {
     // Presence is best-effort: an offline Mac still gets its cached Library and
@@ -194,6 +219,8 @@ function startListeners(uid: string): void {
       },
       (err) => console.error("device revocation listener error:", err),
     );
+    touchCurrentDevice(true);
+    presenceTimer = setInterval(() => touchCurrentDevice(), 60_000);
   }
   const screenshots = subscribeScreenshots(uid, handleScreenshots, (err) =>
     console.error("screenshots listener error:", err),
@@ -253,6 +280,7 @@ export async function startSyncEngine(): Promise<void> {
   unlistenNewShot = await listen<string>("new-screenshot", (event) => {
     const { uid } = store();
     if (uid && device) {
+      touchCurrentDevice(true);
       publishScreenshot(uid, device, event.payload).catch((err) =>
         console.error("publish screenshot failed:", err),
       );
@@ -262,6 +290,7 @@ export async function startSyncEngine(): Promise<void> {
   unlistenClipChanged = await listen<{ text: string }>("clipboard-changed", (event) => {
     const { uid, paused } = store();
     if (!uid || !device || paused) return;
+    touchCurrentDevice();
     writeClipboardEntry(uid, device, event.payload.text, recentClipHash)
       .then((hash) => {
         if (hash) recentClipHash = hash;

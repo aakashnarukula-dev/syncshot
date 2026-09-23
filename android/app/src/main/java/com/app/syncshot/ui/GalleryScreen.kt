@@ -406,6 +406,7 @@ private fun FullScreenViewer(
 
                         var lastTapUptime = 0L
                         var lastTapPos = Offset.Zero
+                        val zoomPanGain = 1.65f
                         awaitEachGesture {
                             val down = awaitFirstDown(requireUnconsumed = false)
                             var maxPointers = 1
@@ -418,13 +419,17 @@ private fun FullScreenViewer(
                                 val panChange = event.calculatePan()
                                 if (zoom != 1f) {
                                     val next = (scaleAnim.value * zoom).coerceIn(1f, 4f)
-                                    pageScope.launch { scaleAnim.snapTo(next) }
+                                    pageScope.launch(start = kotlinx.coroutines.CoroutineStart.UNDISPATCHED) {
+                                        scaleAnim.snapTo(next)
+                                    }
                                     pagerScrollEnabled = next <= 1f
                                     moved = true
                                 }
                                 if (scaleAnim.value > 1f) {
-                                    val next = panAnim.value + panChange
-                                    pageScope.launch { panAnim.snapTo(next) }
+                                    val next = panAnim.value + panChange * zoomPanGain
+                                    pageScope.launch(start = kotlinx.coroutines.CoroutineStart.UNDISPATCHED) {
+                                        panAnim.snapTo(next)
+                                    }
                                     event.changes.forEach { if (it.positionChanged()) it.consume() }
                                     if (panChange.getDistance() > 0f) moved = true
                                 } else if (abs(panChange.y) > abs(panChange.x)) {
@@ -434,7 +439,9 @@ private fun FullScreenViewer(
                             } while (event.changes.any { it.pressed })
 
                             if (scaleAnim.value <= 1f) {
-                                pageScope.launch { panAnim.snapTo(Offset.Zero) }
+                                pageScope.launch(start = kotlinx.coroutines.CoroutineStart.UNDISPATCHED) {
+                                    panAnim.snapTo(Offset.Zero)
+                                }
                                 pagerScrollEnabled = true
                                 if (dismissY > 300f) {
                                     onClose()
