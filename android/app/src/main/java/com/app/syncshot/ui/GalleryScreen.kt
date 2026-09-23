@@ -404,9 +404,19 @@ private fun FullScreenViewer(
                             }
                         }
 
+                        fun clampPan(value: Offset, scale: Float): Offset {
+                            if (scale <= 1f) return Offset.Zero
+                            val maxX = (size.width * (scale - 1f)) / 2f
+                            val maxY = (size.height * (scale - 1f)) / 2f
+                            return Offset(
+                                value.x.coerceIn(-maxX, maxX),
+                                value.y.coerceIn(-maxY, maxY),
+                            )
+                        }
+
                         var lastTapUptime = 0L
                         var lastTapPos = Offset.Zero
-                        val zoomPanGain = 1.65f
+                        val zoomPanGain = 3.25f
                         awaitEachGesture {
                             val down = awaitFirstDown(requireUnconsumed = false)
                             var maxPointers = 1
@@ -418,15 +428,20 @@ private fun FullScreenViewer(
                                 val zoom = event.calculateZoom()
                                 val panChange = event.calculatePan()
                                 if (zoom != 1f) {
-                                    val next = (scaleAnim.value * zoom).coerceIn(1f, 4f)
+                                    val oldScale = scaleAnim.value
+                                    val next = (oldScale * zoom).coerceIn(1f, 4f)
+                                    val centeredPan = if (oldScale > 0f) panAnim.value * (next / oldScale) else panAnim.value
                                     pageScope.launch(start = kotlinx.coroutines.CoroutineStart.UNDISPATCHED) {
                                         scaleAnim.snapTo(next)
+                                    }
+                                    pageScope.launch(start = kotlinx.coroutines.CoroutineStart.UNDISPATCHED) {
+                                        panAnim.snapTo(clampPan(centeredPan, next))
                                     }
                                     pagerScrollEnabled = next <= 1f
                                     moved = true
                                 }
                                 if (scaleAnim.value > 1f) {
-                                    val next = panAnim.value + panChange * zoomPanGain
+                                    val next = clampPan(panAnim.value + panChange * zoomPanGain, scaleAnim.value)
                                     pageScope.launch(start = kotlinx.coroutines.CoroutineStart.UNDISPATCHED) {
                                         panAnim.snapTo(next)
                                     }
