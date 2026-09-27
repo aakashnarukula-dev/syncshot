@@ -200,6 +200,10 @@ function getTempDir(): Promise<string> {
 
 const dragIcons = new Map<string, Promise<string | null>>();
 
+export function forgetDragIconPath(path: string): void {
+  dragIcons.delete(path);
+}
+
 export function ensureDragIconPath(path: string): Promise<string | null> {
   let pending = dragIcons.get(path);
   if (!pending) {
@@ -229,7 +233,10 @@ export function ensureDragIconPath(path: string): Promise<string | null> {
         copyToClip: false,
         overwritePath: `${tempDir}/sx-drag-${safe}`,
       });
-    })().catch(() => {
+    })().then((icon) => {
+      if (!icon) dragIcons.delete(path);
+      return icon;
+    }, () => {
       dragIcons.delete(path); // allow a retry on the next drag
       return null;
     });

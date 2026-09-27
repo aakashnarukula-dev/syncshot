@@ -1,5 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ScreenshotDoc } from "./types";
+import { useSyncStore } from "@/stores/syncStore";
+import { cloudScreenshotPath } from "./order";
 
 const { invokeMock, getDownloadURL, refMock } = vi.hoisted(() => ({
   invokeMock: vi.fn(),
@@ -37,6 +39,9 @@ vi.mock("firebase/firestore", () => ({
 
 import {
   downloadScreenshotToDownloads,
+  invalidateStorageDownloadUrl,
+  prepareScreenshotDragSource,
+  releaseScreenshotDragSource,
   resolveScreenshotFullImageUrl,
   resolveScreenshotThumbnailUrl,
   saveReceivedScreenshot,
@@ -59,11 +64,51 @@ function makeDoc(overrides: Partial<ScreenshotDoc> = {}): ScreenshotDoc {
   };
 }
 
+describe("screenshot drag source", () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+    getDownloadURL.mockReset();
+    useSyncStore.getState().reset();
+    invalidateStorageDownloadUrl("users/u1/screenshots/doc123/full.png");
+  });
+
+  it("keeps an existing own-device staging file after drag", async () => {
+    const stagingPath = "/cache/shot_123.png";
+    useSyncStore.getState().setScreenshots([makeDoc()], false);
+    useSyncStore.getState().mapLocalCapture(stagingPath, "doc123");
+    invokeMock.mockImplementation((command: string, args: { path?: string }) =>
+      command === "file_exists" ? Promise.resolve(args.path === stagingPath) : Promise.resolve(),
+    );
+
+    const source = await prepareScreenshotDragSource(cloudScreenshotPath("doc123"));
+    expect(source).toEqual({ path: stagingPath, temporary: false });
+    await releaseScreenshotDragSource(source);
+    expect(invokeMock).not.toHaveBeenCalledWith("delete_file", expect.anything());
+  });
+
+  it("removes only its downloaded cloud file after drop", async () => {
+    useSyncStore.getState().setScreenshots([makeDoc()], false);
+    getDownloadURL.mockResolvedValue("https://firebasestorage.googleapis.com/full.png?token=t");
+    invokeMock.mockImplementation((command: string) => {
+      if (command === "file_exists") return Promise.resolve(false);
+      if (command === "download_temporary_image") return Promise.resolve("/tmp/syncshot-cloud-doc123.png");
+      return Promise.resolve();
+    });
+
+    const source = await prepareScreenshotDragSource(cloudScreenshotPath("doc123"));
+    expect(source).toEqual({ path: "/tmp/syncshot-cloud-doc123.png", temporary: true });
+    expect(invokeMock).not.toHaveBeenCalledWith("delete_file", expect.anything());
+    await releaseScreenshotDragSource(source);
+    expect(invokeMock).toHaveBeenCalledWith("delete_file", { path: source.path });
+  });
+});
+
 describe("saveReceivedScreenshot", () => {
   beforeEach(() => {
     invokeMock.mockReset();
     getDownloadURL.mockReset();
     refMock.mockClear();
+    invalidateStorageDownloadUrl("users/u1/screenshots/doc123/full.png");
   });
 
   it("resolves a download URL and fetches the bytes via the Rust HTTP command (no getBytes/CORS)", async () => {

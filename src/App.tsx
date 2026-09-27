@@ -530,6 +530,7 @@ function MainApp() {
   // cursor is AWAY from the window, so polling IPC while the user is hovering
   // or focused on it is pure churn.
   const columnHoveredRef = useRef(false);
+  const screenshotDragActiveRef = useRef(false);
 
   // Follow the cursor across displays: while the edge pill / thumbnail column is
   // the visible surface, relocate it to whichever physical display the cursor is
@@ -544,6 +545,7 @@ function MainApp() {
       // Only while the column/pill is the visible surface and not mid-use.
       if (modeRef.current === "pairing" || modeRef.current === "preferences") return;
       if (openEditorsRef.current > 0) return;
+      if (screenshotDragActiveRef.current) return;
       // Paused while the window is focused or the cursor is inside it (both
       // sync checks — no IPC). :hover cross-checks the hover ref because
       // either alone can go stale when the window moves/hides under a
@@ -776,6 +778,7 @@ function MainApp() {
       if (
         modeRef.current !== "thumbnail" ||
         isCollapsedRef.current ||
+        screenshotDragActiveRef.current ||
         openEditorsRef.current > 0
       ) return;
       setAutoCollapseSignal((signal) => signal + 1);
@@ -807,6 +810,12 @@ function MainApp() {
     // leaves instead restarts full grace period without creating stuck hover.
     if (!columnHoveredRef.current && !isCollapsedRef.current) startAutoHide();
   }, [startAutoHide]);
+
+  const handleScreenshotDragStateChange = useCallback((active: boolean) => {
+    screenshotDragActiveRef.current = active;
+    if (active) pauseAutoHide();
+    else if (!isCollapsedRef.current) startAutoHide();
+  }, [pauseAutoHide, startAutoHide]);
 
   // Toggle Screenshots/Text while expanded: swap the view instantly (both
   // lists stay mounted), let the new content paint at the current size, then
@@ -1792,6 +1801,7 @@ function MainApp() {
         onHoverChange={handleHoverChange}
         onActivity={handleColumnActivity}
         onLoadMore={loadOlderPillPage}
+        onDragStateChange={handleScreenshotDragStateChange}
       />
     );
   }

@@ -39,7 +39,7 @@ import { db, storage } from "./firebase";
 import { sha256Hex } from "./hash";
 import { makeThumb } from "./thumbs";
 import { createDownloadUrlCache } from "./downloadUrlCache";
-import { cacheThumbBlob, requestRemoteThumbUrl } from "@/lib/thumbCache";
+import { cacheThumbBlob, forgetDragIconPath, requestRemoteThumbUrl } from "@/lib/thumbCache";
 import { RAIL_THUMB_BUFFER } from "@/lib/railWindow";
 import {
   SCREENSHOTS_PAGE_SIZE,
@@ -905,14 +905,41 @@ export async function ensureLocalScreenshot(path: string): Promise<string> {
   return path;
 }
 
-/** Release a native-action materialization and allow a later drag to fetch a
- * fresh file. Safe to call repeatedly for duplicate drag-end notifications. */
-export async function releaseTemporaryScreenshot(
-  cloudPath: string,
-  localPath: string,
-): Promise<void> {
-  temporaryCloudFiles.delete(cloudPath);
-  await invoke("delete_file", { path: localPath }).catch(() => {});
+export interface ScreenshotDragSource {
+  path: string;
+  temporary: boolean;
+}
+
+/** Prepare a real file for an OS drag. Only files created here may be removed
+ * after the drop; an own-device staging file still belongs to the library. */
+export async function prepareScreenshotDragSource(path: string): Promise<ScreenshotDragSource> {
+  if (await invoke<boolean>("file_exists", { path })) {
+    return { path, temporary: false };
+  }
+
+  const doc = findDocForCachePath(path);
+  if (!doc?.fullPath) throw new Error("Screenshot file is unavailable");
+
+  const stagingPath = Object.entries(useSyncStore.getState().localCaptureDocIds)
+    .find(([, id]) => id === doc.id)?.[0];
+  if (stagingPath && await invoke<boolean>("file_exists", { path: stagingPath })) {
+    return { path: stagingPath, temporary: false };
+  }
+
+  const url = await resolveScreenshotFullImageUrl(doc);
+  if (!url) throw new Error("Screenshot is still uploading");
+  const localPath = await invoke<string>("download_temporary_image", {
+    url,
+    name: receivedCacheName(doc),
+  });
+  return { path: localPath, temporary: true };
+}
+
+export async function releaseScreenshotDragSource(source: ScreenshotDragSource): Promise<void> {
+  if (source.temporary) {
+    forgetDragIconPath(source.path);
+    await invoke("delete_file", { path: source.path }).catch(() => {});
+  }
 }
 
 /**

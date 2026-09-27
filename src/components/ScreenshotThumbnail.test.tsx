@@ -1,8 +1,15 @@
 import { act, fireEvent, render, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+const { startDragMock, prepareDragMock, releaseDragMock, ensureDragIconMock } = vi.hoisted(() => ({
+  startDragMock: vi.fn().mockResolvedValue(undefined),
+  prepareDragMock: vi.fn((path: string) => Promise.resolve({ path, temporary: false })),
+  releaseDragMock: vi.fn().mockResolvedValue(undefined),
+  ensureDragIconMock: vi.fn().mockResolvedValue("/cache/icon.png"),
+}));
+
 vi.mock("@/lib/thumbCache", () => ({
-  ensureDragIconPath: vi.fn().mockResolvedValue(null),
+  ensureDragIconPath: ensureDragIconMock,
   getCachedThumbUrl: vi.fn(() => "data:image/png;base64,iVBORw0KGgo="),
   requestThumbUrl: vi.fn(() => ({
     promise: Promise.resolve(null),
@@ -11,13 +18,17 @@ vi.mock("@/lib/thumbCache", () => ({
 }));
 
 vi.mock("@crabnebula/tauri-plugin-drag", () => ({
-  startDrag: vi.fn().mockResolvedValue(undefined),
+  startDrag: startDragMock,
 }));
 
 const { downloadScreenshotToDownloads } = vi.hoisted(() => ({
   downloadScreenshotToDownloads: vi.fn().mockResolvedValue("/Users/test/Downloads/shot.png"),
 }));
-vi.mock("@/lib/sync/screenshots", () => ({ downloadScreenshotToDownloads }));
+vi.mock("@/lib/sync/screenshots", () => ({
+  downloadScreenshotToDownloads,
+  prepareScreenshotDragSource: prepareDragMock,
+  releaseScreenshotDragSource: releaseDragMock,
+}));
 
 import { ScreenshotThumbnail, ThumbnailItem } from "./ScreenshotThumbnail";
 
@@ -100,6 +111,70 @@ describe("ScreenshotThumbnail add image", () => {
 describe("ThumbnailItem", () => {
   afterEach(() => {
     vi.useRealTimers();
+    startDragMock.mockClear();
+    prepareDragMock.mockClear();
+    releaseDragMock.mockClear();
+  });
+
+  it("starts prepared native drag once and releases cloud file after drop", async () => {
+    const source = { path: "/tmp/syncshot-cloud-one.png", temporary: true };
+    prepareDragMock.mockResolvedValueOnce(source);
+    const onDragStateChange = vi.fn();
+    const view = render(
+      <ThumbnailItem path="syncshot-cloud://one" onEdit={vi.fn()} onRemove={vi.fn()} readOnly={false} onDragStateChange={onDragStateChange} />,
+    );
+    const image = view.getByAltText("Screenshot preview");
+
+    fireEvent.pointerDown(image, { button: 0 });
+    fireEvent.dragStart(image);
+    fireEvent.dragStart(image);
+    await waitFor(() => expect(startDragMock).toHaveBeenCalledTimes(1));
+    expect(startDragMock).toHaveBeenCalledWith(
+      { item: [source.path], icon: "/cache/icon.png" }, expect.any(Function),
+    );
+    expect(releaseDragMock).not.toHaveBeenCalled();
+    startDragMock.mock.calls[0][1]({ result: "Cancelled", cursorPos: { x: 1, y: 1 } });
+    await waitFor(() => expect(releaseDragMock).toHaveBeenCalledWith(source));
+    expect(onDragStateChange.mock.calls).toEqual([[true], [false]]);
+    view.unmount();
+  });
+
+  it("does not start a late drag after mouse release", async () => {
+    let resolvePreparation!: (source: { path: string; temporary: boolean }) => void;
+    prepareDragMock.mockReturnValueOnce(new Promise((resolve) => { resolvePreparation = resolve; }));
+    const view = render(
+      <ThumbnailItem path="/managed/slow.png" onEdit={vi.fn()} onRemove={vi.fn()} readOnly={false} />,
+    );
+    const image = view.getByAltText("Screenshot preview");
+
+    fireEvent.pointerDown(image, { button: 0 });
+    fireEvent.dragStart(image);
+    fireEvent.pointerUp(window);
+    resolvePreparation({ path: "/managed/slow.png", temporary: false });
+    await waitFor(() => expect(releaseDragMock).toHaveBeenCalled());
+    expect(startDragMock).not.toHaveBeenCalled();
+    view.unmount();
+  });
+
+  it("keeps a dropped file until the receiving app can read it", async () => {
+    const source = { path: "/tmp/syncshot-cloud-two.png", temporary: true };
+    prepareDragMock.mockResolvedValueOnce(source);
+    const view = render(
+      <ThumbnailItem path="syncshot-cloud://two" onEdit={vi.fn()} onRemove={vi.fn()} readOnly={false} />,
+    );
+    const image = view.getByAltText("Screenshot preview");
+    fireEvent.pointerDown(image, { button: 0 });
+    fireEvent.dragStart(image);
+    await waitFor(() => expect(startDragMock).toHaveBeenCalledTimes(1));
+
+    vi.useFakeTimers();
+    startDragMock.mock.calls[0][1]({ result: "Dropped", cursorPos: { x: 1, y: 1 } });
+    expect(releaseDragMock).not.toHaveBeenCalled();
+    await act(async () => { vi.advanceTimersByTime(119_999); });
+    expect(releaseDragMock).not.toHaveBeenCalled();
+    await act(async () => { vi.advanceTimersByTime(1); });
+    expect(releaseDragMock).toHaveBeenCalledWith(source);
+    view.unmount();
   });
 
   it("still deletes after the screenshot was opened", () => {

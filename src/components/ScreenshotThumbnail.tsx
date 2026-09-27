@@ -8,6 +8,7 @@ import { useSyncStore } from "@/stores/syncStore";
 import { ensureDragIconPath, getCachedThumbUrl, requestRemoteThumbUrl, requestThumbUrl } from "@/lib/thumbCache";
 import { cloudScreenshotId, isCloudScreenshotPath, isImportScreenshotPath } from "@/lib/sync/order";
 import { computePreloadRange, computeWindowRange, RAIL_THUMB_BUFFER, shouldLoadMore, windowItemTop, windowTotalHeight, type WindowRange } from "@/lib/railWindow";
+import type { ScreenshotDragSource } from "@/lib/sync/screenshots";
 import type { ColumnView } from "@/App";
 
 // Lazy: the clipboard list transitively pulls Firebase (~715KB) via
@@ -57,6 +58,7 @@ interface ScreenshotThumbnailProps {
   onActivity?: () => void;
   /** Request the next newest-first source page once the rail reaches its end. */
   onLoadMore?: () => void;
+  onDragStateChange?: (active: boolean) => void;
 }
 
 // Memoized: the parent (MainApp) re-renders on auth/license/poll churn; the
@@ -78,6 +80,7 @@ export const ScreenshotThumbnail = memo(function ScreenshotThumbnail({
   onHoverChange,
   onActivity,
   onLoadMore,
+  onDragStateChange,
 }: ScreenshotThumbnailProps) {
   const [animatingOut, setAnimatingOut] = useState(false);
   // Fetch the (Firebase-heavy) clipboard chunk only after the first switch to
@@ -301,6 +304,7 @@ export const ScreenshotThumbnail = memo(function ScreenshotThumbnail({
             isReadOnly={isReadOnly}
             onActivity={onActivity}
             onLoadMore={onLoadMore}
+            onDragStateChange={onDragStateChange}
           />
 
           {clipboardLoaded ? (
@@ -349,9 +353,10 @@ interface VirtualThumbListProps {
   isReadOnly: (path: string) => boolean;
   onActivity?: () => void;
   onLoadMore?: () => void;
+  onDragStateChange?: (active: boolean) => void;
 }
 
-function VirtualThumbList({ paths, revealed, revealSignal = 0, onEdit, onRemove, isReadOnly, onActivity, onLoadMore }: VirtualThumbListProps) {
+function VirtualThumbList({ paths, revealed, revealSignal = 0, onEdit, onRemove, isReadOnly, onActivity, onLoadMore, onDragStateChange }: VirtualThumbListProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const rafRef = useRef(0);
   const preloadSignatureRef = useRef("");
@@ -517,7 +522,7 @@ function VirtualThumbList({ paths, revealed, revealSignal = 0, onEdit, onRemove,
               className="absolute inset-x-0"
               style={{ top: windowItemTop(index, itemHeight, LIST_GAP), height: itemHeight }}
             >
-              <ThumbnailItem path={path} onEdit={onEdit} onRemove={onRemove} readOnly={isReadOnly(path)} />
+              <ThumbnailItem path={path} onEdit={onEdit} onRemove={onRemove} readOnly={isReadOnly(path)} onDragStateChange={onDragStateChange} />
             </div>
           );
         })}
@@ -531,6 +536,7 @@ interface ThumbnailItemProps {
   onEdit: (path: string) => void;
   onRemove: (path: string) => void;
   readOnly: boolean;
+  onDragStateChange?: (active: boolean) => void;
 }
 
 // A synced shot whose Storage blob never downloaded — or an orphaned/corrupted
@@ -588,7 +594,7 @@ function withTimeout<T>(p: Promise<T>, ms: number): Promise<T | null> {
 // Memoized: scroll-window shifts re-render the list container, and without
 // memo every mounted tile would re-render on each shift. Props are stable
 // (path string + App-level useCallback handlers).
-export const ThumbnailItem = memo(function ThumbnailItem({ path, onEdit, onRemove, readOnly }: ThumbnailItemProps) {
+export const ThumbnailItem = memo(function ThumbnailItem({ path, onEdit, onRemove, readOnly, onDragStateChange }: ThumbnailItemProps) {
   const isUploading = isImportScreenshotPath(path);
   const cloudId = cloudScreenshotId(path);
   // New Mac/Android uploads persist a tokenized thumbnail URL in Firestore.
@@ -622,6 +628,64 @@ export const ThumbnailItem = memo(function ThumbnailItem({ path, onEdit, onRemov
   const exitingRef = useRef(false);
   const readyRef = useRef(false);
   const remoteFallbackRef = useRef<Promise<string | null> | null>(null);
+  const dragPreparationRef = useRef<Promise<{ source: ScreenshotDragSource; icon: string }> | null>(null);
+  const dragWarmTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const dragReleaseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const dragActiveRef = useRef(false);
+  const pointerHeldRef = useRef(false);
+  const mountedRef = useRef(true);
+
+  const releaseDragPreparation = () => {
+    const pending = dragPreparationRef.current;
+    dragPreparationRef.current = null;
+    if (pending) {
+      void pending.then(async ({ source }) => {
+        const { releaseScreenshotDragSource } = await import("@/lib/sync/screenshots");
+        await releaseScreenshotDragSource(source);
+      }).catch(() => {});
+    }
+  };
+
+  const prepareDrag = () => {
+    if (!dragPreparationRef.current) {
+      dragPreparationRef.current = (async () => {
+        const { prepareScreenshotDragSource, releaseScreenshotDragSource } = await import("@/lib/sync/screenshots");
+        const source = await prepareScreenshotDragSource(path);
+        try {
+          // Never pass a full-resolution or missing image as the native drag
+          // icon. AppKit can abort the entire app when its NSImage is invalid.
+          const icon = await ensureDragIconPath(source.path);
+          if (!icon) throw new Error("Screenshot preview is unavailable");
+          return { source, icon };
+        } catch (error) {
+          await releaseScreenshotDragSource(source);
+          throw error;
+        }
+      })().catch((error) => {
+        dragPreparationRef.current = null;
+        throw error;
+      });
+    }
+    return dragPreparationRef.current;
+  };
+
+  useEffect(() => {
+    mountedRef.current = true;
+    const onPointerUp = () => { pointerHeldRef.current = false; };
+    window.addEventListener("pointerup", onPointerUp, true);
+    window.addEventListener("pointercancel", onPointerUp, true);
+    return () => {
+      mountedRef.current = false;
+      pointerHeldRef.current = false;
+      window.removeEventListener("pointerup", onPointerUp, true);
+      window.removeEventListener("pointercancel", onPointerUp, true);
+      if (dragWarmTimerRef.current) clearTimeout(dragWarmTimerRef.current);
+      if (dragReleaseTimerRef.current) clearTimeout(dragReleaseTimerRef.current);
+      releaseDragPreparation();
+    };
+    // Each tile owns its prepared file for its full mounted lifetime.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [path]);
 
   // Resolve a Firebase Storage token URL for this tile when its local cache
   // file is missing or won't decode — a synced (remote) shot whose Rust
@@ -787,37 +851,58 @@ export const ThumbnailItem = memo(function ThumbnailItem({ path, onEdit, onRemov
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [directRemoteSrc, path]);
 
-  // Drag icon comes from the already-cached thumbnail BYTES (one temp-file
-  // write, memoized per path) — not the old canvas draw + toDataURL + serial
-  // temp-dir/save IPC round-trips against the full-res <img> on every drag.
   const beginDrag = () => {
-    (async () => {
-      let dragPath = path;
-      let deleteAfterDrag = false;
-      if (isCloudScreenshotPath(path)) {
-        const { ensureLocalScreenshot } = await import("@/lib/sync/screenshots");
-        dragPath = await ensureLocalScreenshot(path);
-        deleteAfterDrag = dragPath !== path;
-      }
-      let icon = dragPath; // full-res file itself as the fallback icon
+    if (dragActiveRef.current) return;
+    dragActiveRef.current = true;
+    onDragStateChange?.(true);
+    if (dragReleaseTimerRef.current) clearTimeout(dragReleaseTimerRef.current);
+    let started = false;
+    let finished = false;
+    let watchdog: ReturnType<typeof setTimeout> | null = null;
+    const finish = () => {
+      if (finished) return;
+      finished = true;
+      if (watchdog) clearTimeout(watchdog);
+      dragActiveRef.current = false;
+      pointerHeldRef.current = false;
+      onDragStateChange?.(false);
+    };
+    void (async () => {
       try {
-        const iconPath = await ensureDragIconPath(dragPath);
-        if (iconPath) icon = iconPath;
-      } catch {
-        // fall through with the full-res path
-      }
-      try {
-        await startDrag({ item: [dragPath], icon });
-      } catch (err) {
-        console.error("startDrag failed:", err);
-      } finally {
-        if (deleteAfterDrag) {
-          setTimeout(() => {
-            void import("@/lib/sync/screenshots").then(({ releaseTemporaryScreenshot }) =>
-              releaseTemporaryScreenshot(path, dragPath),
-            );
-          }, 60_000);
+        const prepared = await prepareDrag();
+        // Native drag must begin while mouse button is still held. Delayed
+        // cloud download after release previously spawned a ghost drag.
+        if (!mountedRef.current || !pointerHeldRef.current) return;
+        dragPreparationRef.current = null;
+        started = true;
+        try {
+          await startDrag({ item: [prepared.source.path], icon: prepared.icon }, ({ result }) => {
+            // Target apps may read file after macOS reports drop. Keep cloud
+            // copy briefly after success; cancellation needs no grace period.
+            const delay = result === "Dropped" ? 120_000 : 0;
+            setTimeout(() => {
+              void import("@/lib/sync/screenshots").then(({ releaseScreenshotDragSource }) =>
+                releaseScreenshotDragSource(prepared.source),
+              );
+            }, delay);
+            finish();
+          });
+          // A missed native completion callback must not pin the rail open.
+          if (!finished) watchdog = setTimeout(finish, 300_000);
+        } catch (error) {
+          const { releaseScreenshotDragSource } = await import("@/lib/sync/screenshots");
+          await releaseScreenshotDragSource(prepared.source);
+          finish();
+          throw error;
         }
+      } catch (error) {
+        console.error("startDrag failed:", error);
+        if (mountedRef.current) toast.error("Couldn't drag screenshot", {
+          description: error instanceof Error ? error.message : String(error),
+        });
+      } finally {
+        if (!started) releaseDragPreparation();
+        if (!started || finished) finish();
       }
     })();
   };
@@ -964,6 +1049,26 @@ export const ThumbnailItem = memo(function ThumbnailItem({ path, onEdit, onRemov
             ready ? "opacity-100" : "opacity-0"
           }`}
           draggable={!isUploading}
+          onMouseEnter={() => {
+            if (isUploading) return;
+            if (dragReleaseTimerRef.current) clearTimeout(dragReleaseTimerRef.current);
+            dragWarmTimerRef.current = setTimeout(() => {
+              void prepareDrag().catch(() => {});
+            }, 150);
+          }}
+          onMouseLeave={() => {
+            if (dragWarmTimerRef.current) clearTimeout(dragWarmTimerRef.current);
+            if (dragReleaseTimerRef.current) clearTimeout(dragReleaseTimerRef.current);
+            dragReleaseTimerRef.current = setTimeout(() => {
+              if (!dragActiveRef.current && !pointerHeldRef.current) releaseDragPreparation();
+            }, 10_000);
+          }}
+          onPointerDown={(event) => {
+            if (event.button !== 0 || isUploading) return;
+            pointerHeldRef.current = true;
+            if (dragWarmTimerRef.current) clearTimeout(dragWarmTimerRef.current);
+            void prepareDrag().catch(() => {});
+          }}
           onLoad={() => {
             readyRef.current = true;
             setReady(true);
@@ -971,7 +1076,7 @@ export const ThumbnailItem = memo(function ThumbnailItem({ path, onEdit, onRemov
           }}
           onDragStart={(e) => {
             e.preventDefault();
-            if (!isUploading) beginDrag();
+            if (!isUploading && pointerHeldRef.current) beginDrag();
           }}
           onError={() => {
             readyRef.current = false;
