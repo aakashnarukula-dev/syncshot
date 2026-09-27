@@ -21,4 +21,20 @@ describe("screenshot rail paths", () => {
     expect(omitPendingPaths(["keep", "deleting"], new Set(["deleting"])))
       .toEqual(["keep"]);
   });
+  it("replaces the cloud alias when an editor still names the original capture", () => {
+    const identity = (path: string) => path === "local-original" || path.startsWith("cloud-original") ? "original-id" : path;
+    expect(replaceRailPath(["newest", "cloud-original?v=1", "oldest"], "local-original", "crop", identity))
+      .toEqual(["newest", "crop", "oldest"]);
+  });
+
+  it("keeps the original hidden when its upload acquires a cloud identity later", () => {
+    const mapping: Record<string, string> = {};
+    const identity = (path: string) => mapping[path] ?? path;
+    const pending = new Set(["local-original"]);
+    expect(omitPendingPaths(["local-original", "crop"], pending, identity)).toEqual(["crop"]);
+    mapping["local-original"] = "original-id";
+    mapping["cloud-original?v=1"] = "original-id";
+    expect(omitPendingPaths(["cloud-original?v=1", "crop"], pending, identity)).toEqual(["crop"]);
+  });
+
 });

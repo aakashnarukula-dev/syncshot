@@ -37,6 +37,14 @@ import {
   orderScreenshotsByCreatedAt,
 } from "@/lib/sync/order";
 import { omitPendingPaths, replaceRailPath } from "@/lib/railPaths";
+
+// A capture can change from a staging path to a cloud URL while its editor is
+// open. Compare both names by the same identity, including late upload maps.
+function railIdentity(path: string): string {
+  const id = cloudScreenshotId(path) ?? useSyncStore.getState().localCaptureDocIds[path];
+  return id ? `cloud:${id}` : path;
+}
+
 // Startup-critical: static import so it ships in the entry chunk and never
 // needs a runtime protocol fetch that can stall behind the launch IPC burst.
 import { ScreenshotThumbnail } from "./components/ScreenshotThumbnail";
@@ -448,6 +456,7 @@ function MainApp() {
   // still running. Suppress those paths until the operation settles so an
   // optimistic delete/replace cannot visually resurrect the old screenshot.
   const pendingRemovalPathsRef = useRef<Set<string>>(new Set());
+  const editorReplacedPathsRef = useRef<Set<string>>(new Set());
   // Editor crops can arrive faster than Storage/Firestore round-trips. Process
   // replacements in order: publish crop N before crop N+1 removes its file.
   const editorReplacementQueueRef = useRef<Promise<void>>(Promise.resolve());
@@ -711,8 +720,8 @@ function MainApp() {
   const mergeThumbPages = useCallback((incoming: string[]) => {
     return updateThumbs((current) => {
       const seen = new Set<string>();
-      const visibleIncoming = omitPendingPaths(incoming, pendingRemovalPathsRef.current);
-      const visibleCurrent = omitPendingPaths(current, pendingRemovalPathsRef.current);
+      const visibleIncoming = omitPendingPaths(incoming, pendingRemovalPathsRef.current, railIdentity);
+      const visibleCurrent = omitPendingPaths(current, pendingRemovalPathsRef.current, railIdentity);
       const merged = [...visibleIncoming, ...visibleCurrent].filter((path) => {
         if (seen.has(path)) return false;
         seen.add(path);
@@ -741,11 +750,12 @@ function MainApp() {
   // the clipboard).
   useEffect(() => {
     registerRenameCapturePath((from, to) => {
+      if (!omitPendingPaths([from], pendingRemovalPathsRef.current, railIdentity).length) return;
       void cloneThumb(from, to)
         .catch(() => {})
         .finally(() => {
           updateThumbs((prev) =>
-            prev.includes(from) ? replaceRailPath(prev, from, to) : prev,
+            prev.includes(from) ? replaceRailPath(prev, from, to, railIdentity) : prev,
           );
           dropThumb(from);
         });
@@ -859,7 +869,7 @@ function MainApp() {
   // enables local copy/edit without waiting for the 2.5s folder poll.
   useEffect(() => {
     registerIncomingScreenshotPreview((_item, cloudPath) => {
-      if (pendingRemovalPathsRef.current.has(cloudPath)) return;
+      if (!omitPendingPaths([cloudPath], pendingRemovalPathsRef.current, railIdentity).length) return;
       const next = mergeThumbPages([cloudPath]);
 
       if (modeRef.current === "pairing" || modeRef.current === "preferences") return;
@@ -890,7 +900,7 @@ function MainApp() {
     });
 
     registerIncomingScreenshotSaved((item, cloudPath) => {
-      if (pendingRemovalPathsRef.current.has(cloudPath)) return;
+      if (!omitPendingPaths([cloudPath], pendingRemovalPathsRef.current, railIdentity).length) return;
       if (settingsRef.current.copyToClipboard) {
         import("@/lib/sync/screenshots")
           .then(({ copyScreenshotToClipboard }) =>
@@ -1139,7 +1149,9 @@ function MainApp() {
       // returns can expose old + edited tiles for one listener round-trip.
       for (const path of pendingRemovalPathsRef.current) {
         const id = cloudScreenshotId(path) ?? state.localCaptureDocIds[path];
-        if (id && !cloudIds.has(id)) pendingRemovalPathsRef.current.delete(path);
+        if (id && !cloudIds.has(id) && !editorReplacedPathsRef.current.has(path)) {
+          pendingRemovalPathsRef.current.delete(path);
+        }
       }
       updateThumbs((current) => {
         const staged = current.filter((path) => {
@@ -1158,7 +1170,7 @@ function MainApp() {
         const cloud = state.screenshots
           .filter((item) => !stagedCloudIds.has(item.id))
           .map((item) => cloudScreenshotPath(item.id, item.sha256));
-        const next = omitPendingPaths([...staged, ...cloud], pendingRemovalPathsRef.current);
+        const next = omitPendingPaths([...staged, ...cloud], pendingRemovalPathsRef.current, railIdentity);
         const seen = new Set<string>();
         return next.filter((path) => !seen.has(path) && !!seen.add(path));
       });
@@ -1423,8 +1435,9 @@ function MainApp() {
           if (previewDataUrl) cacheThumbDataUrl(newPath, previewDataUrl);
           if (originalPath && originalPath !== newPath) {
             pendingRemovalPathsRef.current.add(originalPath);
+            editorReplacedPathsRef.current.add(originalPath);
           }
-          updateThumbs((prev) => replaceRailPath(prev, originalPath, newPath));
+          updateThumbs((prev) => replaceRailPath(prev, originalPath, newPath, railIdentity));
           dropThumb(originalPath);
 
           const replacement = editorReplacementQueueRef.current
@@ -1432,7 +1445,7 @@ function MainApp() {
             .then(async () => {
               const { uid } = useSyncStore.getState();
               if (uid) {
-                const [{ deleteScreenshotByPath, findDocForCachePath, publishScreenshotReplacement }, { getDevice }] = await Promise.all([
+                const [{ deleteScreenshotByPath, findDocForCachePath, publishScreenshotReplacement, waitForScreenshotPublish }, { getDevice }] = await Promise.all([
                   import("@/lib/sync/screenshots"),
                   import("@/lib/sync/engine"),
                 ]);
@@ -1440,10 +1453,19 @@ function MainApp() {
                 if (!device) throw new Error("Sync device unavailable");
                 // Upload replacement first. Old cloud image stays valid until
                 // the new thumb/full are safely stored.
-                const originalDocId = originalPath
-                  ? findDocForCachePath(originalPath)?.id ?? cloudScreenshotId(originalPath)
-                  : null;
                 const result = await publishScreenshotReplacement(uid, device, newPath);
+                await waitForScreenshotPublish(originalPath);
+                const originalDocId = originalPath
+                  ? findDocForCachePath(originalPath)?.id ?? cloudScreenshotId(originalPath) ?? useSyncStore.getState().localCaptureDocIds[originalPath]
+                  : null;
+                if (result?.docId === originalDocId) {
+                  // An unchanged export reuses the old cloud object.
+                  pendingRemovalPathsRef.current.delete(originalPath);
+                  editorReplacedPathsRef.current.delete(originalPath);
+                  if (!editorReplacedPathsRef.current.has(newPath)) {
+                    updateThumbs((prev) => replaceRailPath(prev, newPath, result.cloudPath, railIdentity));
+                  }
+                }
                 // An unchanged export can dedupe to the original document.
                 // Never delete the document that now backs the replacement.
                 if (
@@ -1462,15 +1484,7 @@ function MainApp() {
             .catch((error) => {
               console.error("edited screenshot replacement failed:", error);
               toast.error("Could not sync edited screenshot", { duration: 5000 });
-            })
-            .finally(() => {
-              if (originalPath && originalPath !== newPath) {
-                const state = useSyncStore.getState();
-                const id = cloudScreenshotId(originalPath) ?? state.localCaptureDocIds[originalPath];
-                if (!id) pendingRemovalPathsRef.current.delete(originalPath);
-              }
             });
-          toast.success("Screenshot copied to clipboard", { duration: 2000 });
         }
       );
       unlisten6 = await listen("editor-closed", () => {

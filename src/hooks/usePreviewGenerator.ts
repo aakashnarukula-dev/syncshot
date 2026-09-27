@@ -1,6 +1,6 @@
 import { useRef, useEffect, useCallback, useState, useMemo } from "react";
 import { EditorSettings } from "@/stores/editorStore";
-import { createHighQualityCanvas } from "@/lib/canvas-utils";
+import { createHighQualityCanvas, type EditorBitmap } from "@/lib/canvas-utils";
 import { drawAnnotationOnCanvas } from "@/lib/annotation-utils";
 import { Annotation } from "@/types/annotations";
 
@@ -138,14 +138,14 @@ function applyNoise(canvas: HTMLCanvasElement, noiseAmount: number) {
 }
 
 export interface PreviewGeneratorOptions {
-  screenshotImage: HTMLImageElement | null;
+  screenshotImage: EditorBitmap | null;
   settings: EditorSettings;
   canvasRef: React.RefObject<HTMLCanvasElement | null>;
   padding?: number;
 }
 
 export interface PreviewGeneratorResult {
-  previewUrl: string | null;
+  previewImage: EditorBitmap | null;
   isGenerating: boolean;
   error: string | null;
   renderHighQualityCanvas: (annotations: Annotation[]) => Promise<HTMLCanvasElement | null>;
@@ -164,11 +164,10 @@ export function usePreviewGenerator({
   canvasRef,
   padding = 100,
 }: PreviewGeneratorOptions): PreviewGeneratorResult {
-  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+  const [previewImage, setPreviewImage] = useState<EditorBitmap | null>(null);
   const [isGenerating, setIsGenerating] = useState(false);
   const [error, setError] = useState<string | null>(null);
   
-  const previewUrlRef = useRef<string | null>(null);
   const renderIdRef = useRef(0);
   const debounceTimerRef = useRef<NodeJS.Timeout | null>(null);
   const pendingSettingsRef = useRef<EditorSettings | null>(null);
@@ -195,7 +194,7 @@ export function usePreviewGenerator({
     if (!screenshotImage || !canvasRef.current) return;
 
     const currentRenderId = ++renderIdRef.current;
-    const canvas = canvasRef.current;
+    const canvas = document.createElement("canvas");
 
     const bgWidth = screenshotImage.width + padding * 2;
     const bgHeight = screenshotImage.height + padding * 2;
@@ -276,17 +275,10 @@ export function usePreviewGenerator({
 
       if (currentRenderId !== renderIdRef.current) return;
 
-      canvas.toBlob((blob) => {
-        if (blob && currentRenderId === renderIdRef.current) {
-          if (previewUrlRef.current) {
-            URL.revokeObjectURL(previewUrlRef.current);
-          }
-          const url = URL.createObjectURL(blob);
-          previewUrlRef.current = url;
-          setPreviewUrl(url);
-          setIsGenerating(false);
-        }
-      }, "image/png");
+      // Keep decoded pixels in memory. Previewing must never wait for PNG
+      // compression or a second image decode.
+      setPreviewImage(canvas);
+      setIsGenerating(false);
     } catch (err) {
       if (currentRenderId === renderIdRef.current) {
         const message = err instanceof Error ? err.message : String(err);
@@ -299,7 +291,11 @@ export function usePreviewGenerator({
 
   // Debounced preview generation
   useEffect(() => {
-    if (!screenshotImage || !canvasRef.current) return;
+    if (!screenshotImage) {
+      renderIdRef.current += 1;
+      setPreviewImage(null);
+      return;
+    }
 
     // Cancel any pending debounce
     if (debounceTimerRef.current) {
@@ -313,13 +309,9 @@ export function usePreviewGenerator({
     if (padding === 0 && settings.borderRadius === 0) {
       renderIdRef.current += 1;
       pendingSettingsRef.current = null;
-      if (previewUrlRef.current) {
-        URL.revokeObjectURL(previewUrlRef.current);
-        previewUrlRef.current = null;
-      }
       setError(null);
       setIsGenerating(false);
-      setPreviewUrl(screenshotImage.src);
+      setPreviewImage(screenshotImage);
       return;
     }
 
@@ -351,15 +343,6 @@ export function usePreviewGenerator({
     canvasRef,
     generatePreview,
   ]);
-
-  // Cleanup preview URL on unmount
-  useEffect(() => {
-    return () => {
-      if (previewUrlRef.current) {
-        URL.revokeObjectURL(previewUrlRef.current);
-      }
-    };
-  }, []);
 
   // High quality canvas render for save/copy
   const renderHighQualityCanvas = useCallback(
@@ -407,7 +390,7 @@ export function usePreviewGenerator({
   );
 
   return {
-    previewUrl,
+    previewImage,
     isGenerating,
     error,
     renderHighQualityCanvas,

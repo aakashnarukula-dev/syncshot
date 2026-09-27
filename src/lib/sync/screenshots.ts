@@ -389,16 +389,31 @@ export async function publishImportedImage(
  * Publish a locally-captured screenshot file at `path` to the library.
  * No-op (returns false) if an identical image (same sha256) already exists.
  */
-export async function publishScreenshot(
+const capturePublications = new Map<string, Promise<boolean>>();
+
+/** A crop can finish before the original capture upload. Deletion must wait
+ * for that upload so a late setDoc cannot bring the original back. */
+export async function waitForScreenshotPublish(path: string): Promise<void> {
+  await capturePublications.get(path);
+}
+
+export function publishScreenshot(
   uid: string,
   device: DeviceRef,
   path: string,
 ): Promise<boolean> {
-  const outcome = await publishScreenshotDetailed(uid, device, path, true, true);
-  // Captures and editor exports are staging files only. Firebase is the
-  // screenshot library; remove the staging file after full upload/dedupe.
-  await invoke("delete_file", { path }).catch(() => {});
-  return outcome.published;
+  const existing = capturePublications.get(path);
+  if (existing) return existing;
+  const pending = (async () => {
+    const outcome = await publishScreenshotDetailed(uid, device, path, true, true);
+    await invoke("delete_file", { path }).catch(() => {});
+    return outcome.published;
+  })();
+  capturePublications.set(path, pending);
+  void pending.finally(() => {
+    if (capturePublications.get(path) === pending) capturePublications.delete(path);
+  }).catch(() => {});
+  return pending;
 }
 
 /** Publish an editor replacement and reveal which cloud document owns it.
@@ -1119,8 +1134,9 @@ export async function deleteScreenshotByPath(
   path: string,
 ): Promise<void> {
   const direct = findDocForCachePath(path);
-  if (direct) {
-    await deleteDocAndBlobs(uid, direct.id, direct.thumbPath, direct.fullPath);
+  const knownId = direct?.id ?? cloudScreenshotId(path) ?? useSyncStore.getState().localCaptureDocIds[path];
+  if (knownId) {
+    await deleteDocAndBlobs(uid, knownId, direct?.thumbPath, direct?.fullPath);
     if (!isCloudScreenshotPath(path)) {
       await invoke("delete_file", { path }).catch(() => {});
     }

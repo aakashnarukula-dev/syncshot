@@ -1,3 +1,4 @@
+import type { EditorBitmap } from "@/lib/canvas-utils";
 import { useRef, useEffect, useState, useCallback, memo } from "react";
 import { Annotation, ToolType, Point } from "@/types/annotations";
 import { drawAnnotationOnCanvas } from "@/lib/annotation-utils";
@@ -95,7 +96,7 @@ interface AnnotationCanvasProps {
   annotations: Annotation[];
   selectedAnnotation: Annotation | null;
   selectedTool: ToolType;
-  previewUrl: string | null;
+  previewImage: EditorBitmap | null;
   showTransparencyGrid?: boolean;
   /** Color applied to newly created annotations */
   activeColor?: string;
@@ -116,7 +117,7 @@ export const AnnotationCanvas = memo(function AnnotationCanvas({
   annotations,
   selectedAnnotation,
   selectedTool,
-  previewUrl,
+  previewImage,
   showTransparencyGrid = false,
   activeColor = "#FF3300",
   onAnnotationAdd,
@@ -128,7 +129,7 @@ export const AnnotationCanvas = memo(function AnnotationCanvas({
 }: AnnotationCanvasProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
-  const imageRef = useRef<HTMLImageElement | null>(null);
+  const imageRef = useRef<EditorBitmap | null>(null);
   const rafRef = useRef<number | null>(null);
   const readyNotifiedRef = useRef(false);
   
@@ -156,28 +157,12 @@ export const AnnotationCanvas = memo(function AnnotationCanvas({
   const dragStartAnnotationRef = useRef<Annotation | null>(null);
   const resizeStartAnnotationRef = useRef<Annotation | null>(null);
 
-  // Load image once and cache it
+  // Preview pixels are already decoded. Crops swap their canvas directly.
   useEffect(() => {
-    if (!previewUrl) {
-      imageRef.current = null;
-      setImageLoaded(false);
-      return;
-    }
-
-    setImageLoaded(false);
+    imageRef.current = previewImage;
     readyNotifiedRef.current = false;
-
-    const img = new Image();
-    img.onload = () => {
-      imageRef.current = img;
-      setImageLoaded(true);
-    };
-    img.src = previewUrl;
-
-    return () => {
-      img.onload = null;
-    };
-  }, [previewUrl]);
+    setImageLoaded(!!previewImage);
+  }, [previewImage]);
 
   // Cleanup RAF on unmount
   useEffect(() => {
@@ -705,7 +690,7 @@ export const AnnotationCanvas = memo(function AnnotationCanvas({
 
       ctx.restore();
     }
-  }, [imageLoaded, annotations, selectedAnnotation, isDrawing, startPoint, currentPoint, selectedTool, drawAnnotation, createAnnotation, hoveredHandleId, editingTextId, cropRect]);
+  }, [previewImage, imageLoaded, annotations, selectedAnnotation, isDrawing, startPoint, currentPoint, selectedTool, drawAnnotation, createAnnotation, hoveredHandleId, editingTextId, cropRect]);
 
   useEffect(() => {
     redraw();
@@ -723,7 +708,7 @@ export const AnnotationCanvas = memo(function AnnotationCanvas({
       setCropRect(null);
       cropActionRef.current = null;
     }
-  }, [selectedTool, previewUrl]);
+  }, [selectedTool, previewImage]);
 
   // Picking the crop tool drops a frame around the whole image automatically —
   // the user drags the handles inward instead of drawing a box from scratch.
@@ -1153,7 +1138,7 @@ export const AnnotationCanvas = memo(function AnnotationCanvas({
     }
   };
 
-  if (!previewUrl) {
+  if (!previewImage) {
     return null;
   }
 

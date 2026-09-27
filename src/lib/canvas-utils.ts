@@ -1,7 +1,9 @@
 import type { ShadowSettings } from "@/stores/editorStore";
 
+export type EditorBitmap = HTMLImageElement | HTMLCanvasElement;
+
 export interface RenderOptions {
-  image: HTMLImageElement;
+  image: EditorBitmap;
   backgroundType: "transparent" | "white" | "black" | "gray" | "gradient" | "custom" | "image";
   customColor: string;
   selectedImage: string | null;

@@ -4626,7 +4626,7 @@ dependencies = [
 
 [[package]]
 name = "syncshot"
-version = "0.2.20"
+version = "0.2.21"
 dependencies = [
  "base64 0.22.1",
  "dirs 5.0.1",
@@ -4634,6 +4634,7 @@ dependencies = [
  "objc2 0.5.2",
  "objc2 0.6.4",
  "objc2-app-kit",
+ "objc2-foundation",
  "reqwest",
  "serde",
  "serde_json",

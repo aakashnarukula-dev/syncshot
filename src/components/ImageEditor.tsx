@@ -1,3 +1,5 @@
+import { createEditorPersistence, type EditorSaveSession } from "@/lib/editorPersistence";
+import type { EditorBitmap } from "@/lib/canvas-utils";
 import { useState, useRef, useEffect, useCallback } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow, LogicalSize, availableMonitors } from "@tauri-apps/api/window";
@@ -81,14 +83,6 @@ function makeOptimisticThumbnail(canvas: HTMLCanvasElement): string {
   return thumb.toDataURL("image/webp", 0.78);
 }
 
-/** Where saves land — read fresh on every save so pref changes apply to a reused window. */
-async function loadSaveDir(): Promise<string> {
-  try {
-    return await invoke<string>("get_temp_directory");
-  } catch {}
-  return "";
-}
-
 export function ImageEditor({ imagePath }: ImageEditorProps) {
   // Use Zustand store with selectors for optimized re-renders
   const settings = useSettings();
@@ -106,12 +100,12 @@ export function ImageEditor({ imagePath }: ImageEditorProps) {
     nonce: 0,
   }));
   // True from "new image requested" until the preview for it lands — the hook
-  // keeps the PREVIOUS session's previewUrl until it regenerates, so render a
+  // keeps the PREVIOUS session's preview bitmap until it regenerates, so render a
   // loading state instead of flashing the old screenshot.
   const [awaitingPreview, setAwaitingPreview] = useState(false);
 
   // Screenshot image state
-  const [screenshotImage, setScreenshotImage] = useState<HTMLImageElement | null>(null);
+  const [screenshotImage, setScreenshotImage] = useState<EditorBitmap | null>(null);
   const [imageLoaded, setImageLoaded] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
   
@@ -134,14 +128,15 @@ export function ImageEditor({ imagePath }: ImageEditorProps) {
   const [activeColor, setActiveColor] = useState("#FF3300");
 
   // Crop undo stack — base image isn't in the store, so crops undo locally.
-  const cropUndoRef = useRef<Array<{ image: HTMLImageElement; annotations: Annotation[]; settings: EditorSettings }>>([]);
+  const cropUndoRef = useRef<Array<{ image: EditorBitmap; annotations: Annotation[]; settings: EditorSettings }>>([]);
 
   // Tracks the path represented by the latest persisted editor result. Every
   // crop/save creates a replacement file; the main window serially removes the
   // previous local/cloud version. Unique paths keep rapid edits race-free and
   // force the thumbnail/webview to decode the new bytes immediately.
-  const lastCropPathRef = useRef<string | null>(null);
-  const editorPersistQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const saveSessionRef = useRef<EditorSaveSession>({ path: imagePath });
+  const persistRef = useRef<ReturnType<typeof createEditorPersistence> | null>(null);
+  if (!persistRef.current) persistRef.current = createEditorPersistence();
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
@@ -154,7 +149,7 @@ export function ImageEditor({ imagePath }: ImageEditorProps) {
   const autoCopiedNonceRef = useRef<number>(-1);
 
   // Preview generator hook
-  const { previewUrl, error: previewError, renderHighQualityCanvas } = usePreviewGenerator({
+  const { previewImage, error: previewError, renderHighQualityCanvas } = usePreviewGenerator({
     screenshotImage,
     settings,
     canvasRef,
@@ -177,7 +172,7 @@ export function ImageEditor({ imagePath }: ImageEditorProps) {
   const resetEditorSession = useCallback(() => {
     editorActions.reset();
     cropUndoRef.current = [];
-    lastCropPathRef.current = null;
+    saveSessionRef.current = { path: "" };
     setSelectedAnnotation(null);
     setSelectedTool("select");
     setShowCloseConfirm(false);
@@ -190,6 +185,7 @@ export function ImageEditor({ imagePath }: ImageEditorProps) {
 
   const openImage = useCallback((source: EditorPendingSource) => {
     resetEditorSession();
+    saveSessionRef.current = { path: source.imagePath };
     editorActions.initialize();
     setAwaitingPreview(true);
     setOpenReq((prev) => ({
@@ -279,11 +275,11 @@ export function ImageEditor({ imagePath }: ImageEditorProps) {
     restoreWindowState();
   }, [openReq]);
 
-  // The preview hook keeps the previous previewUrl until it regenerates for
+  // The preview hook keeps the previous bitmap until it regenerates for
   // the new image; any change after an open means the fresh one landed.
   useEffect(() => {
-    if (previewUrl) setAwaitingPreview(false);
-  }, [previewUrl]);
+    if (previewImage) setAwaitingPreview(false);
+  }, [previewImage]);
 
   // Load main screenshot image
   useEffect(() => {
@@ -586,41 +582,9 @@ export function ImageEditor({ imagePath }: ImageEditorProps) {
     try { await win.setFocus(); } catch {}
   }, [openReq.nonce, openReq.path]);
 
-  // Serialize crop/save writes inside the editor too. A crop export and a fast
-  // Save click can otherwise both read the same previous path, producing two
-  // sibling replacements before the main window has a chance to process them.
-  const persistEditedImage = useCallback((dataUrl: string, previewDataUrl = ""): Promise<string> => {
-    let resolvePath!: (path: string) => void;
-    let rejectPath!: (reason: unknown) => void;
-    const result = new Promise<string>((resolve, reject) => {
-      resolvePath = resolve;
-      rejectPath = reject;
-    });
-
-    editorPersistQueueRef.current = editorPersistQueueRef.current
-      .catch(() => {})
-      .then(async () => {
-        try {
-          const saveDir = await loadSaveDir();
-          if (!saveDir) throw new Error("Save directory not set");
-          const previousPath = lastCropPathRef.current ?? openReq.path;
-          const newPath = await invoke<string>("save_edited_image", {
-            imageData: dataUrl,
-            saveDir,
-            copyToClip: true,
-          });
-          lastCropPathRef.current = newPath;
-          try {
-            await emit("editor-saved", { originalPath: previousPath, newPath, previewDataUrl });
-          } catch {}
-          resolvePath(newPath);
-        } catch (error) {
-          rejectPath(error);
-        }
-      });
-
-    return result;
-  }, [openReq.path]);
+  const persistEditedImage = useCallback((canvas: HTMLCanvasElement, previewDataUrl: string) => {
+    return persistRef.current!(saveSessionRef.current, canvas, previewDataUrl);
+  }, []);
 
   // Save handler — persists to the save dir + clipboard, notifies the main
   // window, then hides this one (was EditorOnlyApp's onSave + destroy).
@@ -632,18 +596,7 @@ export function ImageEditor({ imagePath }: ImageEditorProps) {
       const highQualityCanvas = await renderHighQualityCanvas(annotations);
       if (!highQualityCanvas) return;
 
-      const blob = await new Promise<Blob | null>((resolve) =>
-        highQualityCanvas.toBlob(resolve, "image/png", 1.0),
-      );
-      if (!blob) return;
-      const dataUrl = await new Promise<string>((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onloadend = () => resolve(reader.result as string);
-        reader.onerror = () => reject(new Error("Failed to read image data"));
-        reader.readAsDataURL(blob);
-      });
-
-      await persistEditedImage(dataUrl, makeOptimisticThumbnail(highQualityCanvas));
+      await persistEditedImage(highQualityCanvas, makeOptimisticThumbnail(highQualityCanvas));
       await closeEditor();
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -669,8 +622,7 @@ export function ImageEditor({ imagePath }: ImageEditorProps) {
         return;
       }
 
-      const dataUrl = highQualityCanvas.toDataURL("image/png");
-      await persistEditedImage(dataUrl, makeOptimisticThumbnail(highQualityCanvas));
+      await persistEditedImage(highQualityCanvas, makeOptimisticThumbnail(highQualityCanvas));
       
       toast.success("Screenshot copied to clipboard!", {
         duration: 2000,
@@ -754,9 +706,9 @@ export function ImageEditor({ imagePath }: ImageEditorProps) {
   // Persist a crop without closing. The main window receives an explicit
   // replacement event immediately; it swaps the live tile, removes the prior
   // local/cloud object, and publishes only this cropped result.
-  const exportCrop = useCallback(async (dataUrl: string, previewDataUrl: string) => {
+  const exportCrop = useCallback(async (canvas: HTMLCanvasElement, previewDataUrl: string) => {
     try {
-      await persistEditedImage(dataUrl, previewDataUrl);
+      await persistEditedImage(canvas, previewDataUrl);
       toast.success("Cropped screenshot saved & copied", { duration: 2000 });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -770,61 +722,44 @@ export function ImageEditor({ imagePath }: ImageEditorProps) {
   //      annotation objects offset so they stay editable over the cropped base.
   // Both canvases share the preview's dimensions, so the rect maps 1:1.
   const handleCrop = useCallback(async (rect: { x: number; y: number; width: number; height: number }) => {
-    if (!previewUrl || !screenshotImage) return;
-
-    // 1. Baked composite (annotations included) for the saved file + clipboard.
-    const baked = await renderHighQualityCanvas(annotations);
-    if (!baked) return;
+    if (!previewImage || !screenshotImage) return;
 
     const sx = Math.max(0, Math.round(rect.x));
     const sy = Math.max(0, Math.round(rect.y));
-    const sw = Math.min(baked.width - sx, Math.round(rect.width));
-    const sh = Math.min(baked.height - sy, Math.round(rect.height));
+    const sw = Math.min(previewImage.width - sx, Math.round(rect.width));
+    const sh = Math.min(previewImage.height - sy, Math.round(rect.height));
     if (sw < 1 || sh < 1) return;
 
-    const cropTo = (src: CanvasImageSource) => {
-      const c = document.createElement("canvas");
-      c.width = sw;
-      c.height = sh;
-      c.getContext("2d")!.drawImage(src, sx, sy, sw, sh, 0, 0, sw, sh);
-      return {
-        dataUrl: c.toDataURL("image/png"),
-        previewDataUrl: makeOptimisticThumbnail(c),
-      };
+    const cropTo = (source: CanvasImageSource) => {
+      const canvas = document.createElement("canvas");
+      canvas.width = sw;
+      canvas.height = sh;
+      canvas.getContext("2d")!.drawImage(source, sx, sy, sw, sh, 0, 0, sw, sh);
+      return canvas;
     };
-
-    const exported = cropTo(baked);
-
-    // 2. Annotation-free composite (the preview) becomes the editable base image.
-    const baseSrc = new Image();
-    baseSrc.onload = () => {
-      const baseDataUrl = cropTo(baseSrc).dataUrl;
-      const newBase = new Image();
-      newBase.onload = () => {
-        cropUndoRef.current.push({
-          image: screenshotImage,
-          annotations: annotations.map((a) => ({ ...a })),
-          settings: { ...settings },
-        });
-        setScreenshotImage(newBase);
-        // Background/padding are baked into the cropped base — flatten the rest.
-        useEditorStore.getState().updateSettingsTransient({
-          padding: 0,
-          borderRadius: 0,
-          backgroundType: "transparent",
-          noiseAmount: 0,
-        });
-        // Keep annotations editable, shifted to the new origin.
-        actions.setAnnotations(annotations.map((a) => offsetAnnotation(a, -sx, -sy)));
-        setSelectedAnnotation(null);
-        setSelectedTool("select");
-        // Save to the screenshots folder + clipboard, like a normal capture.
-        void exportCrop(exported.dataUrl, exported.previewDataUrl);
-      };
-      newBase.src = baseDataUrl;
-    };
-    baseSrc.src = previewUrl;
-  }, [previewUrl, screenshotImage, annotations, settings, actions, renderHighQualityCanvas, exportCrop]);
+    const newBase = cropTo(previewImage);
+    // Snapshot export before changing editor state. Annotations stay editable
+    // on the new base; only the saved output has them baked in.
+    const baked = annotations.length ? await renderHighQualityCanvas(annotations) : null;
+    if (annotations.length && !baked) return;
+    const exported = baked ? cropTo(baked) : newBase;
+    cropUndoRef.current.push({
+      image: screenshotImage,
+      annotations: annotations.map((a) => ({ ...a })),
+      settings: { ...settings },
+    });
+    setScreenshotImage(newBase);
+    useEditorStore.getState().updateSettingsTransient({
+      padding: 0,
+      borderRadius: 0,
+      backgroundType: "transparent",
+      noiseAmount: 0,
+    });
+    actions.setAnnotations(annotations.map((a) => offsetAnnotation(a, -sx, -sy)));
+    setSelectedAnnotation(null);
+    setSelectedTool("select");
+    void exportCrop(exported, makeOptimisticThumbnail(exported));
+  }, [previewImage, screenshotImage, annotations, settings, actions, renderHighQualityCanvas, exportCrop]);
 
   const handleCropUndo = useCallback((): boolean => {
     const snap = cropUndoRef.current.pop();
@@ -945,13 +880,13 @@ export function ImageEditor({ imagePath }: ImageEditorProps) {
       </div>
 
       <div className="flex-1 flex items-center justify-center min-w-0 min-h-0 overflow-hidden">
-        {previewUrl && !awaitingPreview ? (
+        {previewImage && !awaitingPreview ? (
           <AnnotationCanvas
             key={openReq.nonce}
             annotations={annotations}
             selectedAnnotation={selectedAnnotation}
             selectedTool={selectedTool}
-            previewUrl={previewUrl}
+            previewImage={previewImage}
             showTransparencyGrid={false}
             activeColor={activeColor}
             onAnnotationAdd={handleAnnotationAdd}

@@ -1,6 +1,6 @@
 [package]
 name = "syncshot"
-version = "0.2.20"
+version = "0.2.21"
 description = "SyncShot — fast screenshot capture, edit, and share"
 authors = ["kartik labhshetwar"]
 edition = "2021"
@@ -44,7 +44,8 @@ objc2 = "0.5"
 # but drops its vertical origin. Read NSScreen.visibleFrame directly so the
 # collapsed pill and expanded rail share the exact same usable-screen centre.
 objc2-modern = { package = "objc2", version = "0.6" }
-objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSScreen"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSScreen", "NSView", "NSWindow", "NSResponder", "NSTrackingArea"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSDictionary", "NSString"] }
 
 # Desktop-only: prevents a second app instance (autostart + manual launch) from
 # registering a duplicate global shortcut and spawning a second column window.

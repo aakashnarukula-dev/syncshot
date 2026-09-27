@@ -1,3 +1,4 @@
+import { useSyncStore } from "@/stores/syncStore";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { DeviceRef, ScreenshotDoc } from "./types";
 
@@ -96,6 +97,19 @@ describe("cacheDocId", () => {
 });
 
 describe("deleteScreenshotByPath", () => {
+  it("deletes a newly uploaded original before its snapshot arrives and after staging cleanup", async () => {
+    useSyncStore.getState().mapLocalCapture("/tmp/original.png", "uploaded-id");
+    invokeMock.mockResolvedValue(undefined);
+    try {
+      await deleteScreenshotByPath(UID, "/tmp/original.png");
+      expect(deleteDoc).toHaveBeenCalledWith(expect.objectContaining({ __doc: "uploaded-id" }));
+      expect(invokeMock).not.toHaveBeenCalledWith("read_image_bytes", expect.anything());
+      expect(getDocs).not.toHaveBeenCalled();
+    } finally {
+      useSyncStore.getState().reset();
+    }
+  });
+
   it("hashes the file, finds the doc by sha256, sweeps both blobs + the doc, then the local file", async () => {
     // Local bytes now come from Rust IPC (read_image_bytes), NOT a CORS
     // asset:// fetch — the release localhost origin can't CORS-load asset://.

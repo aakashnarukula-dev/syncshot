@@ -9,13 +9,15 @@ mod clipboard;
 mod commands;
 mod image;
 mod license;
+#[cfg(target_os = "macos")]
+mod rail_interaction;
 mod screenshot;
 mod utils;
 
 use auth::{browser_auth_listen, close_auth_window};
 use commands::{
     capture_all_monitors, capture_once, capture_region, clear_remote_image_cache,
-    copy_remote_image_to_clipboard, copy_to_clipboard, cursor_display_bounds, delete_file,
+    copy_png_bytes_to_clipboard, copy_remote_image_to_clipboard, copy_to_clipboard, cursor_display_bounds, delete_file,
     download_temporary_image, file_exists, get_desktop_directory, get_desktop_root,
     get_mouse_position, get_screenshot_thumbnail, get_screenshot_thumbnail_path,
     get_temp_directory, list_screenshot_sources, list_screenshots, list_screenshots_from_dirs,
@@ -181,7 +183,10 @@ fn set_pill_all_spaces(app: tauri::AppHandle, enable: bool) -> Result<(), String
     {
         use tauri::Manager;
         match app.get_webview_window("main") {
-            Some(window) => apply_all_spaces_behavior(&window, enable),
+            Some(window) => {
+                apply_all_spaces_behavior(&window, enable)?;
+                rail_interaction::configure(&window, enable).map_err(|error| error.to_string())
+            }
             None => Err("main window not found".to_string()),
         }
     }
@@ -328,6 +333,9 @@ pub fn run() {
                 if let Err(e) = apply_all_spaces_behavior(&window, true) {
                     eprintln!("Failed to set all-Spaces behavior on pill window: {}", e);
                 }
+                if let Err(e) = rail_interaction::configure(&window, true) {
+                    eprintln!("Failed to enable inactive rail mouse tracking: {}", e);
+                }
             }
 
             // Pre-warm the singleton editor window (hidden) so the first
@@ -425,6 +433,7 @@ pub fn run() {
             save_edited_image_bytes,
             save_native_screenshot,
             copy_to_clipboard,
+            copy_png_bytes_to_clipboard,
             copy_remote_image_to_clipboard,
             prefetch_remote_images,
             clear_remote_image_cache,

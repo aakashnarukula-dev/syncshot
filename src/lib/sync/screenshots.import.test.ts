@@ -40,7 +40,7 @@ vi.mock("firebase/firestore", () => ({
 }));
 
 import { registerRenameCapturePath, useSyncStore } from "@/stores/syncStore";
-import { publishImportedImage } from "./screenshots";
+import { publishImportedImage, publishScreenshot, waitForScreenshotPublish } from "./screenshots";
 
 const DEVICE: DeviceRef = {
   uid: "u1",
@@ -100,6 +100,26 @@ describe("publishImportedImage", () => {
     );
     expect(swaps).toEqual([[staging, "syncshot-cloud://new-doc?v=sha-import"]]);
     expect(result.cloudPath).toBe("syncshot-cloud://new-doc?v=sha-import");
+  });
+
+  it("holds original deletion until a capture upload finishes, including its final document update", async () => {
+    let finishUpload!: () => void;
+    mocks.invoke.mockImplementation(async (command) => command === "read_image_bytes" ? new ArrayBuffer(4) : undefined);
+    mocks.uploadBytes.mockImplementation(async (target: { fullPath: string }) => {
+      if (target.fullPath.endsWith("full.png")) {
+        await new Promise<void>((resolve) => { finishUpload = resolve; });
+      }
+    });
+    const publishing = publishScreenshot("u1", DEVICE, "/tmp/original.png");
+    const safeToDelete = vi.fn();
+    const waiting = waitForScreenshotPublish("/tmp/original.png").then(safeToDelete);
+    await vi.waitFor(() => expect(mocks.uploadBytes).toHaveBeenCalledTimes(2));
+    expect(safeToDelete).not.toHaveBeenCalled();
+    finishUpload();
+    await publishing;
+    await waiting;
+    expect(safeToDelete).toHaveBeenCalledOnce();
+    expect(mocks.updateDoc).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ status: "full" }));
   });
 
   it("rejects unsupported files before writing Firebase", async () => {

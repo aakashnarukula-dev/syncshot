@@ -852,6 +852,18 @@ pub async fn open_editor_window(
     Ok(())
 }
 
+/// Copy an editor export independently of its temporary file lifetime.
+#[tauri::command]
+pub async fn copy_png_bytes_to_clipboard(request: tauri::ipc::Request<'_>) -> Result<(), String> {
+    let bytes = match request.body() {
+        tauri::ipc::InvokeBody::Raw(bytes) => bytes.clone(),
+        _ => return Err("copy_png_bytes_to_clipboard expects a raw byte body".to_string()),
+    };
+    tauri::async_runtime::spawn_blocking(move || copy_image_bytes_to_clipboard(&bytes))
+        .await
+        .map_err(|error| format!("Clipboard task failed: {}", error))?
+}
+
 /// Save an edited image from base64 data
 #[tauri::command]
 pub async fn save_edited_image(

@@ -633,7 +633,17 @@ export const ThumbnailItem = memo(function ThumbnailItem({ path, onEdit, onRemov
   const dragReleaseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const dragActiveRef = useRef(false);
   const pointerHeldRef = useRef(false);
+  const dragPointerRef = useRef<{ id: number; x: number; y: number; target: HTMLImageElement } | null>(null);
+  const suppressDragClickRef = useRef(false);
   const mountedRef = useRef(true);
+
+  const releaseDragPointer = () => {
+    const pointer = dragPointerRef.current;
+    dragPointerRef.current = null;
+    if (pointer?.target.hasPointerCapture?.(pointer.id)) {
+      pointer.target.releasePointerCapture(pointer.id);
+    }
+  };
 
   const releaseDragPreparation = () => {
     const pending = dragPreparationRef.current;
@@ -671,12 +681,16 @@ export const ThumbnailItem = memo(function ThumbnailItem({ path, onEdit, onRemov
 
   useEffect(() => {
     mountedRef.current = true;
-    const onPointerUp = () => { pointerHeldRef.current = false; };
+    const onPointerUp = () => {
+      pointerHeldRef.current = false;
+      releaseDragPointer();
+    };
     window.addEventListener("pointerup", onPointerUp, true);
     window.addEventListener("pointercancel", onPointerUp, true);
     return () => {
       mountedRef.current = false;
       pointerHeldRef.current = false;
+      releaseDragPointer();
       window.removeEventListener("pointerup", onPointerUp, true);
       window.removeEventListener("pointercancel", onPointerUp, true);
       if (dragWarmTimerRef.current) clearTimeout(dragWarmTimerRef.current);
@@ -865,6 +879,7 @@ export const ThumbnailItem = memo(function ThumbnailItem({ path, onEdit, onRemov
       if (watchdog) clearTimeout(watchdog);
       dragActiveRef.current = false;
       pointerHeldRef.current = false;
+      releaseDragPointer();
       onDragStateChange?.(false);
     };
     void (async () => {
@@ -874,6 +889,7 @@ export const ThumbnailItem = memo(function ThumbnailItem({ path, onEdit, onRemov
         // cloud download after release previously spawned a ghost drag.
         if (!mountedRef.current || !pointerHeldRef.current) return;
         dragPreparationRef.current = null;
+        releaseDragPointer();
         started = true;
         try {
           await startDrag({ item: [prepared.source.path], icon: prepared.icon }, ({ result }) => {
@@ -1048,7 +1064,10 @@ export const ThumbnailItem = memo(function ThumbnailItem({ path, onEdit, onRemov
           className={`relative block h-full w-full object-cover select-none rounded-md cursor-pointer transition-opacity duration-200 ${
             ready ? "opacity-100" : "opacity-0"
           }`}
-          draggable={!isUploading}
+          // WebKit's HTML drag negotiation can consume the first gesture in
+          // an inactive window and emits pointercancel during the handoff.
+          // Track a small pointer movement ourselves, then start the OS drag.
+          draggable={false}
           onMouseEnter={() => {
             if (isUploading) return;
             if (dragReleaseTimerRef.current) clearTimeout(dragReleaseTimerRef.current);
@@ -1064,10 +1083,31 @@ export const ThumbnailItem = memo(function ThumbnailItem({ path, onEdit, onRemov
             }, 10_000);
           }}
           onPointerDown={(event) => {
-            if (event.button !== 0 || isUploading) return;
+            if (event.button !== 0 || isUploading || dragActiveRef.current) return;
             pointerHeldRef.current = true;
+            suppressDragClickRef.current = false;
+            dragPointerRef.current = {
+              id: event.pointerId,
+              x: event.clientX,
+              y: event.clientY,
+              target: event.currentTarget,
+            };
+            event.currentTarget.setPointerCapture?.(event.pointerId);
             if (dragWarmTimerRef.current) clearTimeout(dragWarmTimerRef.current);
             void prepareDrag().catch(() => {});
+          }}
+          onPointerMove={(event) => {
+            const pointer = dragPointerRef.current;
+            if (!pointer || pointer.id !== event.pointerId || !pointerHeldRef.current || dragActiveRef.current) return;
+            if ((event.buttons & 1) === 0) {
+              pointerHeldRef.current = false;
+              releaseDragPointer();
+              return;
+            }
+            if (Math.hypot(event.clientX - pointer.x, event.clientY - pointer.y) < 5) return;
+            event.preventDefault();
+            suppressDragClickRef.current = true;
+            beginDrag();
           }}
           onLoad={() => {
             readyRef.current = true;
@@ -1076,7 +1116,6 @@ export const ThumbnailItem = memo(function ThumbnailItem({ path, onEdit, onRemov
           }}
           onDragStart={(e) => {
             e.preventDefault();
-            if (!isUploading && pointerHeldRef.current) beginDrag();
           }}
           onError={() => {
             readyRef.current = false;
@@ -1103,6 +1142,10 @@ export const ThumbnailItem = memo(function ThumbnailItem({ path, onEdit, onRemov
             setFailed(true);
           }}
           onClick={() => {
+            if (suppressDragClickRef.current) {
+              suppressDragClickRef.current = false;
+              return;
+            }
             if (isUploading) {
               toast.info("Image is still uploading", { duration: 1800 });
             } else {
