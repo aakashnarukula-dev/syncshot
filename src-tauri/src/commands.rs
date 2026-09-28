@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use tauri::AppHandle;
 
@@ -632,6 +633,42 @@ mod tests {
         assert!(capture().is_ok());
         assert_eq!(checks.get(), 4);
         assert_eq!(requests.get(), 2);
+    }
+
+    #[test]
+    fn confirmed_access_starts_capture_without_waiting_for_a_fresh_process() {
+        assert_eq!(permission_plan(true, false), PermissionPlan::Granted);
+        assert_eq!(permission_plan(true, true), PermissionPlan::Granted);
+        assert_eq!(
+            permission_plan(false, true),
+            PermissionPlan::VerifyAlongside
+        );
+        assert_eq!(permission_plan(false, false), PermissionPlan::RequestFirst);
+    }
+
+    #[test]
+    fn denied_alongside_check_stops_capture_and_discards_file() {
+        let dir = std::env::temp_dir().join(format!("syncshot-perm-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("shot.png");
+        fs::write(&path, b"x").unwrap();
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        let check = PermissionCheck(Some(std::thread::spawn(|| false)));
+        let error = check.finish(&mut child, &path).unwrap_err();
+        assert!(error.contains("permission"));
+        assert!(child.try_wait().unwrap().is_some());
+        assert!(!path.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn confirmed_alongside_check_keeps_capture_running() {
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        let check = PermissionCheck(Some(std::thread::spawn(|| true)));
+        assert!(check.finish(&mut child, Path::new("/nonexistent")).is_ok());
+        assert!(child.try_wait().unwrap().is_none());
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     #[test]
@@ -1347,6 +1384,13 @@ fn screen_recording_allowed() -> bool {
 
 #[cfg(target_os = "macos")]
 fn request_screen_recording_permission() -> bool {
+    let granted = request_screen_recording_permission_in_fresh_process();
+    HELPER_CONFIRMED_ACCESS.store(granted, Ordering::SeqCst);
+    granted
+}
+
+#[cfg(target_os = "macos")]
+fn request_screen_recording_permission_in_fresh_process() -> bool {
     match crate::capture_permission::request() {
         Ok(granted) => {
             capture_diagnostic(if granted {
@@ -1376,6 +1420,80 @@ fn check_and_activate_permission() -> Result<(), String> {
     )
 }
 
+/// CGPreflightScreenCaptureAccess is cached per process: a SyncShot process
+/// that launched before access was granted (or whose ad-hoc signature changed)
+/// keeps reporting false even though a fresh process sees the grant. Each
+/// fresh-process check launches the full app binary, and that used to happen
+/// twice, serially, before every capture UI appeared (the shortcut lag).
+/// Once a fresh process has confirmed access, later captures start the picker
+/// immediately and repeat the check alongside it, so revoking access is still
+/// detected on every capture.
+static HELPER_CONFIRMED_ACCESS: AtomicBool = AtomicBool::new(false);
+
+#[derive(Debug, PartialEq, Eq)]
+enum PermissionPlan {
+    /// This process can see the grant directly.
+    Granted,
+    /// Start capture now; confirm access in a fresh process meanwhile.
+    VerifyAlongside,
+    /// Nothing has confirmed access yet: ask before showing capture UI.
+    RequestFirst,
+}
+
+fn permission_plan(preflight: bool, helper_confirmed: bool) -> PermissionPlan {
+    if preflight {
+        PermissionPlan::Granted
+    } else if helper_confirmed {
+        PermissionPlan::VerifyAlongside
+    } else {
+        PermissionPlan::RequestFirst
+    }
+}
+
+fn current_permission_plan() -> PermissionPlan {
+    permission_plan(
+        screen_recording_allowed(),
+        HELPER_CONFIRMED_ACCESS.load(Ordering::SeqCst),
+    )
+}
+
+/// A fresh-process confirmation still running while capture UI is on screen.
+struct PermissionCheck(Option<std::thread::JoinHandle<bool>>);
+
+impl PermissionCheck {
+    fn start() -> Result<Self, String> {
+        match current_permission_plan() {
+            PermissionPlan::Granted => Ok(Self(None)),
+            PermissionPlan::VerifyAlongside => {
+                capture_diagnostic("permission-verify-alongside");
+                Ok(Self(Some(std::thread::spawn(
+                    request_screen_recording_permission,
+                ))))
+            }
+            PermissionPlan::RequestFirst => check_and_activate_permission()
+                .map(|()| Self(None))
+                .map_err(|e| {
+                    format!("Permission check failed: {}. Please ensure Screen Recording permission is granted in System Settings > Privacy & Security > Screen Recording.", e)
+                }),
+        }
+    }
+
+    /// Wait for the confirmation. On denial the capture is stopped and its
+    /// file discarded, exactly as if the check had failed before it started.
+    fn finish(self, child: &mut std::process::Child, path: &Path) -> Result<(), String> {
+        let Some(handle) = self.0 else {
+            return Ok(());
+        };
+        if handle.join().unwrap_or(false) {
+            return Ok(());
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_file(path);
+        Err("Screen Recording permission required. Enable SyncShot in System Settings > Privacy & Security > Screen Recording, then try capturing again. If macOS asks you to quit and reopen, follow that prompt.".to_string())
+    }
+}
+
 /// Ask from the main thread while the application is active, before the
 /// frontend hides its window or waits for cloud access. False is a normal
 /// outcome: macOS is free to suppress a previously denied consent dialog.
@@ -1383,10 +1501,16 @@ fn check_and_activate_permission() -> Result<(), String> {
 pub async fn request_capture_permission(app: AppHandle) -> Result<bool, String> {
     capture_diagnostic("permission-check");
     tauri::async_runtime::spawn_blocking(move || {
-        if screen_recording_allowed() {
-            capture_diagnostic("permission-granted");
-            crate::capture_permission::recover_if_needed(true)?;
-            return Ok(true);
+        match current_permission_plan() {
+            PermissionPlan::Granted => {
+                capture_diagnostic("permission-granted");
+                crate::capture_permission::recover_if_needed(true)?;
+                return Ok(true);
+            }
+            // The capture command re-confirms in a fresh process while its
+            // picker is already visible; do not hold the shortcut for it here.
+            PermissionPlan::VerifyAlongside => return Ok(true),
+            PermissionPlan::RequestFirst => {}
         }
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         app.run_on_main_thread(move || {
@@ -1411,6 +1535,7 @@ pub async fn request_capture_permission(app: AppHandle) -> Result<bool, String> 
         // Fresh process requests on its own main thread. Do not block the
         // application's main loop while the OS consent dialog is pending.
         let granted = crate::capture_permission::request()?;
+        HELPER_CONFIRMED_ACCESS.store(granted, Ordering::SeqCst);
         capture_diagnostic(if granted {
             "fresh-permission-granted"
         } else {
@@ -1499,15 +1624,13 @@ fn native_capture_blocking(save_dir: &str, mode_flag: &str) -> Result<String, St
         return Err("Another screenshot capture is already in progress".to_string());
     }
 
-    check_and_activate_permission().map_err(|e| {
-        format!("Permission check failed: {}. Please ensure Screen Recording permission is granted in System Settings > Privacy & Security > Screen Recording.", e)
-    })?;
+    let permission = PermissionCheck::start()?;
 
     let filename = generate_filename("screenshot", "png")?;
     let screenshot_path = PathBuf::from(save_dir).join(&filename);
     let path_str = screenshot_path.to_string_lossy().to_string();
 
-    let child = Command::new("screencapture")
+    let mut child = Command::new("screencapture")
         .arg(mode_flag)
         .arg("-x")
         // `-o`: in window-capture mode, omit the window's drop shadow. macOS bakes
@@ -1521,6 +1644,7 @@ fn native_capture_blocking(save_dir: &str, mode_flag: &str) -> Result<String, St
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("Failed to run screencapture: {}", e))?;
+    permission.finish(&mut child, &screenshot_path)?;
 
     let output = child
         .wait_with_output()
@@ -1768,9 +1892,7 @@ fn native_capture_fullscreen_blocking(save_dir: &str) -> Result<String, String> 
         return Err("Another screenshot capture is already in progress".to_string());
     }
 
-    check_and_activate_permission().map_err(|e| {
-        format!("Permission check failed: {}. Please ensure Screen Recording permission is granted in System Settings > Privacy & Security > Screen Recording.", e)
-    })?;
+    let permission = PermissionCheck::start()?;
 
     let filename = generate_filename("screenshot", "png")?;
     let screenshot_path = PathBuf::from(save_dir).join(&filename);
@@ -1791,10 +1913,17 @@ fn native_capture_fullscreen_blocking(save_dir: &str) -> Result<String, String> 
             cmd.arg(format!("-R{},{},{},{}", x, y, w, h));
         }
     }
-    let output = cmd
+    let mut child = cmd
         .arg(&path_str)
-        .output()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|e| format!("Failed to run screencapture: {}", e))?;
+    permission.finish(&mut child, &screenshot_path)?;
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("Failed to wait for screencapture: {}", e))?;
 
     if output.status.success() && screenshot_path.exists() {
         Ok(path_str)

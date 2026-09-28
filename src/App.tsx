@@ -1220,9 +1220,18 @@ function MainApp() {
         await openPairing();
         return;
       }
-      const access = await loadLicenseStatus();
-      licenseStatusRef.current = access;
-      setLicenseStatus(access);
+      // getAccess is a Cloud Functions round-trip (and a cold start after
+      // idle), which used to sit between the shortcut and the capture UI.
+      // A known-good status (refreshed every 60s) lets capture start now;
+      // anything else still waits for the server before deciding.
+      const cached = licenseStatusRef.current;
+      const hasCachedAccess = cached?.state === "licensed" || cached?.state === "trial";
+      const accessRequest = loadLicenseStatus().then((status) => {
+        licenseStatusRef.current = status;
+        setLicenseStatus(status);
+        return status;
+      });
+      const access = hasCachedAccess ? cached : await accessRequest;
       if (access.state !== "licensed" && access.state !== "trial") {
         setShowPaywall(true);
         await showNormalWindow(appWindow, 520, 640, { title: "Activate SyncShot" });
@@ -1234,7 +1243,12 @@ function MainApp() {
       // deliberately independent of the thumbnail count: an empty pill is still
       // the app's control surface and must be restored too.
       try { await appWindow.hide(); } catch {}
-      await new Promise((resolve) => setTimeout(resolve, 250));
+      // Region and window pickers are interactive, so the pill is long gone
+      // before anything is captured. Only the instant full-screen grab needs
+      // the compositor to drop the hidden window first.
+      if (captureMode === "fullscreen") {
+        await new Promise((resolve) => setTimeout(resolve, 120));
+      }
 
       const commandMap: Record<CaptureMode, string> = {
         region: "native_capture_interactive",
