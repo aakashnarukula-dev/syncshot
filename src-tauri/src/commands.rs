@@ -1548,6 +1548,20 @@ pub async fn request_capture_permission(app: AppHandle) -> Result<bool, String> 
     .map_err(|e| format!("Permission task failed: {e}"))?
 }
 
+/// Rail drag lifecycle stages from the webview, logged beside capture stages.
+/// Only short fixed-vocabulary tokens are accepted, never paths or content.
+#[tauri::command]
+pub fn drag_diagnostic(stage: String) {
+    let valid = !stage.is_empty()
+        && stage.len() <= 80
+        && stage
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | ' ' | '=' | '.'));
+    if valid {
+        capture_diagnostic(&format!("drag {stage}"));
+    }
+}
+
 /// Bounded, local diagnostics contain only capture stages, never keys, account
 /// details, image paths, or image content. Useful when OS consent fails silently.
 pub(crate) fn capture_diagnostic(stage: &str) {
@@ -1581,8 +1595,14 @@ pub(crate) fn capture_diagnostic(stage: &str) {
         let time = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs();
-        let _ = writeln!(file, "{time} pid={} {stage}", std::process::id());
+            .as_millis();
+        let _ = writeln!(
+            file,
+            "{}.{:03} pid={} {stage}",
+            time / 1000,
+            time % 1000,
+            std::process::id()
+        );
     }
 }
 

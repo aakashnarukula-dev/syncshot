@@ -213,8 +213,33 @@ describe("ThumbnailItem", () => {
     fireEvent.pointerMove(image, { pointerId: 1, buttons: 1, clientX: 40, clientY: 20 });
     fireEvent.pointerUp(window);
     resolvePreparation({ path: "/managed/slow.png", temporary: false });
-    await waitFor(() => expect(releaseDragMock).toHaveBeenCalled());
+    await act(async () => {});
     expect(startDragMock).not.toHaveBeenCalled();
+    // The prepared file stays with the tile for the next press.
+    expect(releaseDragMock).not.toHaveBeenCalled();
+    view.unmount();
+    await waitFor(() => expect(releaseDragMock).toHaveBeenCalled());
+  });
+
+  it("starts on the next press when the first was released while preparing", async () => {
+    let resolvePreparation!: (source: { path: string; temporary: boolean }) => void;
+    prepareDragMock.mockReturnValueOnce(new Promise((resolve) => { resolvePreparation = resolve; }));
+    const view = render(
+      <ThumbnailItem path="/managed/cold.png" onEdit={vi.fn()} onRemove={vi.fn()} readOnly={false} />,
+    );
+    const image = view.getByAltText("Screenshot preview");
+
+    fireEvent.pointerDown(image, { button: 0, pointerId: 1, clientX: 20, clientY: 20 });
+    fireEvent.pointerMove(image, { pointerId: 1, buttons: 1, clientX: 40, clientY: 20 });
+    fireEvent.pointerUp(window);
+
+    // Second press arrives while the file is still being prepared.
+    fireEvent.pointerDown(image, { button: 0, pointerId: 2, clientX: 20, clientY: 20 });
+    fireEvent.pointerMove(image, { pointerId: 2, buttons: 1, clientX: 40, clientY: 20 });
+    resolvePreparation({ path: "/managed/cold.png", temporary: false });
+    await waitFor(() => expect(startDragMock).toHaveBeenCalledTimes(1));
+    expect(prepareDragMock).toHaveBeenCalledTimes(1);
+    expect(releaseDragMock).not.toHaveBeenCalled();
     view.unmount();
   });
 

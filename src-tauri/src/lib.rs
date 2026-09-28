@@ -474,6 +474,7 @@ pub fn run() {
             rename_screenshot_to_doc_id,
             download_temporary_image,
             commands::prepare_local_drag_image,
+            commands::drag_diagnostic,
             commands::primary_mouse_button_down,
             save_image_to_downloads,
             set_clipboard_text,
