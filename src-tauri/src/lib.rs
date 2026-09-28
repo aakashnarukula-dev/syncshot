@@ -5,6 +5,7 @@
 //! and background customization.
 
 mod auth;
+pub mod capture_permission;
 mod clipboard;
 mod commands;
 mod image;
@@ -466,8 +467,6 @@ pub fn run() {
             file_exists,
             stat_file,
             commands::request_capture_permission,
-            commands::open_screen_recording_settings,
-            commands::restart_for_capture_permission,
             native_capture_interactive,
             native_capture_fullscreen,
             native_capture_window,

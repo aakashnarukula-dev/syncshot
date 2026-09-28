@@ -1347,11 +1347,21 @@ fn screen_recording_allowed() -> bool {
 
 #[cfg(target_os = "macos")]
 fn request_screen_recording_permission() -> bool {
-    #[link(name = "CoreGraphics", kind = "framework")]
-    extern "C" {
-        fn CGRequestScreenCaptureAccess() -> bool;
+    match crate::capture_permission::request() {
+        Ok(granted) => {
+            capture_diagnostic(if granted {
+                "fresh-permission-granted"
+            } else {
+                "fresh-permission-not-granted"
+            });
+            granted
+        }
+        Err(error) => {
+            capture_diagnostic("fresh-permission-helper-error");
+            eprintln!("{error}");
+            false
+        }
     }
-    unsafe { CGRequestScreenCaptureAccess() }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -1392,40 +1402,23 @@ pub async fn request_capture_permission(app: AppHandle) -> Result<bool, String> 
                     }
                 }
             }
-            let granted = request_screen_recording_permission();
-            capture_diagnostic(if granted {
-                "permission-request-granted"
-            } else {
-                "permission-request-denied"
-            });
-            let _ = tx.send(granted);
+            let _ = tx.send(());
         })
         .map_err(|e| format!("Permission request failed: {e}"))?;
         rx.recv()
-            .map_err(|e| format!("Permission request failed: {e}"))
+            .map_err(|e| format!("Permission request failed: {e}"))?;
+        // Fresh process requests on its own main thread. Do not block the
+        // application's main loop while the OS consent dialog is pending.
+        crate::capture_permission::request().inspect(|granted| {
+            capture_diagnostic(if *granted {
+                "fresh-permission-granted"
+            } else {
+                "fresh-permission-not-granted"
+            });
+        })
     })
     .await
     .map_err(|e| format!("Permission task failed: {e}"))?
-}
-
-#[tauri::command]
-pub fn open_screen_recording_settings() -> Result<(), String> {
-    #[cfg(target_os = "macos")]
-    {
-        let status = Command::new("/usr/bin/open")
-            .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")
-            .status()
-            .map_err(|e| format!("Could not open Screen Recording settings: {e}"))?;
-        if !status.success() {
-            return Err("Could not open Screen Recording settings".into());
-        }
-    }
-    Ok(())
-}
-
-#[tauri::command]
-pub fn restart_for_capture_permission(app: AppHandle) {
-    app.request_restart();
 }
 
 /// Bounded, local diagnostics contain only capture stages, never keys, account

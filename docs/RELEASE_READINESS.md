@@ -101,3 +101,19 @@ The user reported that 0.2.22 still did not show a consent pop-up. Removing the 
 - Add a bounded, private local capture-stage log in the app cache. It records native press/release and permission outcomes, without key values, account details, file paths, or image content.
 
 Verification: 154 frontend tests and 54 Rust tests passed, plus the release build and ad-hoc signature check. Installed and launched 0.2.23; installed executable matches the build. Prior app retained under `src-tauri/target/release/previous-installation-0.2.23/20260928-161542/SyncShot.app`. Remote key injection produced no native shortcut events, so the user was asked for one physical Command-Shift-2 press to inspect the live path.
+
+## Native consent re-prompt investigation — Mac 0.2.24 candidate
+
+The user clarified that only the macOS “SyncShot would like to record this computer’s screen and audio” dialog counts as success. The custom recovery view does not solve that requirement. Live 0.2.23 logs confirmed that physical shortcut press/release events reached the permission API repeatedly, which returned false. The earlier shortcut/cache changes therefore must not be reported as resolving this native-dialog issue.
+
+A 0.2.24 candidate routes a missing-permission request through a short-lived invocation of the same installed executable, before Tauri/single-instance initialization. This uses only the ordinary CoreGraphics APIs and leaves the main app running, retains the same signing/bundle identity, and does not reset or grant TCC permissions. Unknown helper failures fail closed; child waits are bounded and reaped. The existing recovery UI remains a fallback, not evidence of success.
+
+56 Rust tests and the production build/signature checks passed. Installed binary matches the build. Prior app is retained under `src-tauri/target/release/previous-installation-0.2.24/20260928-162706/SyncShot.app`. Live traces showed requests at 16:27:36 and 16:28:19 with main PID 74485 unchanged; TCC attributed the child requests to SyncShot. Both API results were not-granted, which alone cannot prove whether the OS dialog was displayed. Awaiting the user's exact grant/remove/retry result before treating this candidate as a verified fix. Computer-use controls disallow inspecting UserNotificationCenter directly.
+
+## Remove custom permission pop-up — Mac 0.2.25
+
+At the user's request, removed the “Allow screenshot access” component, its dedicated window mode, and its Settings/restart commands. A denied native permission request now leaves the current surface alone and preserves rail auto-hide; a permission failure after capture begins restores the rail silently. No replacement app permission modal or toast is shown. Native CoreGraphics permission requests remain enabled through the same 0.2.24 helper path. Native-dialog reappearance after removing permission still requires separate visual confirmation and is not claimed fixed by this UI removal.
+
+Verification: 152 frontend tests and 56 Rust tests passed. The custom permission component, window mode, commands, and copy are absent from application source. The previously open custom dialog was dismissed and the pill returned.
+
+Mac 0.2.25 release build and ad-hoc signature checks passed. Installed executable matches the build; previous bundle retained at `src-tauri/target/release/previous-installation-0.2.25/20260928-163503/SyncShot.app`.

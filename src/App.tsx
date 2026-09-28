@@ -14,7 +14,6 @@ import { toast } from "sonner";
 import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { flushSync } from "react-dom";
 import { loadLicenseStatus, type LicenseStatus } from "@/lib/license";
-import { ScreenRecordingPermission } from "@/components/ScreenRecordingPermission";
 import { createShortcutGate } from "@/lib/shortcutGate";
 import { Paywall } from "@/components/Paywall";
 // Light module (zustand + types only — no Firebase): safe in the entry chunk.
@@ -57,7 +56,7 @@ const ImageEditor = lazy(() => import("./components/ImageEditor").then(m => ({ d
 const PreferencesPage = lazy(() => import("./components/preferences/PreferencesPage").then(m => ({ default: m.PreferencesPage })));
 const SignInView = lazy(() => import("./components/Pairing/SignInView").then(m => ({ default: m.SignInView })));
 
-type AppMode = "main" | "preferences" | "thumbnail" | "pairing" | "permission";
+type AppMode = "main" | "preferences" | "thumbnail" | "pairing";
 export type ColumnView = "screenshots" | "clipboard";
 
 const THUMB_WIDTH = 240;
@@ -859,7 +858,6 @@ function MainApp() {
   // capture until that shortcut's Released event arrives.
   const shortcutRegistrationQueueRef = useRef<Promise<void>>(Promise.resolve());
   const shortcutGateRef = useRef(createShortcutGate());
-  const permissionCaptureModeRef = useRef<CaptureMode>("region");
   // A burst of remote docs may arrive in one Firestore snapshot. Their paths
   // should all merge immediately, but only one native show/genie sequence may
   // run at a time (otherwise the column visibly opens twice).
@@ -1194,20 +1192,12 @@ function MainApp() {
   }, [updateThumbs]);
 
 
-  const showCapturePermission = useCallback(async () => {
-    idleTimerRef.current?.stop();
-    modeRef.current = "permission";
-    flushSync(() => setMode("permission"));
-    await showNormalWindow(getCurrentWindow(), 520, 560, { title: "Screen Recording access" });
-  }, []);
-
   const handleCapture = useCallback(async (captureMode: CaptureMode = "region") => {
     if (isCapturingRef.current) return;
     // Acquire before any await, including permission and account checks.
     isCapturingRef.current = true;
     idleTimerRef.current?.stop();
     columnHoveredRef.current = false;
-    permissionCaptureModeRef.current = captureMode;
 
     const appWindow = getCurrentWindow();
     // Keep the pre-capture surface so an Escape/capture/save failure always
@@ -1219,10 +1209,10 @@ function MainApp() {
     const { copyToClipboard: shouldCopyToClipboard, tempDir: currentTempDir } = settingsRef.current;
 
     try {
-      // Permission UI must remain visible and must not wait on cloud access.
-      // macOS may return false without displaying another system consent alert.
+      // macOS owns consent UI. A missing grant must not open a second app
+      // dialog, navigate away from the current surface, or hide the pill.
       if (!await invoke<boolean>("request_capture_permission")) {
-        await showCapturePermission();
+        if (modeRef.current === "thumbnail" && !isCollapsedRef.current) startAutoHide();
         return;
       }
       if (useSyncStore.getState().authState !== "signedIn") {
@@ -1318,10 +1308,6 @@ function MainApp() {
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : String(err);
       const normalizedError = errorMessage.toLowerCase();
-      if (normalizedError.includes("permission") || normalizedError.includes("denied") || normalizedError.includes("not authorized")) {
-        await showCapturePermission();
-        return;
-      }
       // The native picker is allowed to fail/cancel, but it is never allowed to
       // close the pill. Restore the exact prior form (or the collapsed control
       // if the rail did not yet have content).
@@ -1345,7 +1331,11 @@ function MainApp() {
         startAutoHide();
       }
 
-      if (normalizedError.includes("cancelled")) {
+      if (normalizedError.includes("permission") || normalizedError.includes("denied") || normalizedError.includes("not authorized")) {
+        // Native permission request has already run. Restore the rail without
+        // adding our own permission pop-up or a duplicate toast.
+        console.warn("Screen Recording access is unavailable");
+      } else if (normalizedError.includes("cancelled")) {
         // user cancelled — silent
       } else if (normalizedError.includes("already in progress")) {
         toast.error("Please wait for the current screenshot to complete", { duration: 4000 });
@@ -1355,7 +1345,7 @@ function MainApp() {
     } finally {
       isCapturingRef.current = false;
     }
-  }, [updateThumbs, reportError, openPairing, openThumbnailWindow, startAutoHide, showCapturePermission]);
+  }, [updateThumbs, reportError, openPairing, openThumbnailWindow, startAutoHide]);
 
   // Setup hotkeys whenever settings change
   useEffect(() => {
@@ -1833,13 +1823,6 @@ function MainApp() {
         onDragStateChange={handleScreenshotDragStateChange}
       />
     );
-  }
-
-  if (mode === "permission") {
-    return <ScreenRecordingPermission
-      onRetry={() => handleCapture(permissionCaptureModeRef.current)}
-      onClose={restoreColumnAfterModal}
-    />;
   }
 
   if (mode === "pairing") {

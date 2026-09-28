@@ -4626,7 +4626,7 @@ dependencies = [
 
 [[package]]
 name = "syncshot"
-version = "0.2.23"
+version = "0.2.25"
 dependencies = [
  "base64 0.22.1",
  "dirs 5.0.1",
