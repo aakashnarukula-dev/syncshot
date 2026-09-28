@@ -650,6 +650,9 @@ export const ThumbnailItem = memo(function ThumbnailItem({ path, onEdit, onRemov
   // Ends a drag that is still waiting for its file when the button is released,
   // so the very next press starts a new drag instead of being ignored.
   const abandonPendingDragRef = useRef<(() => void) | null>(null);
+  // Shown only when a drag waits for a cold cloud download, so the user keeps
+  // holding the button instead of letting go before the OS drag can start.
+  const [dragPending, setDragPending] = useState(false);
   const pointerHeldRef = useRef(false);
   const dragPointerRef = useRef<{ id: number; x: number; y: number; target: HTMLImageElement } | null>(null);
   const suppressDragClickRef = useRef(false);
@@ -896,9 +899,17 @@ export const ThumbnailItem = memo(function ThumbnailItem({ path, onEdit, onRemov
     let started = false;
     let finished = false;
     let watchdog: ReturnType<typeof setTimeout> | null = null;
+    const pendingHint = setTimeout(() => {
+      if (!started && !finished && mountedRef.current) setDragPending(true);
+    }, 120);
+    const clearPendingHint = () => {
+      clearTimeout(pendingHint);
+      if (mountedRef.current) setDragPending(false);
+    };
     const finish = () => {
       if (finished) return;
       finished = true;
+      clearPendingHint();
       if (watchdog) clearTimeout(watchdog);
       finishDragRef.current = null;
       if (abandonPendingDragRef.current === finish) abandonPendingDragRef.current = null;
@@ -922,6 +933,7 @@ export const ThumbnailItem = memo(function ThumbnailItem({ path, onEdit, onRemov
         }
         abandonPendingDragRef.current = null;
         dragDiagnostic(`start ms=${waited}`);
+        clearPendingHint();
         dragPreparationRef.current = null;
         releaseDragPointer();
         started = true;
@@ -1192,6 +1204,13 @@ export const ThumbnailItem = memo(function ThumbnailItem({ path, onEdit, onRemov
             }
           }}
         />
+      ) : null}
+
+      {dragPending ? (
+        <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center rounded-md bg-neutral-950/50 text-white">
+          <Loader2 className="size-4 animate-spin" aria-hidden="true" />
+          <span className="sr-only">Preparing drag</span>
+        </div>
       ) : null}
 
       {isUploading ? (

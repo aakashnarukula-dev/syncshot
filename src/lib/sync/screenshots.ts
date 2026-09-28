@@ -709,8 +709,8 @@ async function primeCloudThumbnail(item: ScreenshotDoc): Promise<void> {
 /**
  * Prime one rail viewport, not the whole Firestore page. Visible thumbnails
  * enter the shared request gate first; twelve following thumbnails form the
- * scroll buffer. Once the visible thumbnails settle, their full images are
- * warmed into the native memory cache (bounded LRU, never written to disk):
+ * scroll buffer. Full images of visible tiles, then the buffer, are warmed
+ * into the native memory cache (bounded LRU, never written to disk):
  * an OS drag must have a real file before the mouse button is released, and
  * a cold Firebase download made the first drags of every tile fail.
  */
@@ -726,9 +726,16 @@ export function preloadScreenshotImages(
 
   // Calling in this order enqueues all visible items ahead of buffer work.
   const visibleThumbs = visible.map((item) => primeCloudThumbnail(item));
-  for (const item of buffer) void primeCloudThumbnail(item).catch(() => {});
-  void Promise.allSettled(visibleThumbs)
-    .then(() => Promise.all(visible.map((item) => resolveScreenshotFullImageUrl(item))))
+  const bufferThumbs = buffer.map((item) => primeCloudThumbnail(item));
+  // Visible full images start now: a tile can be dragged as soon as it is on
+  // screen. The scroll buffer follows once the visible thumbnails settle.
+  warmFullImages(visible);
+  void Promise.allSettled([...visibleThumbs, ...bufferThumbs]).then(() => warmFullImages(buffer));
+}
+
+function warmFullImages(items: ScreenshotDoc[]): void {
+  if (items.length === 0) return;
+  void Promise.all(items.map((item) => resolveScreenshotFullImageUrl(item)))
     .then((urls) => {
       const ready = urls.filter((url): url is string => !!url);
       if (ready.length > 0) return invoke("prefetch_remote_images", { urls: ready });
