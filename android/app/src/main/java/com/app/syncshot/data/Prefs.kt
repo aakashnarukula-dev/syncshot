@@ -8,6 +8,8 @@ import java.util.UUID
  *  uid, so docs are told apart by deviceId) and the device display name. */
 class Prefs(context: Context) {
     private val sp = context.getSharedPreferences("ssx", Context.MODE_PRIVATE)
+    // Keep account-scoped deletion markers across sign-out so old workers stay cancelled.
+    private val deletions = context.getSharedPreferences("screenshot_deletions", Context.MODE_PRIVATE)
 
     val deviceId: String
         get() = sp.getString("device_id", null) ?: UUID.randomUUID().toString()
@@ -25,6 +27,10 @@ class Prefs(context: Context) {
     var screenshotHighWater: Long
         get() = sp.getLong("ss_high_water", -1L)
         set(v) { sp.edit().putLong("ss_high_water", v).apply() }
+
+    fun isScreenshotDeleted(uid: String, sha: String): Boolean = deletions.getBoolean("deleted:$uid:$sha", false)
+    fun markScreenshotDeleted(uid: String, sha: String) { deletions.edit().putBoolean("deleted:$uid:$sha", true).apply() }
+    fun restoreScreenshot(uid: String, sha: String) { deletions.edit().remove("deleted:$uid:$sha").apply() }
 
     fun clear() { sp.edit().clear().apply() }
 }

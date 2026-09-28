@@ -18,6 +18,7 @@ import com.app.syncshot.data.Prefs
 import com.app.syncshot.data.ScreenshotPaging
 import com.app.syncshot.data.db.AppDb
 import com.app.syncshot.data.db.ScreenshotEntity
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -32,7 +33,7 @@ import java.util.Collections
  *  - holds the Firestore screenshots listener -> mirrors docs into Room (instant
  *    grid) and downloads + notify-to-copy for shots from other devices. */
 class SyncService : Service() {
-    private var accessGranted = false
+    @Volatile private var accessGranted = false
     private var observer: ContentObserver? = null
     private var lastSeenId: Long = 0
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
@@ -67,6 +68,7 @@ class SyncService : Service() {
             // not render that stale, unbounded cache on a fresh launch: start
             // with the newest Firestore page and grow only when the user scrolls.
             // Optimistic local captures stay intact (clearSynced excludes them).
+            com.app.syncshot.data.PreviewRepair.removeMissing(this@SyncService)
             dao.clearSynced()
             ScreenshotPaging.reset()
             // All devices share one auth uid — our own docs are identified by
@@ -88,6 +90,10 @@ class SyncService : Service() {
                 FirebaseRepo.screenshotSnapshots(limit).collectLatest { page ->
                     val docs = page.docs
                     dao.upsertAll(docs.map { ScreenshotEntity.of(it) })
+                    // A synced original supersedes older optimistic retry IDs.
+                    docs.filter { it.status == "full" }.forEach {
+                        dao.removeLocalDuplicates(it.sha256, it.id)
+                    }
                     // Reconcile deletes ONLY from authoritative server snapshots — a
                     // partial cache emission must never drive a delete.
                     if (!page.fromCache) {
@@ -176,6 +182,7 @@ class SyncService : Service() {
      * grant it after this foreground service has started. Never query MediaStore
      * without the runtime grant, and make a later start command attach exactly
      * one observer. */
+    @Synchronized
     private fun startScreenshotObserverIfPermitted() {
         if (observer != null || !hasImagePermission()) return
         lastSeenId = latestImageId()
@@ -247,6 +254,8 @@ class SyncService : Service() {
                 }
                 val image = bytes ?: error("Screenshot is not readable yet")
                 FirebaseRepo.publishScreenshot(this@SyncService, image)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
             } catch (_: Exception) {
                 UploadWorker.enqueue(this@SyncService, uri)
             } finally {

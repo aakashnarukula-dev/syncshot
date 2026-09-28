@@ -1,12 +1,13 @@
 package com.app.syncshot.data.db
 
 import androidx.room.Entity
+import androidx.room.Index
 import androidx.room.PrimaryKey
 import com.app.syncshot.data.ScreenshotDoc
 
 /** Local mirror of a screenshot doc so the grid renders instantly on cold start,
  *  before any Firestore listener has fired. */
-@Entity(tableName = "screenshots")
+@Entity(tableName = "screenshots", indices = [Index("sha256")])
 data class ScreenshotEntity(
     @PrimaryKey val id: String,
     val sha256: String,

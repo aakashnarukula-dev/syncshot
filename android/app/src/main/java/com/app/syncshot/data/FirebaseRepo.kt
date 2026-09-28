@@ -10,6 +10,7 @@ import com.google.firebase.firestore.CollectionReference
 import com.google.firebase.firestore.FieldValue
 import com.google.firebase.firestore.MetadataChanges
 import com.google.firebase.firestore.Query
+import com.google.firebase.firestore.Source
 import com.google.firebase.firestore.SetOptions
 import com.google.firebase.firestore.firestore
 import com.google.firebase.storage.StorageMetadata
@@ -31,6 +32,7 @@ import kotlinx.coroutines.tasks.await
  */
 object FirebaseRepo {
     private const val MAX_CLIP_BYTES = 100 * 1024
+    private val screenshotUploads = ScreenshotUploads()
 
     private val auth get() = Firebase.auth
     private val db get() = Firebase.firestore
@@ -111,112 +113,117 @@ object FirebaseRepo {
     }
 
     /** Publish a screenshot: dedupe by sha256, thumbnail-first, then full. */
-    suspend fun publishScreenshot(ctx: Context, full: ByteArray) = coroutineScope {
-        AccountAccess.requireActive()
+    suspend fun publishScreenshot(ctx: Context, full: ByteArray, manual: Boolean = false) {
         val uid = requireUid()
+        AccountAccess.requireActive()
+        check(requireUid() == uid) { "Account changed during upload" }
         val sha = Hashing.sha256(full)
         val type = detectImageType(full)
-        cacheFullLocally(ctx, sha, full, type.mime)
+        val prefs = Prefs(ctx)
 
-        // Thumbnail encoding is independent of the network dedupe lookup. Run
-        // them together so a fresh capture reaches the thumb upload as soon as
-        // the slower of the two completes, instead of paying both costs serially.
-        val preparedThumb = async(Dispatchers.Default) { Thumbs.make(full) }
-        val existing = col("screenshots").whereEqualTo("sha256", sha).limit(1).get().await()
-        if (!existing.isEmpty) {
-            preparedThumb.cancel()
-            return@coroutineScope
-        }
+        val screenshots = db.collection("users").document(uid).collection("screenshots")
+        val id = screenshotUploads.publish(uid, sha, isDeleted = { !manual && prefs.isScreenshotDeleted(uid, sha) }, lookup = {
+            if (manual) prefs.restoreScreenshot(uid, sha)
+            screenshots.whereEqualTo("sha256", sha).get(Source.SERVER).await().documents.map {
+                ScreenshotUploads.Existing(it.id, it.getString("status") == "full" && !it.getString("fullPath").isNullOrBlank())
+            }
+        }, upload = { id -> coroutineScope {
+            cacheFullLocally(ctx, sha, full, type.mime)
+            val docRef = screenshots.document(id)
+            val thumb = kotlinx.coroutines.withContext(Dispatchers.Default) { Thumbs.make(full) }
+                ?: error("Screenshot is not a complete, readable image")
+            val thumbPath = "users/$uid/screenshots/$id/thumb.webp"
+            val fullPath = "users/$uid/screenshots/$id/full.${type.ext}"
+            val fullRef = storage.getReference(fullPath)
 
-        val docRef = col("screenshots").document()
-        val id = docRef.id
-        val thumbPath = "users/$uid/screenshots/$id/thumb.webp"
-        val fullPath = "users/$uid/screenshots/$id/full.${type.ext}"
-        val fullRef = storage.getReference(fullPath)
+            // Start the multi-megabyte original immediately. It runs alongside the
+            // tiny thumbnail encode/upload instead of waiting behind it, so the Mac
+            // clipboard can receive the original within seconds of the rail preview.
+            val fullUpload = async {
+                fullRef
+                    .putBytes(full, StorageMetadata.Builder().setContentType(type.mime).build())
+                    .await()
+            }
 
-        // Start the multi-megabyte original immediately. It runs alongside the
-        // tiny thumbnail encode/upload instead of waiting behind it, so the Mac
-        // clipboard can receive the original within seconds of the rail preview.
-        val fullUpload = async {
-            fullRef
-                .putBytes(full, StorageMetadata.Builder().setContentType(type.mime).build())
-                .await()
-        }
-
-        val thumb = preparedThumb.await()
-        if (thumb == null) {
-            fullUpload.cancel()
-            return@coroutineScope
-        }
-
-        // Optimistic local row: the grid mirrors Room, so writing the row now (with
-        // status "local") makes the just-captured shot appear and render from its
-        // cached local file IMMEDIATELY — instead of only after the thumb finishes
-        // uploading and the Firestore doc is created. The server snapshot later
-        // upserts the same id (flipping status to thumb/full); the delete-reconcile
-        // never prunes status="local" rows, so this can't be wiped before it syncs.
-        runCatching {
-            AppDb.get(ctx).screenshots().upsertAll(
-                listOf(
-                    ScreenshotEntity(
-                        id = id,
-                        sha256 = sha,
-                        createdAt = System.currentTimeMillis(),
-                        deviceUid = uid,
-                        deviceName = Build.MODEL ?: "Android",
-                        platform = PLATFORM_ANDROID,
-                        width = thumb.width,
-                        height = thumb.height,
-                        bytes = full.size.toLong(),
-                        mime = type.mime,
-                        thumbPath = null,
-                        fullPath = null,
-                        status = "local",
+            // Optimistic local row: the grid mirrors Room, so writing the row now (with
+            // status "local") makes the just-captured shot appear and render from its
+            // cached local file IMMEDIATELY — instead of only after the thumb finishes
+            // uploading and the Firestore doc is created. The server snapshot later
+            // upserts the same id (flipping status to thumb/full); the delete-reconcile
+            // never prunes status="local" rows, so this can't be wiped before it syncs.
+            runCatching {
+                AppDb.get(ctx).screenshots().upsertAll(
+                    listOf(
+                        ScreenshotEntity(
+                            id = id,
+                            sha256 = sha,
+                            createdAt = System.currentTimeMillis(),
+                            deviceUid = uid,
+                            deviceName = Build.MODEL ?: "Android",
+                            platform = PLATFORM_ANDROID,
+                            width = thumb.width,
+                            height = thumb.height,
+                            bytes = full.size.toLong(),
+                            mime = type.mime,
+                            thumbPath = null,
+                            fullPath = null,
+                            status = "local",
+                        )
                     )
                 )
-            )
-        }
-
-        val thumbRef = storage.getReference(thumbPath)
-        thumbRef
-            .putBytes(thumb.bytes, StorageMetadata.Builder().setContentType("image/webp").build())
-            .await()
-        docRef.set(
-            mapOf(
-                "sha256" to sha,
-                "createdAt" to FieldValue.serverTimestamp(),
-                "device" to deviceMap(ctx),
-                "width" to thumb.width,
-                "height" to thumb.height,
-                "mime" to type.mime,
-                "thumbPath" to thumbPath,
-                "thumbUrl" to null,
-                // The path is deterministic and safe to publish while bytes
-                // finish uploading. Status remains "thumb" until completion.
-                "fullPath" to fullPath,
-                "fullUrl" to null,
-                "status" to "thumb",
-            )
-        ).await()
-
-        val thumbUrlUpdate = async {
-            runCatching {
-                docRef.update("thumbUrl", thumbRef.downloadUrl.await().toString()).await()
             }
-        }
-        fullUpload.await()
-        docRef.update(
-            mapOf(
-                "status" to "full",
-                "fullPath" to fullPath,
-                "bytes" to full.size.toLong(),
-            )
-        ).await()
 
-        // URL metadata is an optimization, never a delivery gate. Storage paths
-        // are already usable by both apps if either lookup is briefly slow.
-        thumbUrlUpdate.await()
-        runCatching { docRef.update("fullUrl", fullRef.downloadUrl.await().toString()).await() }
+            val thumbRef = storage.getReference(thumbPath)
+            thumbRef
+                .putBytes(thumb.bytes, StorageMetadata.Builder().setContentType("image/webp").build())
+                .await()
+            val metadata = mapOf(
+                    "sha256" to sha,
+                    "device" to mapOf("uid" to uid, "deviceId" to Prefs(ctx).deviceId, "name" to (Build.MODEL ?: "Android"), "platform" to PLATFORM_ANDROID),
+                    "width" to thumb.width,
+                    "height" to thumb.height,
+                    "mime" to type.mime,
+                    "thumbPath" to thumbPath,
+                    "thumbUrl" to null,
+                    // The path is deterministic and safe to publish while bytes
+                    // finish uploading. Status remains "thumb" until completion.
+                    "fullPath" to fullPath,
+                    "fullUrl" to null,
+                    "status" to "thumb",
+                )
+            // Preserve creation time on retries and never downgrade another
+            // device's completed upload back to thumbnail-only.
+            db.runTransaction { transaction ->
+                val current = transaction.get(docRef)
+                if (!current.exists()) {
+                    transaction.set(docRef, metadata + ("createdAt" to FieldValue.serverTimestamp()))
+                } else if (current.getString("status") != "full") {
+                    transaction.set(docRef, metadata, SetOptions.merge())
+                }
+            }.await()
+
+            val thumbUrlUpdate = async {
+                runCatching {
+                    docRef.update("thumbUrl", thumbRef.downloadUrl.await().toString()).await()
+                }
+            }
+            fullUpload.await()
+            docRef.update(
+                mapOf(
+                    "status" to "full",
+                    "fullPath" to fullPath,
+                    "bytes" to full.size.toLong(),
+                )
+            ).await()
+
+            // URL metadata is an optimization, never a delivery gate. Storage paths
+            // are already usable by both apps if either lookup is briefly slow.
+            thumbUrlUpdate.await()
+            runCatching { docRef.update("fullUrl", fullRef.downloadUrl.await().toString()).await() }
+        } }) ?: return
+        // Repair orphan optimistic rows from older retry attempts without
+        // deleting any original image or cloud document.
+        AppDb.get(ctx).screenshots().removeLocalDuplicates(sha, id)
     }
 
     suspend fun downloadFull(path: String, maxBytes: Long = 64L * 1024 * 1024): ByteArray =
@@ -227,16 +234,27 @@ object FirebaseRepo {
      *  users/{uid}/screenshots/{id}/{thumb.webp,full.png} paths plus whatever the
      *  doc carried are all swept, and a missing blob is not an error. Removing the
      *  doc is what stops every device's listener from re-syncing the shot. */
-    suspend fun deleteScreenshot(id: String, thumbPath: String?, fullPath: String?) {
+    suspend fun deleteScreenshot(ctx: Context, item: ScreenshotEntity) {
         val uid = requireUid()
-        val blobs = linkedSetOf(
-            "users/$uid/screenshots/$id/thumb.webp",
-            "users/$uid/screenshots/$id/full.png",
-        )
-        thumbPath?.let(blobs::add)
-        fullPath?.let(blobs::add)
-        blobs.forEach { p -> runCatching { storage.getReference(p).delete().await() } }
-        col("screenshots").document(id).delete().await()
+        screenshotUploads.withImage(uid, item.sha256) {
+            val screenshots = db.collection("users").document(uid).collection("screenshots")
+            val copies = if (item.sha256.isBlank()) emptyList() else
+                screenshots.whereEqualTo("sha256", item.sha256).get(Source.SERVER).await().documents
+            val pathsById = copies.associate { doc ->
+                doc.id to listOfNotNull(doc.getString("thumbPath"), doc.getString("fullPath"))
+            }.toMutableMap()
+            pathsById[item.id] = pathsById[item.id].orEmpty() + listOfNotNull(item.thumbPath, item.fullPath)
+            for ((id, paths) in pathsById) {
+                val blobs = paths + listOf("users/$uid/screenshots/$id/thumb.webp", "users/$uid/screenshots/$id/full.png")
+                // Keep the row until cloud deletion succeeds; failed calls remain retryable.
+                screenshots.document(id).delete().await()
+                blobs.distinct().forEach { path -> runCatching { storage.getReference(path).delete().await() } }
+            }
+            // A queued upload must not resurrect the user's deleted image after restart.
+            Prefs(ctx).markScreenshotDeleted(uid, item.sha256)
+            AppDb.get(ctx).screenshots().deleteImage(item.sha256, item.id)
+            ImageFiles.deleteCachedCopies(ctx, item.sha256)
+        }
     }
 
     /** A screenshot listener emission plus whether it came from the local cache.

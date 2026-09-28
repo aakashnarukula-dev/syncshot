@@ -7,14 +7,39 @@ import androidx.room.Upsert
 
 @Dao
 interface ScreenshotDao {
-    @Query("SELECT * FROM screenshots ORDER BY createdAt DESC")
+    /** Older builds could leave several optimistic IDs for the same bytes.
+     * Prefer a complete synced row, then a stable newest row. Keep originals;
+     * deduplicate before Paging applies LIMIT/OFFSET, not inside the UI. */
+    @Query("""
+        SELECT s.* FROM screenshots AS s
+        WHERE s.sha256 = '' OR s.id = (
+            SELECT candidate.id FROM screenshots AS candidate
+            WHERE candidate.sha256 = s.sha256 AND candidate.deviceUid = s.deviceUid
+            ORDER BY CASE candidate.status WHEN 'full' THEN 2 WHEN 'thumb' THEN 1 ELSE 0 END DESC,
+                candidate.createdAt DESC, candidate.id DESC
+            LIMIT 1
+        )
+        ORDER BY s.createdAt DESC, s.id DESC
+    """)
     fun pagingSource(): PagingSource<Int, ScreenshotEntity>
 
     @Upsert
     suspend fun upsertAll(items: List<ScreenshotEntity>)
 
+    @Query("DELETE FROM screenshots WHERE sha256 = :sha AND id != :canonicalId AND status = 'local'")
+    suspend fun removeLocalDuplicates(sha: String, canonicalId: String)
+
+    @Query("SELECT * FROM screenshots WHERE status = 'local'")
+    suspend fun localPreviews(): List<ScreenshotEntity>
+
+    @Query("DELETE FROM screenshots WHERE id = :id OR (:sha != '' AND sha256 = :sha)")
+    suspend fun deleteImage(sha: String, id: String)
+
     @Query("SELECT * FROM screenshots WHERE id = :id")
     suspend fun byId(id: String): ScreenshotEntity?
+
+    @Query("DELETE FROM screenshots WHERE id = :id AND status = 'local' AND (thumbPath IS NULL OR thumbPath = '') AND (fullPath IS NULL OR fullPath = '')")
+    suspend fun deleteMissingLocal(id: String)
 
     @Query("DELETE FROM screenshots WHERE id = :id")
     suspend fun deleteById(id: String)

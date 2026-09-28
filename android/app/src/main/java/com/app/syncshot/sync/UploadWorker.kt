@@ -14,17 +14,22 @@ import androidx.work.WorkerParameters
 import androidx.work.workDataOf
 import com.app.syncshot.data.FirebaseRepo
 import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.CancellationException
 
 /** Offline-safe screenshot publish: reads the captured image bytes and hands them
  *  to FirebaseRepo (sha256 dedupe -> thumb -> full). Retries on failure. */
 class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx, params) {
     override suspend fun doWork(): Result {
         val uriStr = inputData.getString("uri") ?: return Result.failure()
+        val owner = inputData.getString("uid") ?: return Result.failure()
+        if (FirebaseRepo.uid != owner) return Result.failure()
         return try {
             val bytes = applicationContext.contentResolver.openInputStream(Uri.parse(uriStr))
                 ?.use { it.readBytes() } ?: return Result.retry()
             FirebaseRepo.publishScreenshot(applicationContext, bytes)
             Result.success()
+        } catch (cancelled: CancellationException) {
+            throw cancelled
         } catch (e: Exception) {
             Result.retry()
         }
@@ -32,8 +37,9 @@ class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
 
     companion object {
         fun enqueue(ctx: Context, uri: Uri) {
+            val owner = FirebaseRepo.uid ?: return
             val req = OneTimeWorkRequestBuilder<UploadWorker>()
-                .setInputData(workDataOf("uri" to uri.toString()))
+                .setInputData(workDataOf("uri" to uri.toString(), "uid" to owner))
                 .setConstraints(
                     Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build()
                 )
@@ -42,7 +48,7 @@ class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
                 .build()
             val key = uri.lastPathSegment ?: uri.toString().hashCode().toString()
             WorkManager.getInstance(ctx).enqueueUniqueWork(
-                "syncshot-upload-$key",
+                "syncshot-upload-$owner-$key",
                 ExistingWorkPolicy.KEEP,
                 req,
             )

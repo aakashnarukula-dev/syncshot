@@ -29,8 +29,8 @@ android {
         applicationId = "com.app.syncshot"
         minSdk = 26
         targetSdk = 34
-        versionCode = 12
-        versionName = "2.0.10"
+        versionCode = 13
+        versionName = "2.0.11"
 
         if (!hasGoogleServicesConfig) {
             // Firebase client configuration is public (authorization is

@@ -51,5 +51,6 @@ jobs:
         with:
           packages: platform-tools
       - uses: gradle/actions/setup-gradle@v4
+      - run: python3 -m unittest discover -s android/tests -v
       - run: ./gradlew assembleDebug testDebugUnitTest
         working-directory: android

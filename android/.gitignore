@@ -16,3 +16,6 @@ keystore.properties
 *.jks
 *.keystore
 google-services.json
+
+# Python SQL regression test cache
+__pycache__/

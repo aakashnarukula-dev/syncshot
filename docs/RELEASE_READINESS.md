@@ -55,3 +55,15 @@ Phone users should connect Google while still signed into their existing account
 ## Local Android release signing
 
 Release key is stored outside Git at `~/.config/syncshot-signing/release.jks`; its local Gradle properties are `android/keystore.properties` (ignored). Back up both securely. Do not regenerate the key for updates, publish it, or commit it. A prior debug-signed install cannot be updated using this new release certificate without migration/reinstallation; do not uninstall an existing app until its data and account are secured.
+
+## Android duplicate/empty-preview repair — 2.0.11
+
+Failed uploads previously wrote a fresh random optimistic Room ID on each retry. Those `local` rows were exempt from reconciliation forever. Deleting one duplicate removed the shared cached image but only one row, leaving empty gray tiles. Concurrent publish attempts also used a non-atomic query-before-create check; thumbnail-only documents incorrectly counted as finished uploads.
+
+- Publish IDs now derive from image SHA-256, with one serialized publisher per account/image. Legacy partial documents resume under their existing ID; complete copies win. Retried cloud writes preserve creation time and cannot downgrade a completed document.
+- Gallery deduplication happens in SQLite before pagination; complete originals win over orphan previews. A non-destructive Room migration adds a hash index.
+- Deleting an image removes all matching cloud/local copies. Account-scoped deletion markers block deferred automatic uploads from resurrecting it. Explicit manual re-upload can restore it.
+- Startup and pull-to-refresh discard only local preview rows with no remote paths and no remaining cached image. Cloud originals and phone gallery files are preserved.
+- Upload workers bind to the originating account; cancellation does not schedule another upload. Observer registration is serialized.
+- Verification: 13 Android unit tests and 9 SQLite regression tests passed; debug and signed release builds passed, and APK signature verification passed. Coverage includes four failed attempts/process restarts, four concurrent notifications, unfinished-upload recovery, deletion/retry ordering, gray-placeholder cleanup, gallery pagination, and deleting duplicate rows.
+- The connected phone's installed APK has a different signing certificate from both local debug and release keys. Updating that installation without deleting app data requires its original signing key. The app has not been uninstalled.

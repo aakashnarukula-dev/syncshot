@@ -72,7 +72,7 @@ fun RootScreen(onSignedOut: () -> Unit) {
                         runCatching {
                             val bytes = ctx.contentResolver.openInputStream(uri)?.use { it.readBytes() }
                                 ?: return@runCatching false
-                            FirebaseRepo.publishScreenshot(ctx, bytes); true
+                            FirebaseRepo.publishScreenshot(ctx, bytes, manual = true); true
                         }.getOrDefault(false)
                     }
                     if (!ok) failures++

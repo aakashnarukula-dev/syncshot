@@ -201,8 +201,12 @@ fun GalleryScreen(onViewerOpenChange: (Boolean) -> Unit) {
                     onRefresh = {
                         refreshing = true
                         ScreenshotPaging.reset()
-                        shots.refresh()
-                        scope.launch { delay(700); refreshing = false }
+                        scope.launch {
+                            try {
+                                com.app.syncshot.data.PreviewRepair.removeMissing(ctx)
+                                shots.refresh()
+                            } finally { refreshing = false }
+                        }
                     },
                     modifier = Modifier.fillMaxSize(),
                 ) {

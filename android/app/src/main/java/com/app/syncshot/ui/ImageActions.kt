@@ -10,7 +10,6 @@ import android.provider.MediaStore
 import androidx.core.content.FileProvider
 import com.app.syncshot.data.FirebaseRepo
 import com.app.syncshot.data.ImageFiles
-import com.app.syncshot.data.db.AppDb
 import com.app.syncshot.data.db.ScreenshotEntity
 import java.io.File
 
@@ -54,9 +53,7 @@ object ImageActions {
      *  Firestore listener won't re-add it on the next snapshot. Call off the main
      *  thread. */
     suspend fun deleteEverywhere(ctx: Context, item: ScreenshotEntity) {
-        FirebaseRepo.deleteScreenshot(item.id, item.thumbPath, item.fullPath)
-        AppDb.get(ctx).screenshots().deleteById(item.id)
-        runCatching { ImageFiles.deleteCachedCopies(ctx, item.sha256) }
+        FirebaseRepo.deleteScreenshot(ctx, item)
     }
 
     fun saveToGallery(ctx: Context, file: File): Boolean {
