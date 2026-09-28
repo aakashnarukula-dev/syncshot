@@ -27,7 +27,7 @@ Phone users should connect Google while still signed into their existing account
 ## Deployment
 
 - Website: https://syncshot-seven.vercel.app
-- Builds are available locally; the GitHub releases page currently has no published binaries. Publishing verified installers remains a launch step.
+- Published preview: https://github.com/aakashnarukula-dev/syncshot/releases/tag/preview-2026.09.28 — Apple Silicon Mac ZIP, Android 2.0.11 APK, and SHA-256 checksums. Website links directly to both downloads. Uploaded checksums and unauthenticated download responses were verified. Intel binaries are not included.
 - Browser login: https://syncshot-v2.web.app/auth.html (launch from the Mac app; requires callback state)
 - Firebase project: `syncshot-v2`; callable functions: `us-central1`, Node.js 22.
 - Vercel direct deployment works. Automatic GitHub linking was rejected by Vercel because its GitHub integration lacks repository access. Grant access through Vercel/GitHub before relying on push-triggered website deployment; set the project root to `syncshot-landing`.
