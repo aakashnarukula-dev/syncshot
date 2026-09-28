@@ -223,7 +223,18 @@ pub fn run() {
             None,
         ))
         .plugin(tauri_plugin_opener::init())
-        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+        .plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                .with_handler(|_app, _shortcut, event| {
+                    commands::capture_diagnostic(match event.state {
+                        tauri_plugin_global_shortcut::ShortcutState::Pressed => "shortcut-pressed",
+                        tauri_plugin_global_shortcut::ShortcutState::Released => {
+                            "shortcut-released"
+                        }
+                    });
+                })
+                .build(),
+        )
         .plugin(tauri_plugin_screenshots::init())
         .plugin(tauri_plugin_store::Builder::default().build())
         .plugin(tauri_plugin_drag::init())
@@ -454,6 +465,9 @@ pub fn run() {
             read_remote_image_bytes,
             file_exists,
             stat_file,
+            commands::request_capture_permission,
+            commands::open_screen_recording_settings,
+            commands::restart_for_capture_permission,
             native_capture_interactive,
             native_capture_fullscreen,
             native_capture_window,

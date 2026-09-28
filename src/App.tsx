@@ -14,6 +14,8 @@ import { toast } from "sonner";
 import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { flushSync } from "react-dom";
 import { loadLicenseStatus, type LicenseStatus } from "@/lib/license";
+import { ScreenRecordingPermission } from "@/components/ScreenRecordingPermission";
+import { createShortcutGate } from "@/lib/shortcutGate";
 import { Paywall } from "@/components/Paywall";
 // Light module (zustand + types only — no Firebase): safe in the entry chunk.
 import {
@@ -55,7 +57,7 @@ const ImageEditor = lazy(() => import("./components/ImageEditor").then(m => ({ d
 const PreferencesPage = lazy(() => import("./components/preferences/PreferencesPage").then(m => ({ default: m.PreferencesPage })));
 const SignInView = lazy(() => import("./components/Pairing/SignInView").then(m => ({ default: m.SignInView })));
 
-type AppMode = "main" | "preferences" | "thumbnail" | "pairing";
+type AppMode = "main" | "preferences" | "thumbnail" | "pairing" | "permission";
 export type ColumnView = "screenshots" | "clipboard";
 
 const THUMB_WIDTH = 240;
@@ -855,7 +857,9 @@ function MainApp() {
   // callback during a settings/StrictMode re-registration, and key repeat can
   // emit additional Pressed events. This shared latch admits exactly one
   // capture until that shortcut's Released event arrives.
-  const shortcutKeysDownRef = useRef<Set<string>>(new Set());
+  const shortcutRegistrationQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const shortcutGateRef = useRef(createShortcutGate());
+  const permissionCaptureModeRef = useRef<CaptureMode>("region");
   // A burst of remote docs may arrive in one Firestore snapshot. Their paths
   // should all merge immediately, but only one native show/genie sequence may
   // run at a time (otherwise the column visibly opens twice).
@@ -1190,34 +1194,20 @@ function MainApp() {
   }, [updateThumbs]);
 
 
+  const showCapturePermission = useCallback(async () => {
+    idleTimerRef.current?.stop();
+    modeRef.current = "permission";
+    flushSync(() => setMode("permission"));
+    await showNormalWindow(getCurrentWindow(), 520, 560, { title: "Screen Recording access" });
+  }, []);
+
   const handleCapture = useCallback(async (captureMode: CaptureMode = "region") => {
     if (isCapturingRef.current) return;
-
-    // Sign-in gate: SyncShot is sync-first, so capturing is blocked until the user
-    // has an account. Read the live store (not a closure) so stale auth can't slip
-    // a shot through; bounce to the sign-in window instead of capturing.
-    if (useSyncStore.getState().authState !== "signedIn") {
-      toast.error("Sign in to SyncShot to capture");
-      void openPairing();
-      return;
-    }
-
-    const access = await loadLicenseStatus();
-    licenseStatusRef.current = access;
-    setLicenseStatus(access);
-    if (access.state !== "licensed" && access.state !== "trial") {
-      setShowPaywall(true);
-      await showNormalWindow(getCurrentWindow(), 520, 640, {
-        title: "Activate SyncShot",
-      });
-      setMode("main");
-      return;
-    }
-
-    if (isCapturingRef.current) return;
+    // Acquire before any await, including permission and account checks.
     isCapturingRef.current = true;
     idleTimerRef.current?.stop();
     columnHoveredRef.current = false;
+    permissionCaptureModeRef.current = captureMode;
 
     const appWindow = getCurrentWindow();
     // Keep the pre-capture surface so an Escape/capture/save failure always
@@ -1229,6 +1219,26 @@ function MainApp() {
     const { copyToClipboard: shouldCopyToClipboard, tempDir: currentTempDir } = settingsRef.current;
 
     try {
+      // Permission UI must remain visible and must not wait on cloud access.
+      // macOS may return false without displaying another system consent alert.
+      if (!await invoke<boolean>("request_capture_permission")) {
+        await showCapturePermission();
+        return;
+      }
+      if (useSyncStore.getState().authState !== "signedIn") {
+        toast.error("Sign in to SyncShot to capture");
+        await openPairing();
+        return;
+      }
+      const access = await loadLicenseStatus();
+      licenseStatusRef.current = access;
+      setLicenseStatus(access);
+      if (access.state !== "licensed" && access.state !== "trial") {
+        setShowPaywall(true);
+        await showNormalWindow(appWindow, 520, 640, { title: "Activate SyncShot" });
+        setMode("main");
+        return;
+      }
       // Hide every form of the pill while the native capture picker is active,
       // so it can never end up in the captured image. The failure path below is
       // deliberately independent of the thumbnail count: an empty pill is still
@@ -1307,6 +1317,11 @@ function MainApp() {
       startAutoHide();
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : String(err);
+      const normalizedError = errorMessage.toLowerCase();
+      if (normalizedError.includes("permission") || normalizedError.includes("denied") || normalizedError.includes("not authorized")) {
+        await showCapturePermission();
+        return;
+      }
       // The native picker is allowed to fail/cancel, but it is never allowed to
       // close the pill. Restore the exact prior form (or the collapsed control
       // if the rail did not yet have content).
@@ -1330,31 +1345,21 @@ function MainApp() {
         startAutoHide();
       }
 
-      const normalizedError = errorMessage.toLowerCase();
       if (normalizedError.includes("cancelled")) {
         // user cancelled — silent
       } else if (normalizedError.includes("already in progress")) {
         toast.error("Please wait for the current screenshot to complete", { duration: 4000 });
-      } else if (
-        normalizedError.includes("permission") ||
-        normalizedError.includes("access") ||
-        normalizedError.includes("denied")
-      ) {
-        toast.error("Screen Recording permission required", {
-          description:
-            "Enable SyncShot in System Settings > Privacy & Security > Screen Recording, then try again. Restart only if macOS asks.",
-          duration: 8000,
-        });
       } else {
         reportError(errorMessage);
       }
     } finally {
       isCapturingRef.current = false;
     }
-  }, [updateThumbs, reportError, openPairing, openThumbnailWindow, startAutoHide]);
+  }, [updateThumbs, reportError, openPairing, openThumbnailWindow, startAutoHide, showCapturePermission]);
 
   // Setup hotkeys whenever settings change
   useEffect(() => {
+    let disposed = false;
     const setupHotkeys = async () => {
       try {
         const shortcutsToUnregister = Array.from(registeredShortcutsRef.current);
@@ -1374,19 +1379,16 @@ function MainApp() {
         };
 
         for (const shortcut of shortcuts) {
+          if (disposed) break;
           if (!shortcut.enabled) continue;
           
           const action = actionMap[shortcut.action];
           if (action) {
             try {
               await register(shortcut.shortcut, (event) => {
-                if (event.state === "Released") {
-                  shortcutKeysDownRef.current.delete(event.shortcut);
-                  return;
+                if (shortcutGateRef.current.accept(event.shortcut, event.state)) {
+                  void handleCapture(action);
                 }
-                if (shortcutKeysDownRef.current.has(event.shortcut)) return;
-                shortcutKeysDownRef.current.add(event.shortcut);
-                void handleCapture(action);
               });
               registeredShortcutsRef.current.add(shortcut.shortcut);
             } catch (err) {
@@ -1400,15 +1402,23 @@ function MainApp() {
       }
     };
 
-    setupHotkeys();
+    // Initial preferences load can replace defaults while registration awaits
+    // native IPC. Serialize teardown/setup so an old effect cannot unregister
+    // the new shortcuts or leave its late registration behind.
+    shortcutRegistrationQueueRef.current = shortcutRegistrationQueueRef.current
+      .catch(console.error)
+      .then(() => disposed ? undefined : setupHotkeys());
 
     return () => {
-      const shortcutsToUnregister = Array.from(registeredShortcutsRef.current);
-      if (shortcutsToUnregister.length > 0) {
-        unregister(shortcutsToUnregister).catch(console.error);
-      }
-      registeredShortcutsRef.current.clear();
-      shortcutKeysDownRef.current.clear();
+      disposed = true;
+      shortcutRegistrationQueueRef.current = shortcutRegistrationQueueRef.current
+        .catch(console.error)
+        .then(async () => {
+          const registered = Array.from(registeredShortcutsRef.current);
+          if (registered.length > 0) await unregister(registered).catch(console.error);
+          registeredShortcutsRef.current.clear();
+          shortcutGateRef.current.clear();
+        });
     };
   }, [shortcuts, settingsVersion, handleCapture]);
 
@@ -1823,6 +1833,13 @@ function MainApp() {
         onDragStateChange={handleScreenshotDragStateChange}
       />
     );
+  }
+
+  if (mode === "permission") {
+    return <ScreenRecordingPermission
+      onRetry={() => handleCapture(permissionCaptureModeRef.current)}
+      onClose={restoreColumnAfterModal}
+    />;
   }
 
   if (mode === "pairing") {

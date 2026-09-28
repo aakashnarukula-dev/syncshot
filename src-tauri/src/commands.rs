@@ -1366,6 +1366,106 @@ fn check_and_activate_permission() -> Result<(), String> {
     )
 }
 
+/// Ask from the main thread while the application is active, before the
+/// frontend hides its window or waits for cloud access. False is a normal
+/// outcome: macOS is free to suppress a previously denied consent dialog.
+#[tauri::command]
+pub async fn request_capture_permission(app: AppHandle) -> Result<bool, String> {
+    capture_diagnostic("permission-check");
+    tauri::async_runtime::spawn_blocking(move || {
+        if screen_recording_allowed() {
+            capture_diagnostic("permission-granted");
+            return Ok(true);
+        }
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        app.run_on_main_thread(move || {
+            #[cfg(target_os = "macos")]
+            unsafe {
+                use objc2::{
+                    msg_send,
+                    runtime::{AnyClass, AnyObject},
+                };
+                if let Some(cls) = AnyClass::get("NSApplication") {
+                    let ns_app: *mut AnyObject = msg_send![cls, sharedApplication];
+                    if !ns_app.is_null() {
+                        let _: () = msg_send![ns_app, activateIgnoringOtherApps: true];
+                    }
+                }
+            }
+            let granted = request_screen_recording_permission();
+            capture_diagnostic(if granted {
+                "permission-request-granted"
+            } else {
+                "permission-request-denied"
+            });
+            let _ = tx.send(granted);
+        })
+        .map_err(|e| format!("Permission request failed: {e}"))?;
+        rx.recv()
+            .map_err(|e| format!("Permission request failed: {e}"))
+    })
+    .await
+    .map_err(|e| format!("Permission task failed: {e}"))?
+}
+
+#[tauri::command]
+pub fn open_screen_recording_settings() -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let status = Command::new("/usr/bin/open")
+            .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")
+            .status()
+            .map_err(|e| format!("Could not open Screen Recording settings: {e}"))?;
+        if !status.success() {
+            return Err("Could not open Screen Recording settings".into());
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn restart_for_capture_permission(app: AppHandle) {
+    app.request_restart();
+}
+
+/// Bounded, local diagnostics contain only capture stages, never keys, account
+/// details, image paths, or image content. Useful when OS consent fails silently.
+pub(crate) fn capture_diagnostic(stage: &str) {
+    static LOG_LOCK: Mutex<()> = Mutex::new(());
+    let Ok(_guard) = LOG_LOCK.lock() else {
+        return;
+    };
+    let Some(root) = dirs::cache_dir() else {
+        return;
+    };
+    let dir = root.join("com.aakashnarukula.syncshot");
+    if fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let path = dir.join("capture-diagnostics.log");
+    let rotate = fs::metadata(&path)
+        .map(|m| m.len() > 32_768)
+        .unwrap_or(false);
+    let mut options = fs::OpenOptions::new();
+    options
+        .create(true)
+        .write(true)
+        .append(!rotate)
+        .truncate(rotate);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    if let Ok(mut file) = options.open(path) {
+        let time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let _ = writeln!(file, "{time} pid={} {stage}", std::process::id());
+    }
+}
+
 /// Access can also be revoked after preflight, while a region/window picker is
 /// open. Recheck failures (including a missing output file) before calling them
 /// cancellations, and request access even if the OS preflight result was stale.

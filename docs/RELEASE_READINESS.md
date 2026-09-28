@@ -89,3 +89,15 @@ Every region, window, and full-screen capture now checks macOS permission afresh
 Verification: 149 frontend tests and 54 Rust tests passed, including five permission recovery cases (grant/revoke/regrant in one process, new grant, removal during capture, stale preflight with authorization error, and cancellation without a permission prompt). Physical shortcut testing after removing permission from a running updated app remains required; unit tests do not establish whether macOS will display a new consent dialog in every permission state.
 
 Mac 0.2.22 release build and ad-hoc signature validation passed. Installed and launched `/Applications/SyncShot.app`; installed executable matches the build. Prior app retained under `src-tauri/target/release/previous-installation-0.2.22/20260928-160950/SyncShot.app`. System Settings currently has no SyncShot entry. Remote key injection did not activate the global shortcut; user has been asked to perform the grant/capture/remove/retry sequence on the physical keyboard.
+
+## Screen Recording follow-up — Mac 0.2.23
+
+The user reported that 0.2.22 still did not show a consent pop-up. Removing the cached grant alone did not verify or fix the whole shortcut-to-permission flow.
+
+- Request permission on the native main thread after activating SyncShot, before hiding its window or waiting for cloud account checks.
+- If macOS returns false without a system dialog, show a full-size access recovery window, with Screen Recording settings, retry, cancel, and an explicit restart action. Explain how to add SyncShot when it is missing from the list. Do not claim an app can force macOS to repeat consent in every state.
+- Acquire the capture guard before asynchronous checks. Bound shortcut key-down suppression so a missing release cannot disable capture for the process lifetime. Serialize shortcut registration and cleanup to prevent preferences loading from racing the default registrations.
+- Keep permission failures out of the collapsed pill, where the toast was not usable. No permission database resets, automatic grants, or automatic app restarts.
+- Add a bounded, private local capture-stage log in the app cache. It records native press/release and permission outcomes, without key values, account details, file paths, or image content.
+
+Verification: 154 frontend tests and 54 Rust tests passed, plus the release build and ad-hoc signature check. Installed and launched 0.2.23; installed executable matches the build. Prior app retained under `src-tauri/target/release/previous-installation-0.2.23/20260928-161542/SyncShot.app`. Remote key injection produced no native shortcut events, so the user was asked for one physical Command-Shift-2 press to inspect the live path.
