@@ -1385,6 +1385,7 @@ pub async fn request_capture_permission(app: AppHandle) -> Result<bool, String> 
     tauri::async_runtime::spawn_blocking(move || {
         if screen_recording_allowed() {
             capture_diagnostic("permission-granted");
+            crate::capture_permission::recover_if_needed(true)?;
             return Ok(true);
         }
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
@@ -1409,13 +1410,14 @@ pub async fn request_capture_permission(app: AppHandle) -> Result<bool, String> 
             .map_err(|e| format!("Permission request failed: {e}"))?;
         // Fresh process requests on its own main thread. Do not block the
         // application's main loop while the OS consent dialog is pending.
-        crate::capture_permission::request().inspect(|granted| {
-            capture_diagnostic(if *granted {
-                "fresh-permission-granted"
-            } else {
-                "fresh-permission-not-granted"
-            });
-        })
+        let granted = crate::capture_permission::request()?;
+        capture_diagnostic(if granted {
+            "fresh-permission-granted"
+        } else {
+            "fresh-permission-not-granted"
+        });
+        crate::capture_permission::recover_if_needed(granted)?;
+        Ok(granted)
     })
     .await
     .map_err(|e| format!("Permission task failed: {e}"))?

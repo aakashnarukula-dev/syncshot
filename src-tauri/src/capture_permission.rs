@@ -6,6 +6,48 @@
 const REQUEST_ARG: &str = "--syncshot-request-screen-recording";
 const DENIED: i32 = 10;
 
+/// Tracks an unanswered request, never a cached permission grant. macOS owns
+/// the first consent dialog; later blocked attempts need a visible Settings
+/// destination because macOS may suppress repeated consent dialogs.
+#[derive(Default)]
+struct RecoveryState {
+    awaiting_grant: bool,
+}
+
+impl RecoveryState {
+    fn observe(&mut self, granted: bool) -> bool {
+        let open_settings = !granted && self.awaiting_grant;
+        self.awaiting_grant = !granted;
+        open_settings
+    }
+}
+
+pub(crate) fn recover_if_needed(granted: bool) -> Result<(), String> {
+    static STATE: std::sync::Mutex<RecoveryState> = std::sync::Mutex::new(RecoveryState {
+        awaiting_grant: false,
+    });
+    let open_settings = STATE
+        .lock()
+        .map_err(|_| "Screen Recording permission state unavailable".to_string())?
+        .observe(granted);
+    if open_settings {
+        #[cfg(target_os = "macos")]
+        {
+            let status = std::process::Command::new("/usr/bin/open")
+                .arg(
+                    "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture",
+                )
+                .status()
+                .map_err(|e| format!("Could not open Screen Recording permission settings: {e}"))?;
+            if !status.success() {
+                return Err("Could not open Screen Recording permission settings".into());
+            }
+            crate::commands::capture_diagnostic("permission-settings-opened");
+        }
+    }
+    Ok(())
+}
+
 fn is_request_mode(args: &[std::ffi::OsString]) -> bool {
     args.len() == 2 && args[1] == REQUEST_ARG
 }
@@ -72,6 +114,33 @@ pub fn request() -> Result<bool, String> {
 mod tests {
     use super::*;
     use std::ffi::OsString;
+
+    #[test]
+    fn first_denial_keeps_native_prompt_then_retries_open_settings() {
+        let mut state = RecoveryState::default();
+        assert!(!state.observe(false)); // System prompt adds the app to Settings.
+        assert!(state.observe(false)); // User closed Settings without enabling it.
+        assert!(state.observe(false)); // Closing Settings again must not strand them.
+    }
+
+    #[test]
+    fn granting_access_stops_settings_and_resets_next_revocation() {
+        let mut state = RecoveryState::default();
+        assert!(!state.observe(false));
+        assert!(state.observe(false));
+        assert!(!state.observe(true));
+        assert!(!state.observe(true));
+        assert!(!state.observe(false)); // A newly revoked grant gets a native request.
+        assert!(state.observe(false));
+    }
+
+    #[test]
+    fn authorized_captures_never_open_settings() {
+        let mut state = RecoveryState::default();
+        for _ in 0..3 {
+            assert!(!state.observe(true));
+        }
+    }
     #[test]
     fn helper_mode_requires_exact_internal_argument() {
         let args = |values: &[&str]| values.iter().map(OsString::from).collect::<Vec<_>>();

@@ -117,3 +117,13 @@ At the user's request, removed the “Allow screenshot access” component, its 
 Verification: 152 frontend tests and 56 Rust tests passed. The custom permission component, window mode, commands, and copy are absent from application source. The previously open custom dialog was dismissed and the pill returned.
 
 Mac 0.2.25 release build and ad-hoc signature checks passed. Installed executable matches the build; previous bundle retained at `src-tauri/target/release/previous-installation-0.2.25/20260928-163503/SyncShot.app`.
+
+## Reopen Settings when permission stays disabled — Mac 0.2.26
+
+The user confirmed that removing SyncShot from the list correctly triggers the native macOS consent dialog. The remaining case is closing Settings without enabling the newly added SyncShot entry, then pressing a capture shortcut again.
+
+Only that retry behavior changed: remember an unanswered permission request within the running app. The first blocked attempt preserves the existing native-request flow. Subsequent blocked attempts still perform the native request, then open `Privacy_ScreenCapture` directly. Observing a grant clears the retry state, so authorized capture never opens Settings and a later revocation begins with the native prompt again. This state does not cache a permission grant or read the TCC database. No custom app pop-up was restored; screenshot capture, shortcuts, sync, and frontend code are unchanged.
+
+Verification: 59 Rust tests passed, including first denial, repeated denial after closing Settings, grant/reset/revoke, and authorized capture cases. Frontend production build passed. Physical shortcut-to-Settings testing on the installed update remains pending.
+
+Mac 0.2.26 release build and ad-hoc signature checks passed. Installed executable matches the build; previous bundle retained at `src-tauri/target/release/previous-installation-0.2.26/20260928-164453/SyncShot.app`.
