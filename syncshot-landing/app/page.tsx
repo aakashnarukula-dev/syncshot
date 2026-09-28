@@ -1,4 +1,5 @@
 import Link from "next/link"
+import Image from "next/image"
 import { ArrowUpRight, Check, Clipboard, Crop, Download, Layers, ScanText, MousePointer2, Monitor, SlidersHorizontal, Palette } from "lucide-react"
 import { WorkflowPreview } from "@/components/workflow-preview"
 
@@ -17,7 +18,7 @@ export default function Home() {
     <a href="#main" className="sr-only focus:not-sr-only focus:fixed focus:left-4 focus:top-4 focus:z-50 focus:bg-card focus:p-4">Skip to content</a>
     <header className="border-b border-border bg-card">
       <nav aria-label="Main navigation" className="mx-auto flex max-w-7xl items-center justify-between gap-4 px-6 py-5 md:px-10">
-        <Link href="/" className="flex items-center gap-2.5 text-xl font-semibold"><Crop className="size-7 text-accent"/>SyncShot</Link>
+        <Link href="/" className="flex items-center gap-2.5 text-xl font-semibold"><Image src="/syncshot-mark.svg" width={28} height={28} alt="" className="size-7"/>SyncShot</Link>
         <div className="hidden items-center gap-8 text-sm text-neutral-400 sm:flex"><a href="#how-it-works">How it works</a><a href="#features">Features</a><a href="#pricing">Pricing</a></div>
         <a href="#pricing" className="rounded-full bg-primary px-5 py-2.5 text-sm font-semibold text-primary-foreground">Get SyncShot</a>
       </nav>
@@ -48,12 +49,12 @@ export default function Home() {
         <div className="flex flex-col justify-between gap-6 lg:flex-row lg:items-center">
           <div><h2 className="text-2xl font-semibold">Bring your screens together.</h2><p className="mt-2 text-neutral-400">Download the latest preview. Sign in with the same Google account.</p></div>
           <div className="flex flex-col gap-3 sm:flex-row">
-            <a href="https://github.com/aakashnarukula-dev/syncshot/releases/download/preview-2026.09.28/SyncShot-macOS-Apple-Silicon.zip" className="inline-flex items-center justify-center gap-2 rounded-full bg-primary px-6 py-3 font-medium text-primary-foreground"><Download className="size-4"/>Mac · Apple Silicon</a>
-            <a href="https://github.com/aakashnarukula-dev/syncshot/releases/download/preview-2026.09.28/SyncShot-Android-2.0.11.apk" className="inline-flex items-center justify-center gap-2 rounded-full border border-neutral-600 bg-card px-6 py-3"><Download className="size-4"/>Android · APK</a>
+            <a href="https://github.com/aakashnarukula-dev/syncshot/releases/download/preview-2026.09.28-icons/SyncShot-macOS-0.2.27-Apple-Silicon.zip" className="inline-flex items-center justify-center gap-2 rounded-full bg-primary px-6 py-3 font-medium text-primary-foreground"><Download className="size-4"/>Mac · Apple Silicon</a>
+            <a href="https://github.com/aakashnarukula-dev/syncshot/releases/download/preview-2026.09.28-icons/SyncShot-Android-2.0.12.apk" className="inline-flex items-center justify-center gap-2 rounded-full border border-neutral-600 bg-card px-6 py-3"><Download className="size-4"/>Android · APK</a>
           </div>
         </div>
-        <p className="mt-5 text-sm leading-6 text-neutral-400">Mac 0.2.21 for M-series Macs · Android 2.0.11 for Android 8+. Intel build not included in this preview. Mac app is not notarized and needs Screen Recording access.</p>
-        <p className="mt-2 text-sm leading-6 text-neutral-400">Updating an older Android install may require its original signing key. Keep your existing app and data if Android rejects the update. <a className="text-foreground underline underline-offset-4" href="https://github.com/aakashnarukula-dev/syncshot/releases/tag/preview-2026.09.28">Install notes &amp; release details</a></p>
+        <p className="mt-5 text-sm leading-6 text-neutral-400">Mac 0.2.27 for M-series Macs · Android 2.0.12 for Android 8+. Intel build not included in this preview. Mac app is not notarized and needs Screen Recording access.</p>
+        <p className="mt-2 text-sm leading-6 text-neutral-400">Updating an older Android install may require its original signing key. Keep your existing app and data if Android rejects the update. <a className="text-foreground underline underline-offset-4" href="https://github.com/aakashnarukula-dev/syncshot/releases/tag/preview-2026.09.28-icons">Install notes &amp; release details</a></p>
       </section>
       <section id="faq" className="mx-auto max-w-3xl px-6 py-24"><h2 className="mb-10 text-balance text-center text-4xl font-semibold">A few things to know.</h2>{[
         ["Does it support iPhone or Windows?","This version is for macOS and Android. iPhone and Windows apps are not included."],
@@ -64,6 +65,6 @@ export default function Home() {
         ["Can I use it offline?","Cloud sync and account access checks require an internet connection. Cloud-only originals must be downloaded before they can be used offline."],
       ].map(([q,a])=><details key={q} className="border-b border-border py-5"><summary className="cursor-pointer text-base font-medium">{q}</summary><p className="mt-4 text-pretty text-sm leading-7 text-neutral-400">{a}</p></details>)}</section>
     </main>
-    <footer className="border-t border-border bg-card"><div className="mx-auto flex max-w-7xl flex-wrap items-center justify-between gap-5 px-6 py-8 text-sm text-neutral-400"><span className="flex items-center gap-2 font-medium text-foreground"><Crop className="size-5 text-accent"/>SyncShot</span><div className="flex gap-6"><Link href="/privacy">Privacy</Link><Link href="/terms">Terms</Link><a href="https://github.com/aakashnarukula-dev/syncshot/issues">Support</a><a href="https://github.com/aakashnarukula-dev/syncshot">GitHub</a></div><span>© {new Date().getFullYear()} SyncShot</span></div></footer>
+    <footer className="border-t border-border bg-card"><div className="mx-auto flex max-w-7xl flex-wrap items-center justify-between gap-5 px-6 py-8 text-sm text-neutral-400"><span className="flex items-center gap-2 font-medium text-foreground"><Image src="/syncshot-mark.svg" width={20} height={20} alt="" className="size-5"/>SyncShot</span><div className="flex gap-6"><Link href="/privacy">Privacy</Link><Link href="/terms">Terms</Link><a href="https://github.com/aakashnarukula-dev/syncshot/issues">Support</a><a href="https://github.com/aakashnarukula-dev/syncshot">GitHub</a></div><span>© {new Date().getFullYear()} SyncShot</span></div></footer>
   </>
 }

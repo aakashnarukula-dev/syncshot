@@ -120,7 +120,7 @@ private fun AppHeader(onUpload: () -> Unit, onProfile: () -> Unit) {
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Image(
-                painter = painterResource(R.mipmap.ic_launcher_foreground),
+                painter = painterResource(R.drawable.ic_syncshot),
                 contentDescription = null,
                 modifier = Modifier.size(26.dp).clip(RoundedCornerShape(6.dp)),
             )
