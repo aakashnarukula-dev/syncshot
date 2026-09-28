@@ -127,3 +127,15 @@ Only that retry behavior changed: remember an unanswered permission request with
 Verification: 59 Rust tests passed, including first denial, repeated denial after closing Settings, grant/reset/revoke, and authorized capture cases. Frontend production build passed. Physical shortcut-to-Settings testing on the installed update remains pending.
 
 Mac 0.2.26 release build and ad-hoc signature checks passed. Installed executable matches the build; previous bundle retained at `src-tauri/target/release/previous-installation-0.2.26/20260928-164453/SyncShot.app`.
+
+## Enabled toggle but repeated consent — signing identity diagnosis
+
+Live `tccd` logs after the 0.2.26 installation reported `Failed to match existing code requirement` for SyncShot's ScreenCapture permission. The enabled entry required cdhash `8e9bb60a18bd684c731dabf8eb00aee116e053ca` (confirmed to be the archived 0.2.25 executable), while the installed 0.2.26 executable requires `63fe8434ce9408766cf468b20f19ccfea57df3c7`. An enabled Settings toggle was therefore not evidence that the current binary had permission. This is a signing-identity mismatch, not proof that the retry state ignores a successful grant.
+
+The six prior installation bundles were also registered in LaunchServices under the same bundle identifier. They have now been unregistered and preserved as `.app.zip` archives alongside their former locations. Each archive passed ZIP integrity validation and SHA-256 comparison of every regular source file before the unpacked backup was removed. The build-output app was unregistered and `/Applications/SyncShot.app` registered explicitly. Duplicate registration is a possible source of app-resolution ambiguity; the logs establish the signature mismatch, not which UI action selected the older identity.
+
+No application source, installed binary, signing requirement, TCC database, or permission grant was changed during this repair. Both installed and build-output bundles pass strict signature verification; their executable SHA-256 remains `91ffa9471efed51fe785aa2431bb50ad62f42d8d96ae50e8abb3bb4b6be179ed`.
+
+Remaining manual verification: remove the stale SyncShot entry in Screen & System Audio Recording, add the exact `/Applications/SyncShot.app` bundle, enable it, and retry the physical capture shortcut. Confirm capture succeeds and neither consent nor Settings reopens. Then test the disabled-toggle retry separately. Do not mark this incident resolved until those outcomes are observed.
+
+For future local installations, keep rollback copies compressed rather than as registered `.app` bundles. Preserve the installed binary throughout permission testing. Ad-hoc signing ties the designated requirement to a particular build, so a changed binary may require a fresh user grant; do not diagnose this as a capture-flow regression or weaken the signing requirement to bypass consent. See Apple's [TN3127: Inside Code Signing: Requirements](https://developer.apple.com/documentation/technotes/tn3127-inside-code-signing-requirements).
