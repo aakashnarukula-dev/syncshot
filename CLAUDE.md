@@ -103,4 +103,4 @@ These dirs are **empty placeholders in this fleet checkout** — the actual Fast
 - macOS-first: Rust has `cfg(target_os = "macos")` paths (objc2) and single-instance guard for desktop. Don't break the platform cfgs.
 - Keep version strings in sync across `package.json` / `Cargo.toml` / `tauri.conf.json`.
 - Tailwind v4: utilities only, no `tailwind.config.js`.
-- Release flow: `.github/workflows/release.yml` + `scripts/*-release-notes.sh`; `CHANGELOG.md` is maintained.
+- Release flow: push a `v*` (release) or `preview-*` (prerelease) tag → `.github/workflows/release.yml` publishes the Apple Silicon Mac ZIP, signed Android APK and `SHA256SUMS.txt`. Android signing needs the `ANDROID_KEYSTORE_BASE64` / `ANDROID_KEYSTORE_PASSWORD` / `ANDROID_KEY_ALIAS` / `ANDROID_KEY_PASSWORD` repo secrets. Website download links in `syncshot-landing/app/page.tsx` point at a specific tag and must be updated by hand. `CHANGELOG.md` is maintained.

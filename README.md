@@ -94,11 +94,9 @@ Clean screenshot workflows usually need three things: capture fast, polish fast 
 ### Download a release (recommended)
 
 1. Go to [Releases](https://github.com/aakashnarukula-dev/syncshot/releases)
-2. Download the appropriate DMG file:
-   - **Apple Silicon** (M1/M2/M3): `syncshot_*_aarch64.dmg`
-   - **Intel**: `syncshot_*_x64.dmg`
-3. Open the DMG and drag SyncShot to Applications
-4. First launch (recommended):
+2. Download `SyncShot-macOS-<version>-Apple-Silicon.zip` (M-series Macs; Intel builds are not published)
+3. Unzip it and move SyncShot.app to Applications
+4. First launch: right-click SyncShot.app → **Open**, or run:
 
 ```bash
 xattr -d com.apple.quarantine /Applications/SyncShot.app
