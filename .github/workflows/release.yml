@@ -1,134 +1,201 @@
 name: Release
 
+# Builds the same assets the September 2026 previews were published with by hand:
+#   SyncShot-macOS-<version>-Apple-Silicon.zip  (ad-hoc signed .app, arm64 only)
+#   SyncShot-Android-<versionName>.apk          (release-signed)
+#   SHA256SUMS.txt
+#
+# `v*` tags publish a normal release; `preview-*` tags publish a prerelease.
+#
+# Android signing needs these repository secrets (the release key is never committed):
+#   ANDROID_KEYSTORE_BASE64   base64 of the release .jks
+#   ANDROID_KEYSTORE_PASSWORD
+#   ANDROID_KEY_ALIAS
+#   ANDROID_KEY_PASSWORD
+
 on:
   push:
     tags:
       - 'v*'
+      - 'preview-*'
   workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to build and release'
+        required: true
 
 permissions:
   contents: write
 
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+
 jobs:
-  build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: macos-latest
-            args: '--target aarch64-apple-darwin'
-            arch: 'silicon'
-          - platform: macos-latest
-            args: '--target x86_64-apple-darwin'
-            arch: 'intel'
-
-    runs-on: ${{ matrix.platform }}
+  mac:
+    runs-on: macos-latest
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          ref: ${{ env.RELEASE_TAG }}
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: 22
 
-      - name: Install pnpm
-        uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v4
 
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-apple-darwin,x86_64-apple-darwin
+          targets: aarch64-apple-darwin
 
-      - name: Install frontend dependencies
-        run: pnpm install
-
-      - name: Generate release notes
-        id: release_notes
+      - name: Check version strings are in sync
         run: |
-          TAG_NAME="${{ github.ref_name }}"
-          PREV_TAG=$(git tag --sort=-v:refname | sed -n '2p')
-          if [ -z "$PREV_TAG" ]; then
-            COMMITS=$(git log --oneline --pretty=format:"- %s" --reverse)
-          else
-            COMMITS=$(git log "$PREV_TAG".."$TAG_NAME" --oneline --pretty=format:"- %s" --reverse)
+          PKG=$(node -p "require('./package.json').version")
+          CONF=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          CARGO=$(sed -n 's/^version = "\(.*\)"/\1/p' src-tauri/Cargo.toml | head -1)
+          echo "package.json=$PKG tauri.conf.json=$CONF Cargo.toml=$CARGO"
+          if [ "$PKG" != "$CONF" ] || [ "$PKG" != "$CARGO" ]; then
+            echo "::error::Version strings differ; keep package.json, tauri.conf.json and Cargo.toml in sync"
+            exit 1
           fi
-          if [ -z "$COMMITS" ]; then
-            COMMITS="- No changes documented"
-          fi
-          echo "notes<<EOF" >> $GITHUB_OUTPUT
-          echo "$COMMITS" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
+          echo "MAC_VERSION=$PKG" >> "$GITHUB_ENV"
 
-      - name: Build Tauri app
-        uses: tauri-apps/tauri-action@v0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - run: pnpm install --frozen-lockfile
+
+      - name: Build SyncShot.app
+        run: pnpm tauri build --target aarch64-apple-darwin --bundles app
+
+      - name: Package ZIP
+        run: |
+          APP="src-tauri/target/aarch64-apple-darwin/release/bundle/macos/SyncShot.app"
+          codesign --verify --deep --strict "$APP"
+          mkdir -p dist-release
+          ditto -c -k --sequesterRsrc --keepParent "$APP" "dist-release/SyncShot-macOS-${MAC_VERSION}-Apple-Silicon.zip"
+
+      - uses: actions/upload-artifact@v4
         with:
-          tagName: ${{ github.ref_name }}
-          releaseName: 'SyncShot ${{ github.ref_name }}'
-          releaseBody: |
-            ## Downloads
-            
-            | Platform | Architecture | Download |
-            |----------|--------------|----------|
-            | macOS | Apple Silicon (M1/M2/M3) | `syncshot_*_aarch64.dmg` |
-            | macOS | Intel | `syncshot_*_x64.dmg` |
-            
-            ## Installation
-            
-            1. Download the `.dmg` file for your Mac
-               - **Apple Silicon** (M1, M2, M3): Download the `aarch64` version
-               - **Intel Mac**: Download the `x64` version
-            2. Open the DMG and drag SyncShot to Applications
-            3. **First Launch** - Choose one method (recommended):
-            
-               **Option A: Right-Click Method** (Easiest)
-               - Right-click the app → **Open** → Click **Open** in the dialog
-               
-               **Option B: Terminal Method** (One command, no dialogs) (recommended)
-               ```bash
-               xattr -d com.apple.quarantine /Applications/SyncShot.app
-               ```
-               
-            4. Grant Screen Recording permission when prompted in System Settings
-            
-            > **Note**: This is an ad-hoc signed indie app. macOS shows a warning for apps not notarized through Apple's $99/year developer program. Review the source and download only from this repository.
-            
-            ## What's New
-            
-            ${{ steps.release_notes.outputs.notes }}
-          releaseDraft: true
-          prerelease: false
-          includeUpdaterJson: true
-          args: ${{ matrix.args }}
+          name: mac
+          path: dist-release/*.zip
+          if-no-files-found: error
 
-  publish:
-    needs: build
+  android:
     runs-on: ubuntu-latest
     steps:
-      - name: Publish Release
-        uses: actions/github-script@v7
+      - uses: actions/checkout@v4
         with:
-          script: |
-            const { data: releases } = await github.rest.repos.listReleases({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-            });
-            
-            const tagName = context.ref.replace('refs/tags/', '');
-            const draftRelease = releases.find(r => r.draft && r.tag_name === tagName);
-            
-            if (draftRelease) {
-              await github.rest.repos.updateRelease({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                release_id: draftRelease.id,
-                draft: false,
-              });
-              console.log(`Published release: ${draftRelease.html_url}`);
-            } else {
-              console.log(`No draft release found for tag: ${tagName}`);
-            }
+          ref: ${{ env.RELEASE_TAG }}
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Write release signing config
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          if [ -z "$KEYSTORE_BASE64" ] || [ -z "$KEYSTORE_PASSWORD" ] || [ -z "$KEY_ALIAS" ] || [ -z "$KEY_PASSWORD" ]; then
+            echo "::error::Android release signing secrets are missing; refusing to publish an unsigned or debug-signed APK"
+            exit 1
+          fi
+          echo "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/release.jks"
+          {
+            echo "storeFile=$RUNNER_TEMP/release.jks"
+            echo "storePassword=$KEYSTORE_PASSWORD"
+            echo "keyAlias=$KEY_ALIAS"
+            echo "keyPassword=$KEY_PASSWORD"
+          } > android/keystore.properties
+
+      - name: Build signed APK
+        working-directory: android
+        run: ./gradlew assembleRelease
+
+      - name: Verify signature and name APK
+        run: |
+          APK=android/app/build/outputs/apk/release/app-release.apk
+          test -f "$APK" || { echo "::error::Signed release APK was not produced"; exit 1; }
+          APKSIGNER=$(ls "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -1)
+          "$APKSIGNER" verify --print-certs "$APK"
+          VERSION=$(sed -n 's/.*versionName = "\(.*\)"/\1/p' android/app/build.gradle.kts | head -1)
+          mkdir -p dist-release
+          cp "$APK" "dist-release/SyncShot-Android-${VERSION}.apk"
+
+      - name: Remove signing material
+        if: always()
+        run: rm -f "$RUNNER_TEMP/release.jks" android/keystore.properties
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android
+          path: dist-release/*.apk
+          if-no-files-found: error
+
+  publish:
+    needs: [mac, android]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist-release
+          merge-multiple: true
+
+      - name: Write checksums
+        working-directory: dist-release
+        run: |
+          sha256sum *.zip *.apk > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Write release notes
+        run: |
+          PREV_TAG=$(git describe --tags --abbrev=0 "${RELEASE_TAG}^" 2>/dev/null || true)
+          if [ -n "$PREV_TAG" ]; then
+            COMMITS=$(git log "$PREV_TAG".."$RELEASE_TAG" --pretty=format:"- %s" --reverse)
+          else
+            COMMITS=$(git log "$RELEASE_TAG" --pretty=format:"- %s" --reverse)
+          fi
+          cat > release-notes.md <<EOF
+          ## Downloads
+
+          - **SyncShot-macOS-*-Apple-Silicon.zip** — Mac app for M-series Macs (arm64). Intel builds are not included.
+          - **SyncShot-Android-*.apk** — signed Android app, Android 8.0 or newer.
+          - **SHA256SUMS.txt** — SHA-256 checksums for both downloads.
+
+          ## Install
+
+          - Mac: unzip, move SyncShot.app into Applications, and open it. This build is ad-hoc signed and not notarized, so right-click → **Open** the first time. Grant Screen Recording permission when asked; an update may need it granted again.
+          - Android: open the APK and follow Android's prompts. Updates need the same signing certificate as the installed app. If Android rejects an update, keep the existing app and its data rather than uninstalling.
+          - Sign in with the same Google account on both devices.
+
+          ## What's new
+
+          ${COMMITS:-- No changes documented}
+          EOF
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PRERELEASE=""
+          case "$RELEASE_TAG" in preview-*) PRERELEASE="--prerelease" ;; esac
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" dist-release/* --clobber
+          else
+            gh release create "$RELEASE_TAG" dist-release/* \
+              --title "SyncShot $RELEASE_TAG" \
+              --notes-file release-notes.md \
+              --verify-tag $PRERELEASE
+          fi
