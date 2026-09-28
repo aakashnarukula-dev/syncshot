@@ -36,7 +36,7 @@ jobs:
       - run: pnpm --dir syncshot-landing build
       - run: npm ci --prefix firebase/functions
       - run: npm --prefix firebase/functions run build
-      - run: node --test firebase/functions/access.test.cjs
+      - run: node --test firebase/functions/access.test.cjs firebase/scripts/storage-access.test.mjs
       - run: npx --yes firebase-tools@15.23.0 emulators:exec --project demo-syncshot --config emulators.test.json --only firestore,storage 'node --test rules.test.mjs'
         working-directory: firebase
   android:

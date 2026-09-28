@@ -67,3 +67,15 @@ Failed uploads previously wrote a fresh random optimistic Room ID on each retry.
 - Upload workers bind to the originating account; cancellation does not schedule another upload. Observer registration is serialized.
 - Verification: 13 Android unit tests and 9 SQLite regression tests passed; debug and signed release builds passed, and APK signature verification passed. Coverage includes four failed attempts/process restarts, four concurrent notifications, unfinished-upload recovery, deletion/retry ordering, gray-placeholder cleanup, gallery pagination, and deleting duplicate rows.
 - The connected phone's installed APK has a different signing certificate from both local debug and release keys. Updating that installation without deleting app data requires its original signing key. The app has not been uninstalled.
+
+## Production upload outage and recovery — September 28, 2026
+
+The phone's installed 2.0.10 build reported Firebase Storage HTTP 403 before screenshots reached the cloud, so the Mac had nothing new to receive. Storage rules now consult Firestore entitlements, but the Storage service agent lacked `roles/firebaserules.firestoreServiceAgent`. Firebase CLI 15.23.0 skips this IAM setup in non-interactive deployment, and emulators do not detect the missing production role.
+
+The missing role was granted only to `service-424325660516@gcp-sa-firebasestorage.iam.gserviceaccount.com` in `syncshot-v2`, preserving existing IAM bindings. Ownership, subscription/trial checks, and upload limits were not relaxed. Both existing account entitlements were still active.
+
+Before future Storage-rule rollouts, authenticate gcloud and run `node firebase/scripts/check-storage-access.mjs syncshot-v2`. It is read-only and fails if the cross-service permission is missing; its regression tests run in CI. Also verify a real authenticated image upload after deployment; emulator success alone is insufficient.
+
+The current verified Mac bundle was installed at `/Applications/SyncShot.app` and launched. The previous bundle is retained under `src-tauri/target/release/previous-installation/SyncShot.app`; app data was preserved. Updating the phone remains blocked by the older APK's signing certificate, not by this cloud permission repair.
+
+After the IAM repair and Mac installation, the user took a new Android screenshot and confirmed that it appeared in the Mac column. The live IAM preflight and eight backend/deployment-guard tests passed.
