@@ -604,6 +604,88 @@ mod tests {
     use super::*;
 
     #[test]
+    fn screen_permission_is_checked_again_after_grant_revocation_and_regrant() {
+        use std::cell::Cell;
+        let allowed = Cell::new(true);
+        let checks = Cell::new(0);
+        let requests = Cell::new(0);
+        let capture = || {
+            ensure_screen_recording_permission(
+                || {
+                    checks.set(checks.get() + 1);
+                    allowed.get()
+                },
+                || {
+                    requests.set(requests.get() + 1);
+                    false
+                },
+            )
+        };
+        assert!(capture().is_ok());
+        assert_eq!(requests.get(), 0);
+        allowed.set(false); // Remove the app from Settings without relaunching.
+        assert!(capture().unwrap_err().contains("permission"));
+        assert_eq!(requests.get(), 1);
+        assert!(capture().is_err()); // A denial must not suppress later requests.
+        assert_eq!(requests.get(), 2);
+        allowed.set(true);
+        assert!(capture().is_ok());
+        assert_eq!(checks.get(), 4);
+        assert_eq!(requests.get(), 2);
+    }
+
+    #[test]
+    fn newly_granted_permission_allows_capture() {
+        assert!(ensure_screen_recording_permission(|| false, || true).is_ok());
+    }
+
+    #[test]
+    fn capture_failure_requests_access_revoked_during_picker() {
+        use std::cell::Cell;
+        let requested = Cell::new(false);
+        let error = capture_failure(
+            "",
+            "Screenshot was cancelled or failed",
+            || false,
+            || {
+                requested.set(true);
+                false
+            },
+        );
+        assert!(requested.get());
+        assert!(error.contains("permission"));
+        assert!(!error.contains("cancelled"));
+    }
+
+    #[test]
+    fn capture_permission_error_recovers_even_when_preflight_is_stale() {
+        use std::cell::Cell;
+        let requested = Cell::new(false);
+        let error = capture_failure(
+            "Operation not AUTHORIZED",
+            "Screenshot failed",
+            || true,
+            || {
+                requested.set(true);
+                false
+            },
+        );
+        assert!(requested.get());
+        assert!(error.contains("permission"));
+    }
+
+    #[test]
+    fn cancelling_authorized_capture_does_not_request_permission() {
+        let error = capture_failure(
+            "",
+            "Screenshot was cancelled or failed",
+            || true,
+            || panic!("Normal cancellation must not prompt for permission"),
+        );
+        assert_eq!(error, "Screenshot was cancelled or failed");
+    }
+
+    #[test]
     fn drag_copy_survives_upload_removing_capture() {
         let source =
             std::env::temp_dir().join(format!("syncshot-capture-test-{}.png", std::process::id()));
@@ -1235,40 +1317,74 @@ fn is_screencapture_running() -> bool {
     }
 }
 
-/// Screen-recording permission gate. The old implementation ran a THROWAWAY
-/// full-screen `screencapture -T 0` grab to a temp file on EVERY capture call
-/// (~0.5–1s + disk churn) while holding SCREENCAPTURE_LOCK. Now: an instant
-/// TCC lookup via CGPreflightScreenCaptureAccess, requesting access (one
-/// system prompt) when not yet granted. A granted result is cached for the
-/// app run; a denial is re-checked each call so granting in System Settings
-/// mid-run is picked up without restart.
-#[cfg(target_os = "macos")]
-fn check_and_activate_permission() -> Result<(), String> {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    static GRANTED: AtomicBool = AtomicBool::new(false);
-    if GRANTED.load(Ordering::Relaxed) {
-        return Ok(());
-    }
-
-    #[link(name = "CoreGraphics", kind = "framework")]
-    extern "C" {
-        fn CGPreflightScreenCaptureAccess() -> bool;
-        fn CGRequestScreenCaptureAccess() -> bool;
-    }
-
-    let granted =
-        unsafe { CGPreflightScreenCaptureAccess() } || unsafe { CGRequestScreenCaptureAccess() };
-    if granted {
-        GRANTED.store(true, Ordering::Relaxed);
+/// Permission is revocable while this process is alive. Never cache a grant:
+/// removing SyncShot from Screen Recording must cause the next capture to ask
+/// macOS again, without requiring the user to quit the app first.
+fn ensure_screen_recording_permission(
+    preflight: impl FnOnce() -> bool,
+    request: impl FnOnce() -> bool,
+) -> Result<(), String> {
+    if preflight() || request() {
         Ok(())
     } else {
         Err("Screen Recording permission not granted".to_string())
     }
 }
 
+#[cfg(target_os = "macos")]
+fn screen_recording_allowed() -> bool {
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGPreflightScreenCaptureAccess() -> bool;
+    }
+    unsafe { CGPreflightScreenCaptureAccess() }
+}
+
 #[cfg(not(target_os = "macos"))]
+fn screen_recording_allowed() -> bool {
+    true
+}
+
+#[cfg(target_os = "macos")]
+fn request_screen_recording_permission() -> bool {
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGRequestScreenCaptureAccess() -> bool;
+    }
+    unsafe { CGRequestScreenCaptureAccess() }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn request_screen_recording_permission() -> bool {
+    true
+}
+
 fn check_and_activate_permission() -> Result<(), String> {
-    Ok(())
+    ensure_screen_recording_permission(
+        screen_recording_allowed,
+        request_screen_recording_permission,
+    )
+}
+
+/// Access can also be revoked after preflight, while a region/window picker is
+/// open. Recheck failures (including a missing output file) before calling them
+/// cancellations, and request access even if the OS preflight result was stale.
+fn capture_failure(
+    stderr: &str,
+    fallback: &str,
+    preflight: impl FnOnce() -> bool,
+    request: impl FnOnce() -> bool,
+) -> String {
+    let stderr = stderr.to_lowercase();
+    let permission_error = stderr.contains("permission")
+        || stderr.contains("denied")
+        || stderr.contains("not authorized");
+    if permission_error || !preflight() {
+        request();
+        "Screen Recording permission required. Enable SyncShot in System Settings > Privacy & Security > Screen Recording, then try capturing again. If macOS asks you to quit and reopen, follow that prompt.".to_string()
+    } else {
+        fallback.to_string()
+    }
 }
 
 /// Blocking body shared by the interactive (`-i`) and window (`-w`) captures.
@@ -1319,20 +1435,23 @@ fn native_capture_blocking(save_dir: &str, mode_flag: &str) -> Result<String, St
         if screenshot_path.exists() {
             let _ = std::fs::remove_file(&screenshot_path);
         }
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if stderr.contains("permission")
-            || stderr.contains("denied")
-            || stderr.contains("not authorized")
-        {
-            return Err("Screen Recording permission required. Please grant permission in System Settings > Privacy & Security > Screen Recording and restart the app.".to_string());
-        }
-        return Err("Screenshot was cancelled or failed".to_string());
+        return Err(capture_failure(
+            &String::from_utf8_lossy(&output.stderr),
+            "Screenshot was cancelled or failed",
+            screen_recording_allowed,
+            request_screen_recording_permission,
+        ));
     }
 
     if screenshot_path.exists() {
         Ok(path_str)
     } else {
-        Err("Screenshot was cancelled or failed".to_string())
+        Err(capture_failure(
+            &String::from_utf8_lossy(&output.stderr),
+            "Screenshot was cancelled or failed",
+            screen_recording_allowed,
+            request_screen_recording_permission,
+        ))
     }
 }
 
@@ -1577,19 +1696,23 @@ fn native_capture_fullscreen_blocking(save_dir: &str) -> Result<String, String> 
             cmd.arg(format!("-R{},{},{},{}", x, y, w, h));
         }
     }
-    let status = cmd
+    let output = cmd
         .arg(&path_str)
-        .status()
+        .output()
         .map_err(|e| format!("Failed to run screencapture: {}", e))?;
 
-    if !status.success() {
-        return Err("Screenshot failed".to_string());
-    }
-
-    if screenshot_path.exists() {
+    if output.status.success() && screenshot_path.exists() {
         Ok(path_str)
     } else {
-        Err("Screenshot failed".to_string())
+        if screenshot_path.exists() {
+            let _ = std::fs::remove_file(&screenshot_path);
+        }
+        Err(capture_failure(
+            &String::from_utf8_lossy(&output.stderr),
+            "Screenshot failed",
+            screen_recording_allowed,
+            request_screen_recording_permission,
+        ))
     }
 }
 

@@ -79,3 +79,13 @@ Before future Storage-rule rollouts, authenticate gcloud and run `node firebase/
 The current verified Mac bundle was installed at `/Applications/SyncShot.app` and launched. The previous bundle is retained under `src-tauri/target/release/previous-installation/SyncShot.app`; app data was preserved. Updating the phone remains blocked by the older APK's signing certificate, not by this cloud permission repair.
 
 After the IAM repair and Mac installation, the user took a new Android screenshot and confirmed that it appeared in the Mac column. The live IAM preflight and eight backend/deployment-guard tests passed.
+
+## Screen Recording permission recovery — Mac 0.2.22
+
+The capture gate cached successful permission in a process-wide `GRANTED` flag. Removing SyncShot from System Settings while it was running therefore skipped both the permission check and request until the process restarted.
+
+Every region, window, and full-screen capture now checks macOS permission afresh and requests access when missing. Capture failures also recheck permission, covering removal while the selection picker is open; permission errors are no longer silently classified as cancellation. Full-screen capture now preserves stderr for the same recovery path. No throwaway screenshot, permission database mutation, or forced restart is used. Help text only asks for a restart if macOS requests it.
+
+Verification: 149 frontend tests and 54 Rust tests passed, including five permission recovery cases (grant/revoke/regrant in one process, new grant, removal during capture, stale preflight with authorization error, and cancellation without a permission prompt). Physical shortcut testing after removing permission from a running updated app remains required; unit tests do not establish whether macOS will display a new consent dialog in every permission state.
+
+Mac 0.2.22 release build and ad-hoc signature validation passed. Installed and launched `/Applications/SyncShot.app`; installed executable matches the build. Prior app retained under `src-tauri/target/release/previous-installation-0.2.22/20260928-160950/SyncShot.app`. System Settings currently has no SyncShot entry. Remote key injection did not activate the global shortcut; user has been asked to perform the grant/capture/remove/retry sequence on the physical keyboard.

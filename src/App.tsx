@@ -1342,7 +1342,7 @@ function MainApp() {
       ) {
         toast.error("Screen Recording permission required", {
           description:
-            "System Settings → Privacy & Security → Screen Recording → enable SyncShot, then restart.",
+            "Enable SyncShot in System Settings > Privacy & Security > Screen Recording, then try again. Restart only if macOS asks.",
           duration: 8000,
         });
       } else {
