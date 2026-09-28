@@ -105,14 +105,12 @@ private fun RequestPermissions(onMediaPermissionGranted: (Boolean) -> Unit) {
         val mediaGranted =
             ContextCompat.checkSelfPermission(ctx, mediaPermission) == PackageManager.PERMISSION_GRANTED
         if (mediaGranted) onMediaPermissionGranted(true)
+        // Do not interrupt app launch with Android's notification-consent
+        // dialog. Screenshot sync and gallery access work without it. Users
+        // who want "new screenshot" alerts can enable notifications later in
+        // Android Settings; the foreground sync service remains independent.
         val perms = buildList {
             if (!mediaGranted) add(mediaPermission)
-            if (Build.VERSION.SDK_INT >= 33 &&
-                ContextCompat.checkSelfPermission(ctx, Manifest.permission.POST_NOTIFICATIONS) !=
-                    PackageManager.PERMISSION_GRANTED
-            ) {
-                add(Manifest.permission.POST_NOTIFICATIONS)
-            }
         }
         if (perms.isNotEmpty()) launcher.launch(perms.toTypedArray())
     }

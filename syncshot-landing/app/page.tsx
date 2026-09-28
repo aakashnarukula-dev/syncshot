@@ -50,10 +50,10 @@ export default function Home() {
           <div><h2 className="text-2xl font-semibold">Bring your screens together.</h2><p className="mt-2 text-neutral-400">Download the latest preview. Sign in with the same Google account.</p></div>
           <div className="flex flex-col gap-3 sm:flex-row">
             <a href="https://github.com/aakashnarukula-dev/syncshot/releases/download/preview-2026.09.28-icons/SyncShot-macOS-0.2.27-Apple-Silicon.zip" className="inline-flex items-center justify-center gap-2 rounded-full bg-primary px-6 py-3 font-medium text-primary-foreground"><Download className="size-4"/>Mac · Apple Silicon</a>
-            <a href="https://github.com/aakashnarukula-dev/syncshot/releases/download/preview-2026.09.28-icons/SyncShot-Android-2.0.12.apk" className="inline-flex items-center justify-center gap-2 rounded-full border border-neutral-600 bg-card px-6 py-3"><Download className="size-4"/>Android · APK</a>
+            <a href="https://github.com/aakashnarukula-dev/syncshot/releases/download/preview-2026.09.28-icons/SyncShot-Android-2.0.13.apk" className="inline-flex items-center justify-center gap-2 rounded-full border border-neutral-600 bg-card px-6 py-3"><Download className="size-4"/>Android · APK</a>
           </div>
         </div>
-        <p className="mt-5 text-sm leading-6 text-neutral-400">Mac 0.2.27 for M-series Macs · Android 2.0.12 for Android 8+. Intel build not included in this preview. Mac app is not notarized and needs Screen Recording access.</p>
+        <p className="mt-5 text-sm leading-6 text-neutral-400">Mac 0.2.27 for M-series Macs · Android 2.0.13 for Android 8+. Intel build not included in this preview. Mac app is not notarized and needs Screen Recording access.</p>
         <p className="mt-2 text-sm leading-6 text-neutral-400">Updating an older Android install may require its original signing key. Keep your existing app and data if Android rejects the update. <a className="text-foreground underline underline-offset-4" href="https://github.com/aakashnarukula-dev/syncshot/releases/tag/preview-2026.09.28-icons">Install notes &amp; release details</a></p>
       </section>
       <section id="faq" className="mx-auto max-w-3xl px-6 py-24"><h2 className="mb-10 text-balance text-center text-4xl font-semibold">A few things to know.</h2>{[

@@ -154,4 +154,10 @@ Verification: Mac production frontend/native bundle, Android signed release buil
 
 The user-authorized Android replacement succeeded; the physical Samsung device reports versionName 2.0.12 and versionCode 14. The release APK's signature was verified before uninstalling the old package. Android sign-in and permission setup must be completed again after reinstall. Updated assets are published under `preview-2026.09.28-icons`, and the website download links target these versions.
 
+## Android launch notification prompt — 2.0.13
+
+Android no longer requests `POST_NOTIFICATIONS` while opening the app. This removes launch-time notification consent noise. Media access remains requested when needed for screenshot upload. The foreground sync service and optional received-screenshot notifications remain available; users can enable notification access later in Android Settings.
+
+Android 2.0.13 release build passed, retained the release certificate, and installed over 2.0.12 on the connected Samsung device. Device reports versionCode 15 / versionName 2.0.13. Website download points to the notification-fix release asset.
+
 Post-install Mac smoke check passed: after the user renewed consent, capture diagnostics recorded `fresh-permission-granted` at 17:16:17–18 and the user confirmed “Capture works.” No reset tool was run during this icon update. Public release asset digests were verified against the local checksums.
