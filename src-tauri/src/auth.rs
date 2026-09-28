@@ -1,29 +1,9 @@
-//! Sign-in handoff: run Firebase phone-auth (reCAPTCHA + OTP) on the real
-//! `https://syncshot-v2.web.app` origin, mint a Firebase custom token there,
-//! and hand it back to the app.
-//!
-//! Firebase phone-auth's reCAPTCHA rejects the Tauri *app* webview origin
-//! (`tauri://localhost`) with `auth/invalid-app-credential`, so the auth page
-//! can't run inside the main app window. Two ways to present it:
-//!
-//! * **Embedded** (preferred): open the hosted page in a dedicated, app-owned
-//!   `WebviewWindow` pointed at the remote https origin (an authorized Firebase
-//!   Auth domain, where reCAPTCHA works). The page signals completion by
-//!   navigating to the `http://127.0.0.1:<port>/?token=…&state=…` callback; we
-//!   intercept that navigation in `on_navigation`, lift the token straight off
-//!   the URL, and CANCEL the navigation — so no loopback round-trip, no http
-//!   load (dodges WKWebView ATS/mixed-content), and the app can close its own
-//!   window the instant the token arrives (100% reliable, no stray browser tab).
-//! * **System browser** (fallback): shell the page out to the user's default
-//!   browser and wait for the same callback over a one-shot loopback listener
-//!   (the RFC 8252 native-app pattern). Used if the embedded webview can't run
-//!   reCAPTCHA. The success/error pages are the only thing the user sees in that
-//!   tab; the browser may refuse to auto-close it (a known Chrome limitation),
-//!   so `focus_app` pulls the app back regardless.
+//! Google OAuth runs in the system browser. A one-shot loopback callback
+//! validates a cryptographically random state before accepting a custom token.
+//! Linking tokens travel in the URL fragment, never in hosting request logs.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 /// Hosted sign-in page (Firebase Hosting; an auto-authorized Firebase Auth
@@ -36,7 +16,7 @@ const AUTH_PAGE_URL: &str = "https://syncshot-v2.web.app/auth.html";
 const AUTH_WINDOW_LABEL: &str = "auth";
 
 /// How long to wait for the sign-in round-trip before giving up.
-const AUTH_TIMEOUT: Duration = Duration::from_secs(1800);
+const AUTH_TIMEOUT: Duration = Duration::from_secs(300);
 
 // Dark, minimal "code-like" pages for the SYSTEM-BROWSER fallback (the embedded
 // path never renders these — it cancels the callback navigation). Best-effort
@@ -78,8 +58,9 @@ fn parse_query(query: &str, expected_state: &str) -> Result<String, String> {
             .map_err(|e| e.to_string())?
             .into_owned();
         match k {
-            "token" => token = Some(decoded),
-            "state" => state = Some(decoded),
+            "token" if token.is_none() => token = Some(decoded),
+            "state" if state.is_none() => state = Some(decoded),
+            "token" | "state" => return Err("duplicate callback parameter".into()),
             _ => {}
         }
     }
@@ -97,6 +78,9 @@ fn parse_query(query: &str, expected_state: &str) -> Result<String, String> {
 /// Extract the custom token from a callback HTTP request line, after verifying
 /// the `state` nonce. `request_line` is e.g. `GET /?token=abc&state=xyz HTTP/1.1`.
 fn parse_callback(request_line: &str, expected_state: &str) -> Result<String, String> {
+    if !request_line.starts_with("GET /?") {
+        return Err("invalid callback method or path".into());
+    }
     let target = request_line
         .split_whitespace()
         .nth(1)
@@ -107,18 +91,17 @@ fn parse_callback(request_line: &str, expected_state: &str) -> Result<String, St
 
 /// 128-bit hex nonce from the OS CSPRNG. Ties the sign-in session to THIS
 /// invocation so another local process can't inject a token of its own.
-fn gen_nonce() -> String {
+fn gen_nonce() -> Result<String, String> {
     let mut bytes = [0u8; 16];
-    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-        let _ = f.read_exact(&mut bytes);
-    }
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    let mut f = std::fs::File::open("/dev/urandom").map_err(|e| e.to_string())?;
+    f.read_exact(&mut bytes).map_err(|e| e.to_string())?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 fn respond(stream: &mut TcpStream, body: &str) {
     let res = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\
-         Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+         Cache-Control: no-store\r\nReferrer-Policy: no-referrer\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         body.len(),
         body
     );
@@ -143,16 +126,16 @@ fn accept_token(listener: &TcpListener, expected_state: &str) -> Result<String, 
                 let req = String::from_utf8_lossy(&buf[..n]);
                 let line = req.lines().next().unwrap_or("");
                 if line.contains("token=") {
-                    return match parse_callback(line, expected_state) {
+                    match parse_callback(line, expected_state) {
                         Ok(token) => {
                             respond(&mut stream, SUCCESS_HTML);
-                            Ok(token)
+                            return Ok(token);
                         }
-                        Err(e) => {
+                        Err(_) => {
                             respond(&mut stream, ERROR_HTML);
-                            Err(e)
+                            continue; // An invalid callback must not cancel the legitimate attempt.
                         }
-                    };
+                    }
                 }
                 // Favicon / stray hit — acknowledge and keep waiting.
                 respond(&mut stream, SUCCESS_HTML);
@@ -163,30 +146,6 @@ fn accept_token(listener: &TcpListener, expected_state: &str) -> Result<String, 
             Err(e) => return Err(e.to_string()),
         }
     }
-}
-
-/// Block (until `AUTH_TIMEOUT`) on the shared slot that `on_navigation` fills
-/// when it intercepts the embedded webview's callback navigation.
-fn wait_for_intercepted_token(
-    shared: &Arc<(Mutex<Option<String>>, Condvar)>,
-) -> Result<String, String> {
-    let (lock, cvar) = &**shared;
-    let mut guard = lock.lock().map_err(|_| "auth lock poisoned".to_string())?;
-    let deadline = Instant::now() + AUTH_TIMEOUT;
-    while guard.is_none() {
-        let now = Instant::now();
-        if now >= deadline {
-            return Err("Sign-in timed out. Please try again.".into());
-        }
-        let (g, res) = cvar
-            .wait_timeout(guard, deadline - now)
-            .map_err(|_| "auth lock poisoned".to_string())?;
-        guard = g;
-        if res.timed_out() && guard.is_none() {
-            return Err("Sign-in timed out. Please try again.".into());
-        }
-    }
-    Ok(guard.take().unwrap())
 }
 
 /// Raise the SyncShot app (and its main window) back to the foreground after
@@ -228,77 +187,18 @@ pub fn close_auth_window(app: tauri::AppHandle) {
     close_auth_window_impl(&app);
 }
 
-/// Open the hosted sign-in page in an app-owned `WebviewWindow`, intercept the
-/// loopback callback navigation to lift the token, then close the window.
-async fn embedded_auth(app: tauri::AppHandle) -> Result<String, String> {
-    use tauri::{WebviewUrl, WebviewWindowBuilder};
-
-    // Reserve a loopback port so the page's callback URL is well-formed and the
-    // port can't be reused by another process. We never `accept()` on it — the
-    // callback is caught in `on_navigation` before any http load happens.
-    let _listener = TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
-    let port = _listener.local_addr().map_err(|e| e.to_string())?.port();
-
-    let state = gen_nonce();
-    let url = format!("{AUTH_PAGE_URL}?cb_port={port}&state={state}");
-    let parsed = tauri::Url::parse(&url).map_err(|e| format!("bad auth url: {e}"))?;
-
-    // Shared slot the navigation hook fills and the blocking waiter drains.
-    let shared: Arc<(Mutex<Option<String>>, Condvar)> =
-        Arc::new((Mutex::new(None), Condvar::new()));
-    let hook = shared.clone();
-    let expected_state = state.clone();
-
-    // Don't stack a second sign-in window.
-    close_auth_window_impl(&app);
-
-    WebviewWindowBuilder::new(&app, AUTH_WINDOW_LABEL, WebviewUrl::External(parsed))
-        .title("Sign in to SyncShot")
-        .inner_size(440.0, 440.0)
-        .min_inner_size(400.0, 400.0)
-        .resizable(true)
-        .center()
-        .focused(true)
-        .accept_first_mouse(true)
-        .on_navigation(move |target| {
-            // The hosted page completes by navigating to the loopback callback.
-            // Catch it, lift the token, and CANCEL the navigation so the http
-            // load never happens (no ATS/mixed-content, no loopback needed).
-            let is_callback = matches!(target.host_str(), Some("127.0.0.1") | Some("localhost"));
-            if is_callback {
-                if let Ok(token) = parse_query(target.query().unwrap_or(""), &expected_state) {
-                    let (lock, cvar) = &*hook;
-                    if let Ok(mut slot) = lock.lock() {
-                        *slot = Some(token);
-                    }
-                    cvar.notify_all();
-                    return false; // cancel — the app takes it from here
-                }
-            }
-            true // allow the auth page, reCAPTCHA frames, etc.
-        })
-        .build()
-        .map_err(|e| format!("failed to open sign-in window: {e}"))?;
-
-    let result = tauri::async_runtime::spawn_blocking(move || wait_for_intercepted_token(&shared))
-        .await
-        .map_err(|e| e.to_string())?;
-
-    // Whatever happened, take the sign-in window down — the app owns it.
-    close_auth_window_impl(&app);
-    drop(_listener);
-    result
-}
-
 /// Open the hosted sign-in page in the user's default browser and wait for the
 /// callback token over loopback.
-async fn browser_auth(app: tauri::AppHandle) -> Result<String, String> {
+async fn browser_auth(app: tauri::AppHandle, link_token: Option<String>) -> Result<String, String> {
     let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
     let port = listener.local_addr().map_err(|e| e.to_string())?.port();
     listener.set_nonblocking(true).map_err(|e| e.to_string())?;
 
-    let state = gen_nonce();
-    let url = format!("{AUTH_PAGE_URL}?cb_port={port}&state={state}");
+    let state = gen_nonce()?;
+    let mut url = format!("{AUTH_PAGE_URL}?cb_port={port}&state={state}");
+    if let Some(token) = link_token {
+        url.push_str(&format!("#link_token={}", urlencoding::encode(&token)));
+    }
 
     #[cfg(target_os = "macos")]
     std::process::Command::new("open")
@@ -329,12 +229,10 @@ async fn browser_auth(app: tauri::AppHandle) -> Result<String, String> {
 pub async fn browser_auth_listen(
     app: tauri::AppHandle,
     embed: Option<bool>,
+    link_token: Option<String>,
 ) -> Result<String, String> {
-    let result = if embed.unwrap_or(true) {
-        embedded_auth(app.clone()).await
-    } else {
-        browser_auth(app.clone()).await
-    };
+    let _ = embed; // Old clients may pass this; Google must use a system browser.
+    let result = browser_auth(app.clone(), link_token).await;
     if result.is_ok() {
         focus_app(&app);
     }
@@ -344,6 +242,18 @@ pub async fn browser_auth_listen(
 #[cfg(test)]
 mod tests {
     use super::{parse_callback, parse_query};
+
+    #[test]
+    fn rejects_ambiguous_or_non_get_callbacks() {
+        for line in [
+            "GET /?token=a&token=b&state=n HTTP/1.1",
+            "GET /?token=a&state=n&state=n HTTP/1.1",
+            "POST /?token=a&state=n HTTP/1.1",
+            "GET /other?token=a&state=n HTTP/1.1",
+        ] {
+            assert!(parse_callback(line, "n").is_err(), "{line}");
+        }
+    }
 
     #[test]
     fn parses_token_with_matching_state() {

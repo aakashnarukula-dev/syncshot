@@ -5,7 +5,7 @@
  * On start it: loads local prefs (deviceId/name/paused), wires the
  * Rust-emitted Tauri events (`new-screenshot`, `clipboard-changed`) to the
  * publishers, and follows auth state — listeners run while a user is signed
- * in (email-link OTP; every device shares the account, data under
+ * in (Google sign-in; every device shares the account, data under
  * users/{uid}) and stop on sign-out.
  *
  * Pure logic — no React. It reads/writes the zustand sync store directly so
@@ -42,6 +42,26 @@ import {
 } from "./types";
 
 let started = false;
+let accessTimer: ReturnType<typeof setInterval> | null = null;
+let accessGeneration = 0;
+let listeningUid: string | null = null;
+let accessCheckBusy = false;
+
+async function refreshSyncAccess() {
+  if (accessCheckBusy) return;
+  const uid = store().uid;
+  if (!uid) return;
+  const generation = accessGeneration;
+  accessCheckBusy = true;
+  try {
+    const { loadLicenseStatus } = await import("@/lib/license");
+    const access = await loadLicenseStatus();
+    if (generation !== accessGeneration || store().uid !== uid) return;
+    if (access.state === "licensed" || access.state === "trial") {
+      if (listeningUid !== uid) startListeners(uid);
+    } else stopListeners();
+  } finally { accessCheckBusy = false; }
+}
 let device: DeviceRef | null = null;
 let deviceId: string | null = null;
 
@@ -175,6 +195,7 @@ function handleClipboard(items: ClipboardDoc[]): void {
 }
 
 function stopListeners(): void {
+  listeningUid = null;
   clearPreloadedScreenshotImages();
   unsubDeviceRevocation?.();
   unsubDeviceRevocation = null;
@@ -196,6 +217,7 @@ function stopListeners(): void {
 
 function startListeners(uid: string): void {
   stopListeners();
+  listeningUid = uid;
   listenerStartedAt = Date.now() - 10_000;
   const currentDevice = device;
   if (currentDevice) {
@@ -275,7 +297,7 @@ export async function startSyncEngine(): Promise<void> {
   // before sign-in completes are simply ignored (uid/device still null).
   unlistenNewShot = await listen<string>("new-screenshot", (event) => {
     const { uid } = store();
-    if (uid && device) {
+    if (uid && device && listeningUid === uid) {
       touchCurrentDevice(true);
       publishScreenshot(uid, device, event.payload).catch((err) =>
         console.error("publish screenshot failed:", err),
@@ -285,7 +307,7 @@ export async function startSyncEngine(): Promise<void> {
 
   unlistenClipChanged = await listen<{ text: string }>("clipboard-changed", (event) => {
     const { uid, paused } = store();
-    if (!uid || !device || paused) return;
+    if (!uid || !device || paused || listeningUid !== uid) return;
     touchCurrentDevice();
     writeClipboardEntry(uid, device, event.payload.text, recentClipHash)
       .then((hash) => {
@@ -294,8 +316,15 @@ export async function startSyncEngine(): Promise<void> {
       .catch((err) => console.error("write clipboard failed:", err));
   });
 
+  accessTimer = setInterval(() => { void refreshSyncAccess(); }, 60_000);
   unsubAuth = watchAuth(
     (user) => {
+      accessGeneration++;
+      stopListeners();
+      recentClipHash = null;
+      if (store().uid !== user?.uid) store().setSignedOut();
+      store().setScreenshots([], false);
+      store().setClipboard([]);
       if (user) {
         device = {
           uid: user.uid,
@@ -303,8 +332,8 @@ export async function startSyncEngine(): Promise<void> {
           name: store().deviceName,
           platform: "mac",
         };
-        store().setAuth(user.uid, user.phoneNumber ?? user.email);
-        startListeners(user.uid);
+        store().setAuth(user.uid, user.email ?? user.phoneNumber);
+        void refreshSyncAccess();
       } else {
         device = null;
         stopListeners();
@@ -317,6 +346,9 @@ export async function startSyncEngine(): Promise<void> {
 
 /** Tear down listeners + OS event subscriptions (used on full app teardown). */
 export function stopSyncEngine(): void {
+  accessGeneration++;
+  if (accessTimer) clearInterval(accessTimer);
+  accessTimer = null;
   stopListeners();
   unsubAuth?.();
   unsubAuth = null;

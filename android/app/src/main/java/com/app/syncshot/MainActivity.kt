@@ -54,9 +54,11 @@ class MainActivity : ComponentActivity() {
                     // runs while signed in even when media access is declined. Its
                     // MediaStore observer is permission-gated internally; starting it
                     // here must never crash on a denied runtime permission.
-                    LaunchedEffect(signedIn) { if (signedIn) SyncService.start(ctx) }
+
 
                     if (signedIn) {
+                      com.app.syncshot.ui.AccountGate {
+                        LaunchedEffect(Unit) { SyncService.start(ctx) }
                         // Ask for runtime permissions only once the user is in, so
                         // they don't clutter the sign-in (Truecaller consent) screen.
                         RequestPermissions(onMediaPermissionGranted = { granted ->
@@ -67,6 +69,7 @@ class MainActivity : ComponentActivity() {
                             if (granted) SyncService.start(ctx)
                         })
                         RootScreen(onSignedOut = { signedIn = false })
+                      }
                     } else {
                         LoginScreen(onSignedIn = { signedIn = true })
                     }

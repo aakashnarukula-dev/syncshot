@@ -4,7 +4,7 @@ const { invokeMock, signInWithCustomToken, signOut, authStub } = vi.hoisted(() =
   invokeMock: vi.fn(),
   signInWithCustomToken: vi.fn(),
   signOut: vi.fn(),
-  authStub: { currentUser: null as { isAnonymous: boolean } | null },
+  authStub: { currentUser: null as { isAnonymous: boolean; providerData: { providerId: string }[] } | null },
 }));
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
@@ -32,13 +32,13 @@ describe("startBrowserSignIn", () => {
     authStub.currentUser = null;
   });
 
-  it("opens the embedded sign-in window by default and signs in with the returned token", async () => {
+  it("opens the system browser by default and signs in with the returned token", async () => {
     invokeMock.mockResolvedValue("custom-token-123");
     signInWithCustomToken.mockResolvedValue({ user: { uid: "u1" } });
 
     const user = await startBrowserSignIn();
 
-    expect(invokeMock).toHaveBeenCalledWith("browser_auth_listen", { embed: true });
+    expect(invokeMock).toHaveBeenCalledWith("browser_auth_listen", { embed: false });
     expect(signInWithCustomToken).toHaveBeenCalledWith(authStub, "custom-token-123");
     expect(user).toEqual({ uid: "u1" });
   });
@@ -53,7 +53,7 @@ describe("startBrowserSignIn", () => {
   });
 
   it("discards a leftover anonymous session before signing in", async () => {
-    authStub.currentUser = { isAnonymous: true };
+    authStub.currentUser = { isAnonymous: true, providerData: [] };
     invokeMock.mockResolvedValue("tok");
     signInWithCustomToken.mockResolvedValue({ user: { uid: "u2" } });
 
@@ -61,6 +61,12 @@ describe("startBrowserSignIn", () => {
 
     expect(signOut).toHaveBeenCalledWith(authStub);
     expect(signInWithCustomToken).toHaveBeenCalledWith(authStub, "tok");
+  });
+
+  it("does not switch an already connected Google account", async () => {
+    authStub.currentUser = { isAnonymous: false, providerData: [{ providerId: "google.com" }] };
+    expect(await startBrowserSignIn()).toBe(authStub.currentUser);
+    expect(invokeMock).not.toHaveBeenCalled();
   });
 
   it("surfaces a listener error and never reaches sign-in", async () => {

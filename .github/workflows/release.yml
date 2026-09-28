@@ -32,7 +32,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
 
       - name: Install pnpm
         uses: pnpm/action-setup@v4
@@ -95,7 +95,7 @@ jobs:
                
             4. Grant Screen Recording permission when prompted in System Settings
             
-            > **Note**: This is an ad-hoc signed indie app. macOS shows a warning for apps not notarized through Apple's $99/year developer program. The app is completely safe and open source.
+            > **Note**: This is an ad-hoc signed indie app. macOS shows a warning for apps not notarized through Apple's $99/year developer program. Review the source and download only from this repository.
             
             ## What's New
             

@@ -1,3 +1,5 @@
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
@@ -14,16 +16,10 @@ if (hasGoogleServicesConfig) {
     apply(plugin = "com.google.gms.google-services")
 }
 
-// Truecaller partner key is pluggable: set it via a gradle property
-// (-PTRUECALLER_PARTNER_KEY=..., gradle.properties, or the
-// ORG_GRADLE_PROJECT_TRUECALLER_PARTNER_KEY / TRUECALLER_PARTNER_KEY env var).
-// It arrives after the partner app for com.app.syncshot is registered; until
-// then it stays empty and the Truecaller button greys out (server /init also
-// returns an empty partnerKey, which the app treats the same way).
-val truecallerPartnerKey: String =
-    (project.findProperty("TRUECALLER_PARTNER_KEY") as String?)
-        ?: System.getenv("TRUECALLER_PARTNER_KEY")
-        ?: ""
+val releaseSigning = Properties().apply {
+    val propertiesFile = rootProject.file("keystore.properties")
+    if (propertiesFile.exists()) propertiesFile.inputStream().use { load(it) }
+}
 
 android {
     namespace = "com.app.syncshot"
@@ -40,6 +36,7 @@ android {
             // Firebase client configuration is public (authorization is
             // enforced by Auth + Firestore/Storage rules). These values belong
             // to the registered syncshot-v2 Android app for com.app.syncshot.
+            resValue("string", "default_web_client_id", "424325660516-bh4n43qr0ok27el6jeqnqelm69rplv6j.apps.googleusercontent.com")
             resValue("string", "google_app_id", "1:424325660516:android:402841aebec1c1fbfec471")
             resValue("string", "google_api_key", "AIzaSyApIWE3umXq6BDvxiB7fCm6NHgsZZfB4nE")
             resValue("string", "gcm_defaultSenderId", "424325660516")
@@ -47,12 +44,21 @@ android {
             resValue("string", "google_storage_bucket", "syncshot-v2.firebasestorage.app")
         }
 
-        buildConfigField("String", "TRUECALLER_PARTNER_KEY", "\"$truecallerPartnerKey\"")
-        manifestPlaceholders["truecallerPartnerKey"] = truecallerPartnerKey
     }
 
+    signingConfigs {
+        if (releaseSigning.getProperty("storeFile") != null) {
+            create("release") {
+                storeFile = file(releaseSigning.getProperty("storeFile"))
+                storePassword = releaseSigning.getProperty("storePassword")
+                keyAlias = releaseSigning.getProperty("keyAlias")
+                keyPassword = releaseSigning.getProperty("keyPassword")
+            }
+        }
+    }
     buildTypes {
         release {
+            signingConfig = signingConfigs.findByName("release")
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(
@@ -75,6 +81,9 @@ android {
 }
 
 dependencies {
+    implementation("androidx.credentials:credentials:1.3.0")
+    implementation("androidx.credentials:credentials-play-services-auth:1.3.0")
+    implementation("com.google.android.libraries.identity.googleid:googleid:1.1.1")
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
     implementation(libs.androidx.lifecycle.runtime.compose)

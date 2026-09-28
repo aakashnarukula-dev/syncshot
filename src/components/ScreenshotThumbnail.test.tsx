@@ -81,6 +81,32 @@ describe("ScreenshotThumbnail add image", () => {
     vi.useRealTimers();
   });
 
+  it("cancels an old collapse when a new screenshot is revealed", () => {
+    vi.useFakeTimers();
+    try {
+      const onToggleCollapsed = vi.fn();
+      const view = render(<ScreenshotThumbnail {...columnProps} openSignal={0} autoCollapseSignal={0} onToggleCollapsed={onToggleCollapsed} />);
+      view.rerender(<ScreenshotThumbnail {...columnProps} openSignal={0} autoCollapseSignal={1} onToggleCollapsed={onToggleCollapsed} />);
+      view.rerender(<ScreenshotThumbnail {...columnProps} openSignal={1} autoCollapseSignal={1} onToggleCollapsed={onToggleCollapsed} />);
+      act(() => vi.advanceTimersByTime(400));
+      expect(onToggleCollapsed).not.toHaveBeenCalled();
+      view.rerender(<ScreenshotThumbnail {...columnProps} openSignal={1} autoCollapseSignal={2} onToggleCollapsed={onToggleCollapsed} />);
+      act(() => vi.advanceTimersByTime(400));
+      expect(onToggleCollapsed).toHaveBeenCalledTimes(1);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("Escape collapses an empty rail", () => {
+    vi.useFakeTimers();
+    try {
+      const onToggleCollapsed = vi.fn();
+      render(<ScreenshotThumbnail {...columnProps} onToggleCollapsed={onToggleCollapsed} />);
+      fireEvent.keyDown(window, { key: "Escape" });
+      act(() => vi.advanceTimersByTime(400));
+      expect(onToggleCollapsed).toHaveBeenCalledTimes(1);
+    } finally { vi.useRealTimers(); }
+  });
+
   it("reports hover and scroll activity to idle-timer owner", () => {
     const onHoverChange = vi.fn();
     const onActivity = vi.fn();

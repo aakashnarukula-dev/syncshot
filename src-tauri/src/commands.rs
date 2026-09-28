@@ -425,7 +425,9 @@ pub fn cleanup_temporary_cloud_materializations() {
         let is_ours = path
             .file_name()
             .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with("syncshot-cloud-"));
+            .is_some_and(|name| {
+                name.starts_with("syncshot-cloud-") || name.starts_with("syncshot-drag-")
+            });
         if is_ours && path.is_file() {
             let _ = fs::remove_file(path);
         }
@@ -547,6 +549,28 @@ pub async fn download_temporary_image(url: String, name: String) -> Result<Strin
     .map_err(|e| format!("Temp image task failed: {e}"))?
 }
 
+/// A drag owns its file independently of capture upload/deletion and tile remounts.
+#[tauri::command]
+pub async fn prepare_local_drag_image(path: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let source = std::path::Path::new(&path);
+        let extension = source.extension().and_then(|s| s.to_str()).unwrap_or("png");
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| e.to_string())?
+            .as_nanos();
+        let destination = std::env::temp_dir().join(format!("syncshot-drag-{unique}.{extension}"));
+        // A hard link is instantaneous and retains the inode after upload unlinks
+        // the staging name. Fall back to a copy for cross-filesystem sources.
+        if fs::hard_link(source, &destination).is_err() {
+            fs::copy(source, &destination).map_err(|e| format!("Could not prepare drag: {e}"))?;
+        }
+        Ok(destination.to_string_lossy().into_owned())
+    })
+    .await
+    .map_err(|e| format!("Drag preparation failed: {e}"))?
+}
+
 /// Save a full-resolution screenshot to the user's Downloads directory. Cloud
 /// images reuse the bounded RAM cache warmed by the rail; local staging images
 /// are read directly. Exactly one source must be supplied.
@@ -578,6 +602,20 @@ pub async fn save_image_to_downloads(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn drag_copy_survives_upload_removing_capture() {
+        let source =
+            std::env::temp_dir().join(format!("syncshot-capture-test-{}.png", std::process::id()));
+        std::fs::write(&source, b"captured image").unwrap();
+        let prepared = tauri::async_runtime::block_on(super::prepare_local_drag_image(
+            source.to_string_lossy().into_owned(),
+        ))
+        .unwrap();
+        std::fs::remove_file(&source).unwrap();
+        assert_eq!(std::fs::read(&prepared).unwrap(), b"captured image");
+        std::fs::remove_file(prepared).unwrap();
+    }
 
     #[test]
     fn file_stat_serializes_camel_case() {
@@ -1592,6 +1630,19 @@ pub async fn get_mouse_position() -> Result<(f64, f64), String> {
     {
         Err("unsupported".into())
     }
+}
+
+#[tauri::command]
+pub fn primary_mouse_button_down() -> bool {
+    #[cfg(target_os = "macos")]
+    unsafe {
+        use objc2::{msg_send, runtime::AnyClass};
+        if let Some(event) = AnyClass::get("NSEvent") {
+            let buttons: usize = msg_send![event, pressedMouseButtons];
+            return buttons & 1 != 0;
+        }
+    }
+    false
 }
 
 /// Returns the usable (x, y, width, height) rect — in the GLOBAL,

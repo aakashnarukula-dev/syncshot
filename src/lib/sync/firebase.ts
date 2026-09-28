@@ -1,19 +1,5 @@
-/**
- * Firebase app initialization + typed service handles.
- *
- * Single source of truth for Firebase. Firestore uses a memory-only cache so
- * screenshot metadata is never persisted on the Mac; Storage remains the sole
- * screenshot library.
- *
- * Identity = phone sign-in. Phone + reCAPTCHA + OTP can't run inside the Tauri
- * webview: its `tauri://localhost` origin fails Firebase phone-auth's
- * reCAPTCHA app-credential check (`auth/invalid-app-credential`). So that step
- * runs on a hosted https page in the user's default browser, which mints a
- * Firebase custom token handed back over a one-shot loopback listener (Rust
- * `browser_auth_listen`); the app finishes with `signInWithCustomToken`. Every
- * device signs in to the same account; data lives under users/{uid}. Per-device
- * identity is a locally-persisted deviceId, NOT the auth uid.
- */
+/** Firebase identity and realtime services. Google sign-in uses the system
+ * browser; account linking preserves legacy phone-account UIDs. */
 
 import { invoke } from "@tauri-apps/api/core";
 import { initializeApp, type FirebaseApp } from "firebase/app";
@@ -43,27 +29,25 @@ export const db: Firestore = initializeFirestore(app, {
 
 export const storage: FirebaseStorage = getStorage(app);
 
-/**
- * Sign in via the system browser.
- *
- * Opens the hosted phone-auth page in the default browser (Rust side) and
- * blocks until it redirects back a Firebase custom token over loopback, then
- * exchanges it for a session. A leftover anonymous session (pre-OTP builds) is
- * discarded first. `onAuthStateChanged` fires on success, which starts the
- * sync engine.
- */
-/**
- * Run the sign-in round-trip and sign this device in with the minted custom
- * token. `embed` (default) presents the hosted phone-auth page in an app-owned
- * webview window that the app closes itself on completion; `embed = false`
- * shells it out to the system browser (fallback for when reCAPTCHA can't run in
- * the embedded webview). Resolves once the user is signed in.
- */
-export async function startBrowserSignIn(embed = true): Promise<User> {
-  const token = await invoke<string>("browser_auth_listen", { embed });
-  if (auth.currentUser?.isAnonymous) await signOut(auth);
-  const cred = await signInWithCustomToken(auth, token);
-  return cred.user;
+// Google rejects embedded user agents. Always use the system browser. Reuse a
+// pending attempt so repeated tray clicks cannot open competing listeners.
+let pendingSignIn: Promise<User> | null = null;
+export function startBrowserSignIn(_embed = false): Promise<User> {
+  if (pendingSignIn) return pendingSignIn;
+  pendingSignIn = (async () => {
+    const current = auth.currentUser;
+    if (current?.providerData.some(p => p.providerId === "google.com")) return current;
+    let linkToken: string | undefined;
+    if (current && !current.isAnonymous && !current.providerData.some(p => p.providerId === "google.com")) {
+      const { getFunctions, httpsCallable } = await import("firebase/functions");
+      const result = await httpsCallable<void, { token: string }>(getFunctions(app, "us-central1"), "mintDesktopToken")();
+      linkToken = result.data.token;
+    }
+    const token = await invoke<string>("browser_auth_listen", { embed: false, ...(linkToken ? { linkToken } : {}) });
+    if (auth.currentUser?.isAnonymous) await signOut(auth);
+    return (await signInWithCustomToken(auth, token)).user;
+  })().finally(() => { pendingSignIn = null; });
+  return pendingSignIn;
 }
 
 /** Dismiss the embedded sign-in window (used when switching to the browser fallback). */

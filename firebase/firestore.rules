@@ -1,13 +1,16 @@
 rules_version = '2';
-
-// SyncShot / ClipboardX realtime backend.
-// Identity = email-link sign-in; every device signs in to the same account.
-// All data lives under users/{uid} and is gated on the caller's auth uid.
 service cloud.firestore {
   match /databases/{database}/documents {
-
+    function owner(uid) { return request.auth != null && request.auth.uid == uid; }
+    function active(uid) {
+      let access = get(/databases/$(database)/documents/entitlements/$(uid)).data;
+      return access.lifetime == true || access.trialExpiresAt > request.time;
+    }
+    // Only Admin SDK / a verified payment webhook may write entitlements.
+    match /entitlements/{uid} { allow read: if owner(uid); allow write: if false; }
     match /users/{uid}/{document=**} {
-      allow read, write: if request.auth != null && request.auth.uid == uid;
+      allow read, create, update: if owner(uid) && active(uid);
+      allow delete: if owner(uid);
     }
   }
 }

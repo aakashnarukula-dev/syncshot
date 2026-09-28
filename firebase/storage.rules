@@ -1,11 +1,17 @@
 rules_version = '2';
-
-// Screenshot blobs are stored under users/{uid}/... and gated on the caller's
-// auth uid (email-link sign-in; all devices share the account).
 service firebase.storage {
   match /b/{bucket}/o {
+    function owner(uid) { return request.auth != null && request.auth.uid == uid; }
+    function active(uid) {
+      let access = firestore.get(/databases/(default)/documents/entitlements/$(uid)).data;
+      return access.lifetime == true || access.trialExpiresAt > request.time;
+    }
     match /users/{uid}/{allPaths=**} {
-      allow read, write: if request.auth != null && request.auth.uid == uid;
+      allow read: if owner(uid) && active(uid);
+      allow create, update: if owner(uid) && active(uid)
+        && request.resource.size <= 25 * 1024 * 1024
+        && request.resource.contentType.matches('image/(png|jpeg|webp|gif)');
+      allow delete: if owner(uid);
     }
   }
 }

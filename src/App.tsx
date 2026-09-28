@@ -36,6 +36,7 @@ import {
   isSyncedCacheFile,
   orderScreenshotsByCreatedAt,
 } from "@/lib/sync/order";
+import { createRailIdleTimer } from "@/lib/railIdle";
 import { omitPendingPaths, replaceRailPath } from "@/lib/railPaths";
 
 // A capture can change from a staging path to a cloud URL while its editor is
@@ -284,7 +285,7 @@ async function showThumbnailWindow(count: number, mouseX?: number, mouseY?: numb
 // (e.g. right after the pairing window closes). Verify against the real cursor
 // before the display-follow poll moves the window; on failure err toward
 // "hovering" so an active control surface is never yanked away.
-async function cursorInsideWindow(): Promise<boolean> {
+async function cursorInsideWindow(onError = true): Promise<boolean> {
   try {
     const w = getCurrentWindow();
     const [pos, size, sf, [mx, my]] = await Promise.all([
@@ -297,7 +298,7 @@ async function cursorInsideWindow(): Promise<boolean> {
     const y = pos.y / sf;
     return mx >= x && mx < x + size.width / sf && my >= y && my < y + size.height / sf;
   } catch {
-    return true;
+    return onError;
   }
 }
 
@@ -428,6 +429,18 @@ function App() {
   return <MainApp />;
 }
 
+// Hidden/inactive WKWebViews can suspend animation frames. Native window work
+// must always proceed even if the compositor does not produce a frame.
+function waitForRailPaint(): Promise<void> {
+  return new Promise(resolve => {
+    const timeout = setTimeout(resolve, 100);
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      clearTimeout(timeout);
+      resolve();
+    }));
+  });
+}
+
 function MainApp() {
   // The edge pill is the app's persistent launcher, not a by-product of having
   // screenshots in memory. Starting in its collapsed state means opening
@@ -474,7 +487,6 @@ function MainApp() {
   // while actually visible (otherwise it animates behind a hidden window).
   const [openSignal, setOpenSignal] = useState(0);
   const [autoCollapseSignal, setAutoCollapseSignal] = useState(0);
-  const autoHideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const openEditorsRef = useRef(0);
   const [licenseStatus, setLicenseStatus] = useState<LicenseStatus | null>(null);
   const licenseStatusRef = useRef<LicenseStatus | null>(null);
@@ -552,18 +564,17 @@ function MainApp() {
     const id = setInterval(async () => {
       if (busy) return;
       // Only while the column/pill is the visible surface and not mid-use.
-      if (modeRef.current === "pairing" || modeRef.current === "preferences") return;
+      if (modeRef.current !== "thumbnail" || isCapturingRef.current) return;
       if (openEditorsRef.current > 0) return;
       if (screenshotDragActiveRef.current) return;
       // Paused while the window is focused or the cursor is inside it (both
       // sync checks — no IPC). :hover cross-checks the hover ref because
       // either alone can go stale when the window moves/hides under a
       // stationary cursor.
-      if (document.hasFocus()) return;
-      if (columnHoveredRef.current && document.documentElement.matches(":hover")) return;
       busy = true;
       try {
         const w = getCurrentWindow();
+        if (await cursorInsideWindow()) return;
         if (!(await w.isVisible())) return; // hidden → nothing to move
         const rect = await cursorDisplayRect(); // cursor's current display
         if (!rect) return;
@@ -579,6 +590,7 @@ function MainApp() {
           w.outerSize(),
           w.scaleFactor(),
         ]);
+        if (isCapturingRef.current || modeRef.current !== "thumbnail") return;
         const currentX = position.x / scaleFactor;
         const currentY = position.y / scaleFactor;
         const currentWidth = size.width / scaleFactor;
@@ -621,13 +633,6 @@ function MainApp() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const handleActivated = useCallback(async (_key: string) => {
-    const status = await loadLicenseStatus();
-    setLicenseStatus(status);
-    licenseStatusRef.current = status;
-    setShowPaywall(false);
-  }, []);
-
   // Boot the Firebase realtime sync engine once. It runs for the life of this
   // (always-alive, usually hidden) main webview — independent of which mode is
   // showing — so screenshot/clipboard sync keeps working in the background.
@@ -661,11 +666,13 @@ function MainApp() {
   // for its existing call sites: launch, tray, capture-gate, post-logout.)
   const [pairingAutoStart] = useState(false);
   const openPairing = useCallback(async () => {
+    setShowPaywall(false);
+    setMode("pairing");
     try {
-      const { startBrowserSignIn } = await import("@/lib/sync/firebase");
-      await startBrowserSignIn(true);
-    } catch {
-      /* dismissed / timed out — stay signed out; tray re-triggers sign-in */
+      await showNormalWindow(getCurrentWindow(), 500, 420, { title: "Sign in to SyncShot" });
+    } catch (error) {
+      toast.error("Could not open sign-in. Please reopen SyncShot.");
+      console.error("show sign-in failed:", error);
     }
   }, []);
 
@@ -681,13 +688,20 @@ function MainApp() {
     setMode("thumbnail");
     // The React surface changes first, so a delayed native IPC call can never
     // squeeze Preferences or the screenshot column into pill-sized geometry.
-    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+    await waitForRailPaint();
     try {
       await showCollapsedThumbnail();
     } catch (error) {
       console.error("restore collapsed pill failed:", error);
     }
   }, []);
+
+  const handleActivated = useCallback(async (status: LicenseStatus) => {
+    setLicenseStatus(status);
+    licenseStatusRef.current = status;
+    setShowPaywall(false);
+    await restoreColumnAfterModal();
+  }, [restoreColumnAfterModal]);
 
   const closePairing = restoreColumnAfterModal;
 
@@ -772,43 +786,36 @@ function MainApp() {
     // Wait for the freshly-shown window (already at final geometry, content
     // opacity:0) to paint before running the genie-in — a single rAF can fire
     // before the compositor shows it, which reads as a flash.
-    await new Promise<void>((resolve) =>
-      requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
-    );
+    await waitForRailPaint();
     setOpenSignal((n) => n + 1);
   }, [setColumnViewBoth]);
 
   // Keep outside clicks inert, but collapse an expanded screenshot column five
   // seconds after capture/reveal. Signal the child so its existing genie-out
   // animation runs before native window geometry shrinks back to the pill.
-  const startAutoHide = useCallback(() => {
-    if (autoHideTimerRef.current) clearTimeout(autoHideTimerRef.current);
-    autoHideTimerRef.current = setTimeout(() => {
-      autoHideTimerRef.current = null;
-      if (
-        modeRef.current !== "thumbnail" ||
-        isCollapsedRef.current ||
-        screenshotDragActiveRef.current ||
-        openEditorsRef.current > 0
-      ) return;
-      setAutoCollapseSignal((signal) => signal + 1);
-    }, SCREENSHOT_COLUMN_AUTO_HIDE_MS);
-  }, []);
-
-  const pauseAutoHide = useCallback(() => {
-    if (autoHideTimerRef.current) {
-      clearTimeout(autoHideTimerRef.current);
-      autoHideTimerRef.current = null;
-    }
-  }, []);
-
+  const idleTimerRef = useRef<ReturnType<typeof createRailIdleTimer> | null>(null);
+  if (!idleTimerRef.current) {
+    idleTimerRef.current = createRailIdleTimer(SCREENSHOT_COLUMN_AUTO_HIDE_MS, async () => {
+      if (modeRef.current !== "thumbnail" || isCollapsedRef.current) return true;
+      if (isCapturingRef.current || openEditorsRef.current > 0) return true;
+      if (screenshotDragActiveRef.current) {
+        if (await invoke<boolean>("primary_mouse_button_down").catch(() => false)) return true;
+        screenshotDragActiveRef.current = false;
+      }
+      // Native geometry is authoritative. WebKit can omit mouseleave when the
+      // window hides, changes display, or hands a drag to another app.
+      const inside = await cursorInsideWindow(false);
+      columnHoveredRef.current = inside;
+      return inside;
+    }, () => setAutoCollapseSignal(signal => signal + 1));
+  }
+  const startAutoHide = useCallback(() => idleTimerRef.current?.restart(), []);
+  const pauseAutoHide = useCallback(() => idleTimerRef.current?.stop(), []);
   useEffect(() => pauseAutoHide, [pauseAutoHide]);
 
   const handleHoverChange = useCallback((active: boolean) => {
     columnHoveredRef.current = active;
-    if (active) {
-      pauseAutoHide();
-    } else if (!isCollapsedRef.current) {
+    if (!isCollapsedRef.current) {
       // Full grace period begins only after pointer leaves rail. Scroll/wheel
       // activity reports active too, so timer cannot expire mid-interaction.
       startAutoHide();
@@ -823,8 +830,7 @@ function MainApp() {
 
   const handleScreenshotDragStateChange = useCallback((active: boolean) => {
     screenshotDragActiveRef.current = active;
-    if (active) pauseAutoHide();
-    else if (!isCollapsedRef.current) startAutoHide();
+    if (!isCollapsedRef.current) startAutoHide();
   }, [pauseAutoHide, startAutoHide]);
 
   // Toggle Screenshots/Text while expanded: swap the view instantly (both
@@ -835,9 +841,7 @@ function MainApp() {
     if (columnViewRef.current === view) return;
     setColumnViewBoth(view);
     startAutoHide();
-    await new Promise<void>((resolve) =>
-      requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
-    );
+    await waitForRailPaint();
     await expandThumbWindow(view, thumbsRef.current.length);
   }, [setColumnViewBoth, startAutoHide]);
   const [shortcuts, setShortcuts] = useState<KeyboardShortcut[]>(DEFAULT_SHORTCUTS);
@@ -872,7 +876,7 @@ function MainApp() {
       if (!omitPendingPaths([cloudPath], pendingRemovalPathsRef.current, railIdentity).length) return;
       const next = mergeThumbPages([cloudPath]);
 
-      if (modeRef.current === "pairing" || modeRef.current === "preferences") return;
+      if (modeRef.current !== "thumbnail" || isCapturingRef.current) return;
       setMode("thumbnail");
       setColumnViewBoth("screenshots");
 
@@ -1198,7 +1202,10 @@ function MainApp() {
       return;
     }
 
-    if (licenseStatusRef.current?.state === "expired") {
+    const access = await loadLicenseStatus();
+    licenseStatusRef.current = access;
+    setLicenseStatus(access);
+    if (access.state !== "licensed" && access.state !== "trial") {
       setShowPaywall(true);
       await showNormalWindow(getCurrentWindow(), 520, 640, {
         title: "Activate SyncShot",
@@ -1207,7 +1214,10 @@ function MainApp() {
       return;
     }
 
+    if (isCapturingRef.current) return;
     isCapturingRef.current = true;
+    idleTimerRef.current?.stop();
+    columnHoveredRef.current = false;
 
     const appWindow = getCurrentWindow();
     // Keep the pre-capture surface so an Escape/capture/save failure always
@@ -1524,7 +1534,7 @@ function MainApp() {
           isCollapsedRef.current = true;
           setIsCollapsed(true);
           setMode("thumbnail");
-          await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+          await waitForRailPaint();
           await showCollapsedThumbnail();
         }
       });
@@ -1625,7 +1635,10 @@ function MainApp() {
       toast.info("Desktop screenshots are shown read-only");
       return;
     }
-    if (licenseStatusRef.current?.state === "expired") {
+    const access = await loadLicenseStatus();
+    licenseStatusRef.current = access;
+    setLicenseStatus(access);
+    if (access.state !== "licensed" && access.state !== "trial") {
       setShowPaywall(true);
       await showNormalWindow(getCurrentWindow(), 520, 640, {
         title: "Activate SyncShot",
@@ -1717,16 +1730,13 @@ function MainApp() {
     };
     void remove();
     if (remaining.length === 0) {
-      if (autoHideTimerRef.current) {
-        clearTimeout(autoHideTimerRef.current);
-        autoHideTimerRef.current = null;
-      }
+      idleTimerRef.current?.stop();
       // Keep the launcher available after the last item is deleted rather than
       // leaving the user with an invisible app surface.
       isCollapsedRef.current = true;
       setIsCollapsed(true);
       setMode("thumbnail");
-      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+      await waitForRailPaint();
       try { await showCollapsedThumbnail(); } catch {}
     } else if (!isCollapsedRef.current) {
       await resizeThumbWindowKeepingBottom(remaining.length);
@@ -1740,10 +1750,7 @@ function MainApp() {
 
   const handleToggleCollapsed = useCallback(async () => {
     const next = !isCollapsedRef.current;
-    if (autoHideTimerRef.current) {
-      clearTimeout(autoHideTimerRef.current);
-      autoHideTimerRef.current = null;
-    }
+    idleTimerRef.current?.stop();
     if (next) {
       // COLLAPSE. triggerCollapse already played the genie-out so the column is
       // fully invisible (opacity:0, curled into the pill). Resize the native
@@ -1753,7 +1760,7 @@ function MainApp() {
       // narrow pill window.
       isCollapsedRef.current = true;
       setIsCollapsed(true);
-      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+      await waitForRailPaint();
       try {
         await showCollapsedThumbnail();
       } catch (error) {
@@ -1774,13 +1781,11 @@ function MainApp() {
       // opacity:0 column state is actually COMPOSITED to screen before we touch
       // native geometry — otherwise the old collapsed pill rides the window's
       // top edge upward during the resize (the "pill jumps up" flash).
-      await new Promise<void>((resolve) =>
-        requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
-      );
+      await waitForRailPaint();
       await expandThumbWindow(columnViewRef.current, thumbsRef.current.length);
       // One more frame so the resized geometry is composited before the reveal
       // starts (the genie must not unfurl inside a still-pill-sized window).
-      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+      await waitForRailPaint();
       setOpenSignal((n) => n + 1);
       startAutoHide();
     }
@@ -1849,7 +1854,7 @@ function MainApp() {
       <Paywall
         reason={licenseStatus?.state === "expired" ? "expired" : "manual"}
         onActivated={handleActivated}
-        onClose={() => setShowPaywall(false)}
+        onClose={() => { setShowPaywall(false); void restoreColumnAfterModal(); }}
       />
     );
   }

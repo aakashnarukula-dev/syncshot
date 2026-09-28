@@ -77,13 +77,41 @@ describe("screenshot drag source", () => {
     useSyncStore.getState().setScreenshots([makeDoc()], false);
     useSyncStore.getState().mapLocalCapture(stagingPath, "doc123");
     invokeMock.mockImplementation((command: string, args: { path?: string }) =>
-      command === "file_exists" ? Promise.resolve(args.path === stagingPath) : Promise.resolve(),
+      command === "file_exists" ? Promise.resolve(args.path === stagingPath) :
+        command === "prepare_local_drag_image" ? Promise.resolve("/tmp/syncshot-drag-copy.png") : Promise.resolve(),
     );
 
     const source = await prepareScreenshotDragSource(cloudScreenshotPath("doc123"));
-    expect(source).toEqual({ path: stagingPath, temporary: false });
+    expect(source).toEqual({ path: "/tmp/syncshot-drag-copy.png", temporary: true });
     await releaseScreenshotDragSource(source);
-    expect(invokeMock).not.toHaveBeenCalledWith("delete_file", expect.anything());
+    expect(invokeMock).toHaveBeenCalledWith("delete_file", { path: source.path });
+    expect(invokeMock).not.toHaveBeenCalledWith("delete_file", { path: stagingPath });
+  });
+
+  it("uses local staging while the cloud original is still uploading", async () => {
+    useSyncStore.getState().setScreenshots([makeDoc({ fullPath: null, status: "thumb" })], false);
+    useSyncStore.getState().mapLocalCapture("/cache/new.png", "doc123");
+    invokeMock.mockImplementation((command: string, args: { path?: string }) => {
+      if (command === "file_exists") return Promise.resolve(args.path === "/cache/new.png");
+      if (command === "prepare_local_drag_image") return Promise.resolve("/tmp/syncshot-drag-new.png");
+      return Promise.resolve();
+    });
+    const source = await prepareScreenshotDragSource(cloudScreenshotPath("doc123"));
+    expect(source.path).toBe("/tmp/syncshot-drag-new.png");
+    expect(getDownloadURL).not.toHaveBeenCalled();
+  });
+
+  it("recovers if upload deletes staging between file probe and drag preparation", async () => {
+    useSyncStore.getState().setScreenshots([makeDoc()], false);
+    useSyncStore.getState().mapLocalCapture("/cache/race.png", "doc123");
+    getDownloadURL.mockResolvedValue("https://firebasestorage.googleapis.com/full.png?token=r");
+    invokeMock.mockImplementation((command: string) => {
+      if (command === "file_exists") return Promise.resolve(true);
+      if (command === "prepare_local_drag_image") return Promise.reject(new Error("file gone"));
+      if (command === "download_temporary_image") return Promise.resolve("/tmp/syncshot-cloud-race.png");
+      return Promise.resolve();
+    });
+    expect(await prepareScreenshotDragSource("/cache/race.png")).toEqual({ path: "/tmp/syncshot-cloud-race.png", temporary: true });
   });
 
   it("removes only its downloaded cloud file after drop", async () => {

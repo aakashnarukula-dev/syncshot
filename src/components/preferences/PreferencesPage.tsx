@@ -129,7 +129,7 @@ export function PreferencesPage({ onBack, onSettingsChange, onLoggedOut }: Prefe
           <Section label="account">
             <Row
               label={account ?? "signed in"}
-              hint="this device is linked to your phone account. screenshots & clipboard sync across your devices."
+              hint="Use the same Google account on every device. Existing phone accounts can connect Google without losing their library."
             >
               <button
                 onClick={handleLogout}
@@ -144,6 +144,13 @@ export function PreferencesPage({ onBack, onSettingsChange, onLoggedOut }: Prefe
                 log out
               </button>
             </Row>
+            <button type="button" className="rounded-md border border-white/20 px-3 py-2 text-sm" onClick={async () => {
+              try {
+                const { startBrowserSignIn } = await import("@/lib/sync/firebase");
+                await startBrowserSignIn();
+                toast.success("Google account connected");
+              } catch (error) { toast.error(error instanceof Error ? error.message : "Could not connect Google"); }
+            }}>Connect Google account</button>
           </Section>
         )}
       </div>

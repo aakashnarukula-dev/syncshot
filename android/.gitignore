@@ -11,3 +11,8 @@ local.properties
 app/google-services.json
 firebase-debug.log
 *.log
+
+keystore.properties
+*.jks
+*.keystore
+google-services.json

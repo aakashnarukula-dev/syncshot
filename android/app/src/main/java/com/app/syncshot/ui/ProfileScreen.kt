@@ -63,7 +63,7 @@ fun ProfileScreen(onSignedOut: () -> Unit, onBack: (() -> Unit)? = null) {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
     val myDeviceId = remember { Prefs(ctx).deviceId }
-    val phone = remember { FirebaseRepo.phoneNumber }
+    var phone by remember { mutableStateOf(com.google.firebase.auth.FirebaseAuth.getInstance().currentUser?.email ?: FirebaseRepo.phoneNumber) }
 
     val devicesFlow = remember {
         if (FirebaseRepo.signedIn) FirebaseRepo.deviceSnapshots()
@@ -78,12 +78,13 @@ fun ProfileScreen(onSignedOut: () -> Unit, onBack: (() -> Unit)? = null) {
     if (confirmSignOut) AlertDialog(
         onDismissRequest = { confirmSignOut = false },
         title = { Text("Sign out?") },
-        text = { Text("Stops syncing on this device. Sign back in anytime with the same number.") },
+        text = { Text("Stops syncing on this device. Sign back in anytime with the same Google account.") },
         confirmButton = {
             TextButton(onClick = {
                 confirmSignOut = false
                 scope.launch {
                     withContext(Dispatchers.IO) {
+                        runCatching { com.app.syncshot.data.GoogleAuth.clear(ctx) }
                         runCatching { FirebaseRepo.signOutLocal(ctx) }
                         runCatching { AppDb.get(ctx).clearAllTables() }
                     }
@@ -162,6 +163,18 @@ fun ProfileScreen(onSignedOut: () -> Unit, onBack: (() -> Unit)? = null) {
                 }
             }
 
+            item {
+                OutlinedButton(onClick = {
+                    scope.launch {
+                        try {
+                            com.app.syncshot.data.GoogleAuth.signIn(ctx)
+                            phone = com.google.firebase.auth.FirebaseAuth.getInstance().currentUser?.email
+                            Toast.makeText(ctx, "Google account connected", Toast.LENGTH_SHORT).show()
+                        } catch (cancelled: kotlinx.coroutines.CancellationException) { throw cancelled }
+                        catch (error: Exception) { Toast.makeText(ctx, error.message ?: "Could not connect Google", Toast.LENGTH_LONG).show() }
+                    }
+                }) { Text("Connect Google account") }
+            }
             item {
                 Text(
                     "This device",

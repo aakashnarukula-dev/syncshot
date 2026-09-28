@@ -929,17 +929,23 @@ export interface ScreenshotDragSource {
  * after the drop; an own-device staging file still belongs to the library. */
 export async function prepareScreenshotDragSource(path: string): Promise<ScreenshotDragSource> {
   if (await invoke<boolean>("file_exists", { path })) {
-    return { path, temporary: false };
+    try {
+      return { path: await invoke<string>("prepare_local_drag_image", { path }), temporary: true };
+    } catch { /* Upload may have unlinked staging between the probe and copy. */ }
   }
 
   const doc = findDocForCachePath(path);
-  if (!doc?.fullPath) throw new Error("Screenshot file is unavailable");
+  if (!doc) throw new Error("Screenshot file is unavailable");
 
   const stagingPath = Object.entries(useSyncStore.getState().localCaptureDocIds)
     .find(([, id]) => id === doc.id)?.[0];
   if (stagingPath && await invoke<boolean>("file_exists", { path: stagingPath })) {
-    return { path: stagingPath, temporary: false };
+    try {
+      return { path: await invoke<string>("prepare_local_drag_image", { path: stagingPath }), temporary: true };
+    } catch { /* Fall back to the uploaded file if staging was removed. */ }
   }
+
+  if (!doc.fullPath) throw new Error("Screenshot is still uploading");
 
   const url = await resolveScreenshotFullImageUrl(doc);
   if (!url) throw new Error("Screenshot is still uploading");

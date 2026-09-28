@@ -1,5 +1,9 @@
 # SyncShot
 
+[Website](https://syncshot-seven.vercel.app) · [Release readiness and verification](docs/RELEASE_READINESS.md)
+
+SyncShot connects screenshot and clipboard workflows across macOS and Android using Google sign-in. Planned lifetime access is ₹999 in India or $9 internationally. Checkout is currently a Razorpay demo: no payment or paid license is created. Existing phone accounts should connect Google from app settings before signing out.
+
 <img width="3600" height="2025" alt="stage-1768238789948" src="https://github.com/user-attachments/assets/3051266a-5179-440f-a747-7980abd7bac3" />
 
 [![Discord](https://img.shields.io/badge/Discord-%235865F2.svg?style=for-the-badge&logo=discord&logoColor=white)](https://discord.gg/zThjstVs) 
@@ -41,7 +45,7 @@ SyncShot is a fast, lightweight screenshot tool built with Tauri + React. It pro
 
 ## Background
 
-Clean screenshot workflows usually need three things: capture fast, polish fast (background/shadow/roundness), and annotate fast (arrows, labels). SyncShot is a macOS-native app that keeps everything local and lightweight.
+Clean screenshot workflows usually need three things: capture fast, polish fast (background/shadow/roundness), and annotate fast (arrows, labels). SyncShot combines native Mac capture and editing with an account-based Firebase cloud library shared with Android. Captures and copied text can upload automatically; review sync preferences before handling sensitive content.
 
 ## Features
 

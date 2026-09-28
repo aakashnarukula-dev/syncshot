@@ -32,6 +32,7 @@ import java.util.Collections
  *  - holds the Firestore screenshots listener -> mirrors docs into Room (instant
  *    grid) and downloads + notify-to-copy for shots from other devices. */
 class SyncService : Service() {
+    private var accessGranted = false
     private var observer: ContentObserver? = null
     private var lastSeenId: Long = 0
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
@@ -48,8 +49,12 @@ class SyncService : Service() {
         } else {
             startForeground(1, notif)
         }
-        startScreenshotObserverIfPermitted()
-        startMirror()
+        scope.launch {
+            accessGranted = runCatching { com.app.syncshot.data.AccountAccess.check() }.getOrDefault(false)
+            if (!accessGranted) { stopSelf(); return@launch }
+            startScreenshotObserverIfPermitted()
+            startMirror()
+        }
     }
 
     private fun startMirror() {
@@ -253,8 +258,8 @@ class SyncService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         // Re-check on every explicit start so granting image access from the UI
         // after the service was already alive enables local screenshot uploads.
-        startScreenshotObserverIfPermitted()
-        return START_STICKY
+        if (accessGranted) startScreenshotObserverIfPermitted()
+        return START_NOT_STICKY
     }
 
     override fun onDestroy() {

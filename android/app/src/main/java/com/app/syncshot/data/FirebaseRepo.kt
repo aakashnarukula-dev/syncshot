@@ -1,15 +1,10 @@
 package com.app.syncshot.data
 
-import android.app.Activity
 import android.content.Context
 import android.os.Build
 import com.app.syncshot.data.db.AppDb
 import com.app.syncshot.data.db.ScreenshotEntity
 import com.google.firebase.Firebase
-import com.google.firebase.FirebaseException
-import com.google.firebase.auth.PhoneAuthCredential
-import com.google.firebase.auth.PhoneAuthOptions
-import com.google.firebase.auth.PhoneAuthProvider
 import com.google.firebase.auth.auth
 import com.google.firebase.firestore.CollectionReference
 import com.google.firebase.firestore.FieldValue
@@ -29,7 +24,7 @@ import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.tasks.await
 
 /**
- * Single Firebase entry point. Identity = phone OTP sign-in: every device
+ * Single Firebase entry point. Identity = Google sign-in: every device
  * signs in to the same account and reads/writes users/{uid}/... directly.
  * Per-device identity (to skip our own docs on receive) is Prefs.deviceId,
  * not the shared auth uid.
@@ -53,59 +48,6 @@ object FirebaseRepo {
     fun purgeAnonymousAndCheck(): Boolean {
         auth.currentUser?.takeIf { it.isAnonymous }?.let { auth.signOut() }
         return signedIn
-    }
-
-    // --- Phone OTP sign-in ------------------------------------------------------
-
-    private var verificationId: String? = null
-
-    /** Text a 6-digit code to `phone` (E.164). App verification (Play Integrity /
-     *  reCAPTCHA fallback) needs the foreground Activity. */
-    fun sendPhoneOtp(
-        activity: Activity,
-        phone: String,
-        onSent: () -> Unit,
-        onAutoSignedIn: () -> Unit,
-        onError: (Throwable) -> Unit,
-    ) {
-        val options = PhoneAuthOptions.newBuilder(auth)
-            .setPhoneNumber(phone)
-            .setTimeout(60L, java.util.concurrent.TimeUnit.SECONDS)
-            .setActivity(activity)
-            .setCallbacks(object : PhoneAuthProvider.OnVerificationStateChangedCallbacks() {
-                override fun onVerificationCompleted(credential: PhoneAuthCredential) {
-                    // Instant verification / auto SMS retrieval — no code entry needed.
-                    auth.currentUser?.takeIf { it.isAnonymous }?.let { auth.signOut() }
-                    auth.signInWithCredential(credential)
-                        .addOnSuccessListener { onAutoSignedIn() }
-                        .addOnFailureListener { onError(it) }
-                }
-
-                override fun onVerificationFailed(e: FirebaseException) = onError(e)
-
-                override fun onCodeSent(id: String, token: PhoneAuthProvider.ForceResendingToken) {
-                    verificationId = id
-                    onSent()
-                }
-            })
-            .build()
-        PhoneAuthProvider.verifyPhoneNumber(options)
-    }
-
-    /** Complete sign-in with the SMS code. */
-    suspend fun signInWithOtp(code: String) {
-        val id = verificationId ?: error("Request a code first")
-        val cred = PhoneAuthProvider.getCredential(id, code.trim())
-        auth.currentUser?.takeIf { it.isAnonymous }?.let { auth.signOut() }
-        auth.signInWithCredential(cred).await()
-    }
-
-    /** Complete sign-in with a Firebase custom token (e.g. minted by the
-     *  SyncShot Truecaller server). The server keys it to the same uid as
-     *  phone-OTP, so the account/library is identical either way. */
-    suspend fun signInWithCustomToken(token: String) {
-        auth.currentUser?.takeIf { it.isAnonymous }?.let { auth.signOut() }
-        auth.signInWithCustomToken(token).await()
     }
 
     /** Sign this device out and clear local state, including downloaded images. */
@@ -170,6 +112,7 @@ object FirebaseRepo {
 
     /** Publish a screenshot: dedupe by sha256, thumbnail-first, then full. */
     suspend fun publishScreenshot(ctx: Context, full: ByteArray) = coroutineScope {
+        AccountAccess.requireActive()
         val uid = requireUid()
         val sha = Hashing.sha256(full)
         val type = detectImageType(full)
@@ -359,6 +302,7 @@ object FirebaseRepo {
     /** Write a clipboard entry, dropping it if it duplicates the most-recent hash
      *  or exceeds the 100 KB text cap. */
     suspend fun writeClipboard(ctx: Context, text: String) {
+        AccountAccess.requireActive()
         if (text.isBlank()) return
         if (text.toByteArray(Charsets.UTF_8).size > MAX_CLIP_BYTES) return
         val hash = Hashing.sha256(text.toByteArray(Charsets.UTF_8))

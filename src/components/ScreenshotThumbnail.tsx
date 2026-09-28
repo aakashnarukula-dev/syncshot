@@ -114,6 +114,7 @@ export const ScreenshotThumbnail = memo(function ScreenshotThumbnail({
   const colRef = useRef<HTMLDivElement>(null);
   const animRef = useRef<ReturnType<typeof animate> | null>(null);
   const collapsePendingRef = useRef(false);
+  const collapseGenerationRef = useRef(0);
   const collapseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const prevOpenRef = useRef(openSignal);
   const prevAutoCollapseRef = useRef(autoCollapseSignal);
@@ -140,6 +141,10 @@ export const ScreenshotThumbnail = memo(function ScreenshotThumbnail({
   useLayoutEffect(() => {
     if (prevOpenRef.current === openSignal) return;
     prevOpenRef.current = openSignal;
+    collapseGenerationRef.current++;
+    collapsePendingRef.current = false;
+    setAnimatingOut(false);
+    if (collapseTimerRef.current) clearTimeout(collapseTimerRef.current);
     const el = colRef.current;
     if (!el) return;
     animRef.current?.stop();
@@ -157,9 +162,10 @@ export const ScreenshotThumbnail = memo(function ScreenshotThumbnail({
     // so pill-control and Escape dismissals have a guaranteed close path.
     if (animatingOut || collapsePendingRef.current || isCollapsed) return;
     collapsePendingRef.current = true;
+    const generation = ++collapseGenerationRef.current;
     setAnimatingOut(true);
     const complete = () => {
-      if (!collapsePendingRef.current) return;
+      if (!collapsePendingRef.current || generation !== collapseGenerationRef.current) return;
       collapsePendingRef.current = false;
       if (collapseTimerRef.current) {
         clearTimeout(collapseTimerRef.current);
@@ -189,7 +195,7 @@ export const ScreenshotThumbnail = memo(function ScreenshotThumbnail({
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape" && !isCollapsed && columnView === "screenshots" && paths.length > 0) {
+      if (e.key === "Escape" && !isCollapsed) {
         // Escape is a dismissal key, never a destructive shortcut. The old
         // handler permanently deleted the newest screenshot without a prompt.
         e.preventDefault();
@@ -632,6 +638,7 @@ export const ThumbnailItem = memo(function ThumbnailItem({ path, onEdit, onRemov
   const dragWarmTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const dragReleaseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const dragActiveRef = useRef(false);
+  const finishDragRef = useRef<(() => void) | null>(null);
   const pointerHeldRef = useRef(false);
   const dragPointerRef = useRef<{ id: number; x: number; y: number; target: HTMLImageElement } | null>(null);
   const suppressDragClickRef = useRef(false);
@@ -689,6 +696,7 @@ export const ThumbnailItem = memo(function ThumbnailItem({ path, onEdit, onRemov
     window.addEventListener("pointercancel", onPointerUp, true);
     return () => {
       mountedRef.current = false;
+      finishDragRef.current?.();
       pointerHeldRef.current = false;
       releaseDragPointer();
       window.removeEventListener("pointerup", onPointerUp, true);
@@ -877,11 +885,13 @@ export const ThumbnailItem = memo(function ThumbnailItem({ path, onEdit, onRemov
       if (finished) return;
       finished = true;
       if (watchdog) clearTimeout(watchdog);
+      finishDragRef.current = null;
       dragActiveRef.current = false;
       pointerHeldRef.current = false;
       releaseDragPointer();
       onDragStateChange?.(false);
     };
+    finishDragRef.current = finish;
     void (async () => {
       try {
         const prepared = await prepareDrag();

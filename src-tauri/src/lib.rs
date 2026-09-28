@@ -17,15 +17,16 @@ mod utils;
 use auth::{browser_auth_listen, close_auth_window};
 use commands::{
     capture_all_monitors, capture_once, capture_region, clear_remote_image_cache,
-    copy_png_bytes_to_clipboard, copy_remote_image_to_clipboard, copy_to_clipboard, cursor_display_bounds, delete_file,
-    download_temporary_image, file_exists, get_desktop_directory, get_desktop_root,
-    get_mouse_position, get_screenshot_thumbnail, get_screenshot_thumbnail_path,
-    get_temp_directory, list_screenshot_sources, list_screenshots, list_screenshots_from_dirs,
-    native_capture_fullscreen, native_capture_interactive, native_capture_window,
-    open_editor_window, play_screenshot_sound, prefetch_remote_images, read_image_bytes,
-    read_remote_image_bytes, remove_legacy_screenshot_directory, rename_screenshot_to_doc_id,
-    save_edited_image, save_edited_image_bytes, save_image_to_downloads, save_native_screenshot,
-    set_clipboard_text, stat_file, take_editor_pending_path,
+    copy_png_bytes_to_clipboard, copy_remote_image_to_clipboard, copy_to_clipboard,
+    cursor_display_bounds, delete_file, download_temporary_image, file_exists,
+    get_desktop_directory, get_desktop_root, get_mouse_position, get_screenshot_thumbnail,
+    get_screenshot_thumbnail_path, get_temp_directory, list_screenshot_sources, list_screenshots,
+    list_screenshots_from_dirs, native_capture_fullscreen, native_capture_interactive,
+    native_capture_window, open_editor_window, play_screenshot_sound, prefetch_remote_images,
+    read_image_bytes, read_remote_image_bytes, remove_legacy_screenshot_directory,
+    rename_screenshot_to_doc_id, save_edited_image, save_edited_image_bytes,
+    save_image_to_downloads, save_native_screenshot, set_clipboard_text, stat_file,
+    take_editor_pending_path,
 };
 use license::{get_machine_id, keychain_delete, keychain_get, keychain_set};
 
@@ -459,6 +460,8 @@ pub fn run() {
             play_screenshot_sound,
             rename_screenshot_to_doc_id,
             download_temporary_image,
+            commands::prepare_local_drag_image,
+            commands::primary_mouse_button_down,
             save_image_to_downloads,
             set_clipboard_text,
             get_mouse_position,
