@@ -1,5 +1,5 @@
 import { lazy, memo, Suspense, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
-import { convertFileSrc } from "@tauri-apps/api/core";
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { animate } from "motion";
 import { startDrag } from "@crabnebula/tauri-plugin-drag";
 import { Check, ChevronLeft, ClipboardList, Copy, Download, Image as ImageIcon, ImageOff, ImagePlus, Link2, Loader2, Trash2 } from "lucide-react";
@@ -600,6 +600,14 @@ function withTimeout<T>(p: Promise<T>, ms: number): Promise<T | null> {
 // Memoized: scroll-window shifts re-render the list container, and without
 // memo every mounted tile would re-render on each shift. Props are stable
 // (path string + App-level useCallback handlers).
+/** Timestamped drag stages in the local capture diagnostics log. */
+function dragDiagnostic(stage: string) {
+  const focus = typeof document !== "undefined" && document.hasFocus() ? "key" : "notkey";
+  void Promise.resolve()
+    .then(() => invoke("drag_diagnostic", { stage: `${stage} ${focus}` }))
+    .catch(() => {});
+}
+
 export const ThumbnailItem = memo(function ThumbnailItem({ path, onEdit, onRemove, readOnly, onDragStateChange }: ThumbnailItemProps) {
   const isUploading = isImportScreenshotPath(path);
   const cloudId = cloudScreenshotId(path);
@@ -639,6 +647,12 @@ export const ThumbnailItem = memo(function ThumbnailItem({ path, onEdit, onRemov
   const dragReleaseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const dragActiveRef = useRef(false);
   const finishDragRef = useRef<(() => void) | null>(null);
+  // Ends a drag that is still waiting for its file when the button is released,
+  // so the very next press starts a new drag instead of being ignored.
+  const abandonPendingDragRef = useRef<(() => void) | null>(null);
+  // Shown only when a drag waits for a cold cloud download, so the user keeps
+  // holding the button instead of letting go before the OS drag can start.
+  const [dragPending, setDragPending] = useState(false);
   const pointerHeldRef = useRef(false);
   const dragPointerRef = useRef<{ id: number; x: number; y: number; target: HTMLImageElement } | null>(null);
   const suppressDragClickRef = useRef(false);
@@ -688,9 +702,11 @@ export const ThumbnailItem = memo(function ThumbnailItem({ path, onEdit, onRemov
 
   useEffect(() => {
     mountedRef.current = true;
-    const onPointerUp = () => {
+    const onPointerUp = (event: PointerEvent) => {
+      if (pointerHeldRef.current) dragDiagnostic(`pointer-${event.type === "pointercancel" ? "cancel" : "up"}`);
       pointerHeldRef.current = false;
       releaseDragPointer();
+      abandonPendingDragRef.current?.();
     };
     window.addEventListener("pointerup", onPointerUp, true);
     window.addEventListener("pointercancel", onPointerUp, true);
@@ -875,34 +891,55 @@ export const ThumbnailItem = memo(function ThumbnailItem({ path, onEdit, onRemov
 
   const beginDrag = () => {
     if (dragActiveRef.current) return;
+    const dragStartedAt = performance.now();
+    dragDiagnostic(`begin prepared=${dragPreparationRef.current ? "pending" : "none"}`);
     dragActiveRef.current = true;
     onDragStateChange?.(true);
     if (dragReleaseTimerRef.current) clearTimeout(dragReleaseTimerRef.current);
     let started = false;
     let finished = false;
     let watchdog: ReturnType<typeof setTimeout> | null = null;
+    const pendingHint = setTimeout(() => {
+      if (!started && !finished && mountedRef.current) setDragPending(true);
+    }, 120);
+    const clearPendingHint = () => {
+      clearTimeout(pendingHint);
+      if (mountedRef.current) setDragPending(false);
+    };
     const finish = () => {
       if (finished) return;
       finished = true;
+      clearPendingHint();
       if (watchdog) clearTimeout(watchdog);
       finishDragRef.current = null;
+      if (abandonPendingDragRef.current === finish) abandonPendingDragRef.current = null;
       dragActiveRef.current = false;
       pointerHeldRef.current = false;
       releaseDragPointer();
       onDragStateChange?.(false);
     };
     finishDragRef.current = finish;
+    abandonPendingDragRef.current = finish;
     void (async () => {
       try {
         const prepared = await prepareDrag();
+        const waited = Math.round(performance.now() - dragStartedAt);
         // Native drag must begin while mouse button is still held. Delayed
         // cloud download after release previously spawned a ghost drag.
-        if (!mountedRef.current || !pointerHeldRef.current) return;
+        // An abandoned attempt keeps the prepared file for the next press.
+        if (finished || !mountedRef.current || !pointerHeldRef.current) {
+          dragDiagnostic(`abort ms=${waited} mounted=${mountedRef.current} held=${pointerHeldRef.current}`);
+          return;
+        }
+        abandonPendingDragRef.current = null;
+        dragDiagnostic(`start ms=${waited}`);
+        clearPendingHint();
         dragPreparationRef.current = null;
         releaseDragPointer();
         started = true;
         try {
           await startDrag({ item: [prepared.source.path], icon: prepared.icon }, ({ result }) => {
+            dragDiagnostic(`result ${result === "Dropped" ? "dropped" : "cancelled"}`);
             // Target apps may read file after macOS reports drop. Keep cloud
             // copy briefly after success; cancellation needs no grace period.
             const delay = result === "Dropped" ? 120_000 : 0;
@@ -923,11 +960,13 @@ export const ThumbnailItem = memo(function ThumbnailItem({ path, onEdit, onRemov
         }
       } catch (error) {
         console.error("startDrag failed:", error);
+        dragDiagnostic("error");
         if (mountedRef.current) toast.error("Couldn't drag screenshot", {
           description: error instanceof Error ? error.message : String(error),
         });
       } finally {
-        if (!started) releaseDragPreparation();
+        // A prepared file survives an early release: the next press reuses it
+        // instantly. Mouse-leave and unmount still release it.
         if (!started || finished) finish();
       }
     })();
@@ -1093,6 +1132,7 @@ export const ThumbnailItem = memo(function ThumbnailItem({ path, onEdit, onRemov
             }, 10_000);
           }}
           onPointerDown={(event) => {
+            dragDiagnostic(`pointer-down button=${event.button} uploading=${isUploading} active=${dragActiveRef.current} prepared=${dragPreparationRef.current ? "yes" : "no"}`);
             if (event.button !== 0 || isUploading || dragActiveRef.current) return;
             pointerHeldRef.current = true;
             suppressDragClickRef.current = false;
@@ -1110,6 +1150,7 @@ export const ThumbnailItem = memo(function ThumbnailItem({ path, onEdit, onRemov
             const pointer = dragPointerRef.current;
             if (!pointer || pointer.id !== event.pointerId || !pointerHeldRef.current || dragActiveRef.current) return;
             if ((event.buttons & 1) === 0) {
+              dragDiagnostic("move-without-button");
               pointerHeldRef.current = false;
               releaseDragPointer();
               return;
@@ -1163,6 +1204,13 @@ export const ThumbnailItem = memo(function ThumbnailItem({ path, onEdit, onRemov
             }
           }}
         />
+      ) : null}
+
+      {dragPending ? (
+        <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center rounded-md bg-neutral-950/50 text-white">
+          <Loader2 className="size-4 animate-spin" aria-hidden="true" />
+          <span className="sr-only">Preparing drag</span>
+        </div>
       ) : null}
 
       {isUploading ? (
