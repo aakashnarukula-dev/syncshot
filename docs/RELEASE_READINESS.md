@@ -26,7 +26,7 @@ Phone users should connect Google while still signed into their existing account
 
 ## Deployment
 
-- Website: https://syncshot-seven.vercel.app
+- Website: https://syncshot-app.web.app
 - Published preview: https://github.com/aakashnarukula-dev/syncshot/releases/tag/preview-2026.09.28 — Apple Silicon Mac ZIP, Android 2.0.11 APK, and SHA-256 checksums. Website links directly to both downloads. Uploaded checksums and unauthenticated download responses were verified. Intel binaries are not included.
 - Browser login: https://syncshot-v2.web.app/auth.html (launch from the Mac app; requires callback state)
 - Firebase project: `syncshot-v2`; callable functions: `us-central1`, Node.js 22.
