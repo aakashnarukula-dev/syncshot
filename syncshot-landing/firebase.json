@@ -1,0 +1,16 @@
+{
+  "hosting": {
+    "target": "landing",
+    "public": "out",
+    "cleanUrls": true,
+    "trailingSlash": true,
+    "ignore": ["firebase.json", "**/.*", "**/node_modules/**"],
+    "predeploy": ["npx -y pnpm@10.28.0 --dir \"$PROJECT_DIR\" build"],
+    "headers": [
+      {
+        "source": "/_next/static/**",
+        "headers": [{ "key": "Cache-Control", "value": "public, max-age=31536000, immutable" }]
+      }
+    ]
+  }
+}

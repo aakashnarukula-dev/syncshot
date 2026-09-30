@@ -1,6 +1,6 @@
 # SyncShot
 
-[Website](https://syncshot-seven.vercel.app) · [Release readiness and verification](docs/RELEASE_READINESS.md)
+[Website](https://syncshot-app.web.app) · [Release readiness and verification](docs/RELEASE_READINESS.md)
 
 SyncShot connects screenshot and clipboard workflows across macOS and Android using Google sign-in. Planned lifetime access is ₹999 in India or $9 internationally. Checkout is currently a Razorpay demo: no payment or paid license is created. Existing phone accounts should connect Google from app settings before signing out.
 

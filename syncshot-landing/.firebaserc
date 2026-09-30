@@ -1,0 +1,12 @@
+{
+  "projects": {
+    "default": "syncshot-v2"
+  },
+  "targets": {
+    "syncshot-v2": {
+      "hosting": {
+        "landing": ["syncshot-app"]
+      }
+    }
+  }
+}

@@ -12,7 +12,7 @@ export function Paywall({ reason, onActivated, onClose }: PaywallProps) {
       <p className="text-pretty text-zinc-400">One account for your Mac and Android phone. ₹999 in India or $9 internationally, paid once.</p>
       <p className="rounded-lg border border-white/20 p-4 text-sm">Checkout is currently a demo. No payment is collected and demo checkout does not activate lifetime access.</p>
       <button className="w-full rounded-md bg-white px-4 py-3 text-black" onClick={() => {
-        void openUrl("https://syncshot-seven.vercel.app/#pricing").catch(() => setError("Could not open the website. Visit syncshot-seven.vercel.app in your browser."));
+        void openUrl("https://syncshot-app.web.app/#pricing").catch(() => setError("Could not open the website. Visit syncshot-app.web.app in your browser."));
       }}>View purchase options</button>
       <button disabled={busy} className="w-full rounded-md border border-white/30 px-4 py-3 disabled:opacity-50" onClick={async () => {
         setBusy(true); setError(null);
