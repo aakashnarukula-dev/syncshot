@@ -40,6 +40,8 @@ xcap = "0.8"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.5"
+# localtime_r for readable Finder names on clipboard PNG files.
+libc = "0.2"
 # Tauri 2.9's macOS Monitor.workArea currently preserves visibleFrame's size
 # but drops its vertical origin. Read NSScreen.visibleFrame directly so the
 # collapsed pill and expanded rail share the exact same usable-screen centre.

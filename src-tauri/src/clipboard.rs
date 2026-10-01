@@ -9,13 +9,14 @@ struct ClipboardChanged {
     text: String,
 }
 
-/// Copy an image file to the system clipboard as self-contained image data.
+/// Copy an image file to the system clipboard as self-contained image data,
+/// plus a `public.file-url` so Cmd+V in Finder pastes a PNG file.
 ///
-/// Do not advertise the staging path as `public.file-url`: captures and editor
-/// exports are deleted after their Firebase upload. Apps which preferred that
-/// representation could paste once while the file existed and then fail on the
-/// next paste. NSPasteboard owns the bytes written below, so repeated pastes
-/// remain valid after the staging file is removed.
+/// Never advertise the staging path itself: captures and editor exports are
+/// deleted after their Firebase upload, so a paste after that would fail. The
+/// file URL instead points at a SyncShot-owned copy in the Caches directory
+/// (see `clipboard_file_copy`). NSPasteboard owns the image bytes written
+/// below, so image pastes stay valid regardless of either file.
 #[cfg(target_os = "macos")]
 pub fn copy_image_to_clipboard(image_path: &str) -> AppResult<()> {
     let bytes = std::fs::read(image_path).map_err(|e| format!("read image: {}", e))?;
@@ -49,6 +50,96 @@ fn png_clipboard_fallback(bytes: &[u8]) -> Option<Vec<u8>> {
     Some(output.into_inner())
 }
 
+/// How many clipboard PNG files to keep. Finder only needs the newest one, but
+/// a short history keeps a slightly older paste from pointing at nothing.
+#[cfg(target_os = "macos")]
+const CLIPBOARD_FILE_KEEP: usize = 20;
+
+#[cfg(target_os = "macos")]
+fn clipboard_files_dir() -> Option<std::path::PathBuf> {
+    Some(
+        dirs::cache_dir()?
+            .join("com.aakashnarukula.syncshot")
+            .join("Clipboard"),
+    )
+}
+
+/// `SyncShot 2026-10-01 at 09.48.10` in local time, matching macOS's own
+/// screenshot naming so the pasted file reads naturally in Finder.
+#[cfg(target_os = "macos")]
+fn clipboard_file_stem() -> String {
+    let now = unsafe { libc::time(std::ptr::null_mut()) };
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    if unsafe { libc::localtime_r(&now, &mut tm) }.is_null() {
+        return format!("SyncShot {now}");
+    }
+    format!(
+        "SyncShot {:04}-{:02}-{:02} at {:02}.{:02}.{:02}",
+        tm.tm_year + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min,
+        tm.tm_sec
+    )
+}
+
+/// Pick `<stem>.<ext>`, or `<stem> 2.<ext>`… when copies land in the same second.
+#[cfg(target_os = "macos")]
+fn unique_file_path(dir: &std::path::Path, stem: &str, ext: &str) -> std::path::PathBuf {
+    let first = dir.join(format!("{stem}.{ext}"));
+    if !first.exists() {
+        return first;
+    }
+    (2..)
+        .map(|n| dir.join(format!("{stem} {n}.{ext}")))
+        .find(|p| !p.exists())
+        .expect("unbounded suffix search")
+}
+
+/// Delete all but the newest `keep` files in `dir`.
+#[cfg(target_os = "macos")]
+fn prune_clipboard_files(dir: &std::path::Path, keep: usize) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut files: Vec<(std::time::SystemTime, std::path::PathBuf)> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+        .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
+        .collect();
+    files.sort_by(|a, b| b.0.cmp(&a.0));
+    for (_, path) in files.into_iter().skip(keep) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Write the image to a SyncShot-owned file that outlives staging/cloud files,
+/// for the pasteboard's `public.file-url`. PNG when possible (the original
+/// bytes if already PNG, else the decoded fallback); the original format only
+/// when it cannot be decoded. Best effort: None leaves an image-only clipboard.
+#[cfg(target_os = "macos")]
+fn clipboard_file_copy(
+    dir: &std::path::Path,
+    bytes: &[u8],
+    kind: crate::image::ImageKind,
+    png_fallback: Option<&[u8]>,
+) -> Option<std::path::PathBuf> {
+    let (file_bytes, ext) = match (kind, png_fallback) {
+        (crate::image::ImageKind::Png, _) => (bytes, "png"),
+        (_, Some(png)) => (png, "png"),
+        (other, None) => (bytes, other.extension()),
+    };
+    std::fs::create_dir_all(dir).ok()?;
+    let path = unique_file_path(dir, &clipboard_file_stem(), ext);
+    if let Err(e) = std::fs::write(&path, file_bytes) {
+        eprintln!("clipboard file copy failed: {e}");
+        return None;
+    }
+    prune_clipboard_files(dir, CLIPBOARD_FILE_KEEP);
+    Some(path)
+}
+
 #[cfg(target_os = "macos")]
 fn write_image_to_clipboard(bytes: &[u8]) -> AppResult<()> {
     use objc2::msg_send;
@@ -72,6 +163,9 @@ fn write_image_to_clipboard(bytes: &[u8]) -> AppResult<()> {
         .ok_or_else(|| "Unsupported or invalid image data".to_string())?;
     let image_uti = image_kind.pasteboard_uti();
     let png_fallback = png_clipboard_fallback(bytes);
+    let file_copy = clipboard_files_dir().and_then(|dir| {
+        clipboard_file_copy(&dir, bytes, image_kind, png_fallback.as_deref())
+    });
     let c_image_type = CString::new(image_uti).unwrap();
     let c_png_type = CString::new("public.png").unwrap();
 
@@ -123,6 +217,26 @@ fn write_image_to_clipboard(bytes: &[u8]) -> AppResult<()> {
                 return Err("Failed to write PNG clipboard fallback".to_string());
             }
         }
+
+        // Finder's paste reads a file URL from the same pasteboard item; apps
+        // that take images keep reading the image representations above.
+        if let Some(path) = file_copy.as_ref().and_then(|p| p.to_str()) {
+            let c_path = CString::new(path).map_err(|e| format!("path cstring: {e}"))?;
+            let ns_url_cls = objc2::runtime::AnyClass::get("NSURL")
+                .ok_or_else(|| "NSURL class not found".to_string())?;
+            let ns_path: *mut AnyObject =
+                msg_send![ns_string_cls, stringWithUTF8String: c_path.as_ptr()];
+            let url: *mut AnyObject = msg_send![ns_url_cls, fileURLWithPath: ns_path];
+            let url_string: *mut AnyObject = msg_send![url, absoluteString];
+            let c_file_url_type = CString::new("public.file-url").unwrap();
+            let file_url_type: *mut AnyObject =
+                msg_send![ns_string_cls, stringWithUTF8String: c_file_url_type.as_ptr()];
+            let url_written: bool =
+                msg_send![pasteboard, setString: url_string, forType: file_url_type];
+            if !url_written {
+                eprintln!("clipboard file URL was not written; image data is still copied");
+            }
+        }
     }
 
     Ok(())
@@ -130,7 +244,57 @@ fn write_image_to_clipboard(bytes: &[u8]) -> AppResult<()> {
 
 #[cfg(all(test, target_os = "macos"))]
 mod image_clipboard_tests {
-    use super::png_clipboard_fallback;
+    use super::{clipboard_file_copy, png_clipboard_fallback, prune_clipboard_files};
+    use crate::image::ImageKind;
+
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "syncshot-clip-{name}-{}",
+            crate::utils::get_timestamp().unwrap()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn file_copy_writes_png_for_jpeg_source() {
+        let dir = temp_dir("jpeg");
+        let png = include_bytes!("../icons/32x32.png");
+        let path = clipboard_file_copy(&dir, b"\xFF\xD8\xFFjpeg", ImageKind::Jpeg, Some(png))
+            .expect("file copy");
+        assert_eq!(path.extension().unwrap(), "png");
+        assert_eq!(std::fs::read(&path).unwrap(), png);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn same_second_copies_get_distinct_files() {
+        let dir = temp_dir("unique");
+        let png = include_bytes!("../icons/32x32.png");
+        let a = clipboard_file_copy(&dir, png, ImageKind::Png, None).unwrap();
+        let b = clipboard_file_copy(&dir, png, ImageKind::Png, None).unwrap();
+        assert_ne!(a, b);
+        assert!(a.exists() && b.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prune_keeps_newest_files() {
+        let dir = temp_dir("prune");
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..5 {
+            std::fs::write(dir.join(format!("{i}.png")), b"x").unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        prune_clipboard_files(&dir, 2);
+        let mut left: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        assert_eq!(left, vec!["3.png", "4.png"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn png_needs_no_duplicate_fallback() {
