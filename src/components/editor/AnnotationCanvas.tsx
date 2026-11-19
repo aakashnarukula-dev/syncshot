@@ -135,7 +135,7 @@ export const AnnotationCanvas = memo(function AnnotationCanvas({
   const imageRef = useRef<EditorBitmap | null>(null);
   const rafRef = useRef<number | null>(null);
   const readyNotifiedRef = useRef(false);
-  const { viewport, displayScale, isPanning, spacePressed, zoomIn, zoomOut, fitToWindow, actualSize, canZoomIn, canZoomOut, pointerHandlers } =
+  const { viewport, displayScale, isPanning, spacePressed, zoomIn, zoomOut, fitToWindow, actualSize, canZoomIn, canZoomOut, canActualSize, pointerHandlers } =
     useEditorViewport(containerRef, previewImage, selectedTool === "pan");
   
   // Local state for drag operation - avoids store updates during drag
@@ -1273,7 +1273,7 @@ export const AnnotationCanvas = memo(function AnnotationCanvas({
         <span className="min-w-12 text-center text-xs tabular-nums" aria-label="Image zoom">{Math.round(displayScale * 100)}%</span>
         <Button variant="ghost" size="icon" className="size-8" aria-label="Zoom in" title="Zoom in (⌘/Ctrl +)" onClick={zoomIn} disabled={!canZoomIn}><ZoomIn className="size-4" /></Button>
         <Button variant="ghost" size="icon" className="size-8" aria-label="Fit image to window" title="Fit to window (⌘/Ctrl 0)" onClick={fitToWindow}><Maximize className="size-4" /></Button>
-        <Button variant="ghost" size="sm" className="h-8 px-2 text-xs" aria-label="Actual image size" title="Actual size (⌘/Ctrl 1)" onClick={actualSize}>1:1</Button>
+        <Button variant="ghost" size="sm" className="h-8 px-2 text-xs" aria-label="Actual image size" title={canActualSize ? "Actual size (⌘/Ctrl 1)" : "Actual size is smaller than fitted size"} onClick={actualSize} disabled={!canActualSize}>1:1</Button>
       </div>
     </div>
   );

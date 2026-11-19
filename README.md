@@ -150,7 +150,7 @@ This permission is required for the app to capture screenshots of your screen.
 
 ### Preview navigation
 
-Use the bottom controls to zoom, fit the image to the window, or view it at actual size (1:1). Pinch or hold `⌘`/`Ctrl` while scrolling to zoom around the pointer. Scroll to pan; use the hand tool, hold `Space` and drag, or drag with the middle mouse button to move the image. View changes do not alter the saved image or annotation coordinates.
+Use the bottom controls to zoom, fit the image to the window, or view it at actual size (1:1). Zoom-out stops at fitted size, and panning stays within image edges. Actual size is available when it is at least as large as the fitted image. Pinch or hold `⌘`/`Ctrl` while scrolling to zoom around the pointer. Scroll to pan; use the hand tool, hold `Space` and drag, or drag with the middle mouse button to move the image. View changes do not alter the saved image or annotation coordinates.
 
 ### Auto-apply workflow
 

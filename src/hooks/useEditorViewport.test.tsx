@@ -37,9 +37,9 @@ describe("editor viewport", () => {
 
   it("supports scroll pan, actual size, fit reset, and bounded zoom", () => {
     const { result } = setup();
-    act(() => { fireEvent.wheel(container, { deltaX: 30, deltaY: 40 }); });
-    expect(result.current.viewport).toEqual({ zoom: 1, x: -30, y: -40 });
     act(() => result.current.actualSize());
+    act(() => { fireEvent.wheel(container, { deltaX: 30, deltaY: 40 }); });
+    expect(result.current.viewport).toEqual({ zoom: 2, x: -30, y: -40 });
     expect(result.current.displayScale).toBe(1);
     act(() => result.current.fitToWindow());
     expect(result.current.viewport).toEqual({ zoom: 1, x: 0, y: 0 });
@@ -47,7 +47,7 @@ describe("editor viewport", () => {
     expect(result.current.viewport.zoom).toBe(16);
     expect(result.current.canZoomIn).toBe(false);
     act(() => { for (let i = 0; i < 100; i++) result.current.zoomOut(); });
-    expect(result.current.viewport.zoom).toBe(0.1);
+    expect(result.current.viewport).toEqual({ zoom: 1, x: 0, y: 0 });
     expect(result.current.canZoomOut).toBe(false);
   });
 
@@ -90,22 +90,41 @@ describe("editor viewport", () => {
     act(() => result.current.pointerHandlers.onPointerDownCapture(click as never));
     expect(click.preventDefault).not.toHaveBeenCalled();
     rerender({ source: image, hand: true });
+    act(() => result.current.zoomIn());
     act(() => result.current.pointerHandlers.onPointerDownCapture(event(100, 100) as never));
     act(() => result.current.pointerHandlers.onPointerMoveCapture(event(150, 130) as never));
-    expect(result.current.viewport).toEqual({ zoom: 1, x: 50, y: 30 });
+    expect(result.current.viewport).toEqual({ zoom: 1.25, x: 50, y: 30 });
     expect(result.current.isPanning).toBe(true);
     act(() => result.current.pointerHandlers.onPointerUpCapture(event(150, 130) as never));
     expect(result.current.isPanning).toBe(false);
     expect(container.releasePointerCapture).toHaveBeenCalledWith(7);
   });
 
-  it("permits actual size for both very long captures and tiny images", () => {
+  it("permits actual size for long captures but preserves the fit floor for tiny images", () => {
     const { result, rerender } = setup();
     rerender({ source: Object.assign(document.createElement("canvas"), { width: 2000, height: 50000 }), hand: false });
     act(() => result.current.actualSize());
     expect(result.current.displayScale).toBe(1);
     rerender({ source: Object.assign(document.createElement("canvas"), { width: 10, height: 5 }), hand: false });
+    expect(result.current.canActualSize).toBe(false);
     act(() => result.current.actualSize());
-    expect(result.current.displayScale).toBe(1);
+    expect(result.current.viewport).toEqual({ zoom: 1, x: 0, y: 0 });
+    expect(result.current.displayScale).toBe(100);
+  });
+
+  it("stops wheel, pinch, and keyboard zoom-out at fit and keeps fit centered", () => {
+    const { result } = setup();
+    act(() => result.current.actualSize());
+    act(() => { fireEvent.wheel(container, { deltaX: 10000, deltaY: -10000 }); });
+    expect(result.current.viewport).toEqual({ zoom: 2, x: -500, y: 250 });
+    act(() => { fireEvent.wheel(container, { ctrlKey: true, deltaY: 1000, clientX: 900, clientY: 400 }); });
+    expect(result.current.viewport).toEqual({ zoom: 1, x: 0, y: 0 });
+    act(() => { fireEvent(container, new Event("gesturestart")); });
+    act(() => { fireEvent(container, Object.assign(new Event("gesturechange"), { scale: 0.01, clientX: 900, clientY: 400 })); });
+    act(() => { fireEvent(container, new Event("gestureend")); });
+    act(() => { fireEvent.keyDown(window, { key: "-", metaKey: true }); });
+    act(() => { fireEvent.wheel(container, { deltaX: 100, deltaY: 100 }); });
+    expect(result.current.viewport).toEqual({ zoom: 1, x: 0, y: 0 });
+    expect(result.current.canZoomOut).toBe(false);
   });
 });

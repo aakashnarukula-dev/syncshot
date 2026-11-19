@@ -21,7 +21,9 @@ describe("preview transforms preserve editing pixels", () => {
   it("draws at original image coordinates after zoom without resampling the bitmap", () => {
     const view = render(<AnnotationCanvas {...props} />);
     const canvas = view.container.querySelector("canvas")!;
+    expect(view.getByRole("button", { name: "Zoom out" })).toBeDisabled();
     fireEvent.click(view.getByRole("button", { name: "Actual image size" }));
+    expect(view.getByRole("button", { name: "Zoom out" })).toBeEnabled();
     expect(view.container.querySelector("[data-editor-transform]")).toHaveStyle({ transform: "translate(0px, 0px) scale(2)" });
     expect(view.getByLabelText("Image zoom")).toHaveTextContent("100%");
     expect(canvas.width).toBe(2000);
@@ -33,6 +35,7 @@ describe("preview transforms preserve editing pixels", () => {
     fireEvent.mouseUp(canvas, { clientX: 100, clientY: 100 });
     expect(props.onAnnotationAdd).toHaveBeenCalledWith(expect.objectContaining({ type: "rectangle", x: 500, y: 250, width: 100, height: 100 }));
     fireEvent.click(view.getByRole("button", { name: "Fit image to window" }));
+    expect(view.getByRole("button", { name: "Zoom out" })).toBeDisabled();
     expect(view.container.querySelector("[data-editor-transform]")).toHaveStyle({ transform: "translate(0px, 0px) scale(1)" });
   });
 

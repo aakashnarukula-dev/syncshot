@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useRef, useState, type RefObject, type PointerEvent as ReactPointerEvent } from "react";
 import type { EditorBitmap } from "@/lib/canvas-utils";
 
-const MIN_ZOOM = 0.1;
+// Zoom is relative to fit-to-window, so 1 fills the available image area.
+const MIN_ZOOM = 1;
 const MAX_ZOOM = 16;
 const FIT = { zoom: 1, x: 0, y: 0 };
 type Viewport = typeof FIT;
@@ -30,10 +31,11 @@ export function useEditorViewport(
     if (rect && image && rect.width > 0 && rect.height > 0) {
       const fit = Math.min(rect.width / image.width, rect.height / image.height);
       setFitScale(fit);
-      // Keep at least 48px visible so a dragged image cannot get lost.
-      const limitX = Math.max(0, (image.width * fit * next.zoom + rect.width) / 2 - 48);
-      const limitY = Math.max(0, (image.height * fit * next.zoom + rect.height) / 2 - 48);
-      next = { ...next, x: Math.max(-limitX, Math.min(limitX, next.x)), y: Math.max(-limitY, Math.min(limitY, next.y)) };
+      // Clamp to the image edges, including while zooming out from a panned
+      // view. At fit, center the image instead of exposing empty canvas.
+      const limitX = Math.max(0, (image.width * fit * next.zoom - rect.width) / 2);
+      const limitY = Math.max(0, (image.height * fit * next.zoom - rect.height) / 2);
+      next = { ...next, x: limitX > 0 ? Math.max(-limitX, Math.min(limitX, next.x)) : 0, y: limitY > 0 ? Math.max(-limitY, Math.min(limitY, next.y)) : 0 };
     }
     current.current = next;
     setViewport(next);
@@ -45,9 +47,9 @@ export function useEditorViewport(
     if (!rect || !image || !rect.width || !rect.height) return;
     const previous = current.current;
     const fit = Math.min(rect.width / image.width, rect.height / image.height);
-    // Always allow 1:1, including very long captures and tiny images.
+    // Allow 1:1 for long captures, but never shrink below fitted size.
     const nativeZoom = 1 / fit;
-    const zoom = Math.max(Math.min(MIN_ZOOM, nativeZoom), Math.min(Math.max(MAX_ZOOM, nativeZoom), value));
+    const zoom = Math.max(MIN_ZOOM, Math.min(Math.max(MAX_ZOOM, nativeZoom), value));
     const x = (clientX ?? rect.left + rect.width / 2) - rect.left - rect.width / 2;
     const y = (clientY ?? rect.top + rect.height / 2) - rect.top - rect.height / 2;
     const ratio = zoom / previous.zoom;
@@ -172,7 +174,8 @@ export function useEditorViewport(
   return {
     viewport, displayScale: viewport.zoom * fitScale, isPanning, spacePressed, zoomIn, zoomOut, fitToWindow, actualSize,
     canZoomIn: viewport.zoom < Math.max(MAX_ZOOM, 1 / fitScale),
-    canZoomOut: viewport.zoom > Math.min(MIN_ZOOM, 1 / fitScale),
+    canZoomOut: viewport.zoom > MIN_ZOOM,
+    canActualSize: fitScale <= 1,
     pointerHandlers: { onPointerDownCapture, onPointerMoveCapture, onPointerUpCapture: endPan, onPointerCancel: endPan, onLostPointerCapture: endPan },
   };
 }
