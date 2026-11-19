@@ -148,6 +148,10 @@ This permission is required for the app to capture screenshots of your screen.
 5. Extract text: Use the "Extract Text" button to run OCR on your screenshot
 6. Export: `⌘S` to save, `⇧⌘C` to copy to clipboard
 
+### Preview navigation
+
+Use the bottom controls to zoom, fit the image to the window, or view it at actual size (1:1). Pinch or hold `⌘`/`Ctrl` while scrolling to zoom around the pointer. Scroll to pan; use the hand tool, hold `Space` and drag, or drag with the middle mouse button to move the image. View changes do not alter the saved image or annotation coordinates.
+
 ### Auto-apply workflow
 
 For faster workflows, enable **Auto-apply background** on the main screen:
@@ -179,6 +183,10 @@ Capture shortcuts are customizable in Preferences.
 | Undo | `⌘Z` |
 | Redo | `⇧⌘Z` |
 | Delete Annotation | `Delete` or `Backspace` |
+| Zoom In / Out | `⌘+` / `⌘−` |
+| Fit Image to Window | `⌘0` |
+| Actual Image Size | `⌘1` |
+| Pan Image | Hold `Space` and drag |
 | Close Editor | `Esc` |
 
 ## Development

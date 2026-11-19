@@ -1,4 +1,4 @@
-export type ToolType = "circle" | "rectangle" | "line" | "arrow" | "text" | "number" | "blur" | "crop" | "select" | null;
+export type ToolType = "circle" | "rectangle" | "line" | "arrow" | "text" | "number" | "blur" | "crop" | "select" | "pan" | null;
 
 export type LineType = "straight" | "curved";
 

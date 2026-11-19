@@ -3,6 +3,9 @@ import { useRef, useEffect, useState, useCallback, memo } from "react";
 import { Annotation, ToolType, Point } from "@/types/annotations";
 import { drawAnnotationOnCanvas } from "@/lib/annotation-utils";
 import { cn } from "@/lib/utils";
+import { useEditorViewport } from "@/hooks/useEditorViewport";
+import { Button } from "@/components/ui/button";
+import { ZoomIn, ZoomOut, Maximize } from "lucide-react";
 
 function getDistanceToQuadraticCurve(
   point: Point,
@@ -132,6 +135,8 @@ export const AnnotationCanvas = memo(function AnnotationCanvas({
   const imageRef = useRef<EditorBitmap | null>(null);
   const rafRef = useRef<number | null>(null);
   const readyNotifiedRef = useRef(false);
+  const { viewport, displayScale, isPanning, spacePressed, zoomIn, zoomOut, fitToWindow, actualSize, canZoomIn, canZoomOut, pointerHandlers } =
+    useEditorViewport(containerRef, previewImage, selectedTool === "pan");
   
   // Local state for drag operation - avoids store updates during drag
   const [imageLoaded, setImageLoaded] = useState(false);
@@ -189,7 +194,7 @@ export const AnnotationCanvas = memo(function AnnotationCanvas({
 
   const createAnnotation = useCallback(
     (type: ToolType, start: Point, end: Point): Annotation | null => {
-      if (!type || type === "select" || type === "crop") return null;
+      if (!type || type === "select" || type === "crop" || type === "pan") return null;
 
       const defaultColor = { hex: activeColor, opacity: 100 };
       const defaultBorder = { width: 5, color: { hex: activeColor, opacity: 100 } };
@@ -757,6 +762,7 @@ export const AnnotationCanvas = memo(function AnnotationCanvas({
   }, [imageLoaded, redraw]);
 
   const handleMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    if (e.button !== 0 || selectedTool === "pan" || spacePressed || isPanning) return;
     const point = getCanvasCoordinates(e);
 
     if (selectedTool === "crop") {
@@ -970,6 +976,7 @@ export const AnnotationCanvas = memo(function AnnotationCanvas({
   }, []);
 
   const handleMouseMove = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
+    if (selectedTool === "pan" || spacePressed || isPanning) return;
     const point = getCanvasCoordinates(e);
     const canvas = canvasRef.current;
 
@@ -1067,7 +1074,7 @@ export const AnnotationCanvas = memo(function AnnotationCanvas({
         setHoveredHandleId(null);
       }
     }
-  }, [getCanvasCoordinates, resizingAnnotation, resizeHandle, resizeStartPoint, draggingAnnotation, dragOffset, annotations, isDrawing, startPoint, selectedTool, selectedAnnotation, applyResize, getHandleAtPoint, isPointInAnnotation, getCursorForHandle, onAnnotationUpdateTransient, onAnnotationUpdate, cropRect]);
+  }, [getCanvasCoordinates, resizingAnnotation, resizeHandle, resizeStartPoint, draggingAnnotation, dragOffset, annotations, isDrawing, startPoint, selectedTool, selectedAnnotation, applyResize, getHandleAtPoint, isPointInAnnotation, getCursorForHandle, onAnnotationUpdateTransient, onAnnotationUpdate, cropRect, spacePressed, isPanning]);
 
   const handleMouseUp = () => {
     if (selectedTool === "crop") {
@@ -1138,11 +1145,8 @@ export const AnnotationCanvas = memo(function AnnotationCanvas({
     }
   };
 
-  if (!previewImage) {
-    return null;
-  }
-
   const handleDoubleClick = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    if (selectedTool === "pan" || spacePressed || isPanning) return;
     const point = getCanvasCoordinates(e);
     const hit = [...annotations].reverse().find(
       (ann) => ann.type === "text" && isPointInAnnotation(point, ann)
@@ -1160,14 +1164,11 @@ export const AnnotationCanvas = memo(function AnnotationCanvas({
     const canvas = canvasRef.current;
     const container = containerRef.current;
     if (!editingText || editingText.type !== "text" || !canvas || !container) return null;
-    const cRect = canvas.getBoundingClientRect();
-    const conRect = container.getBoundingClientRect();
-    const offsetX = cRect.left - conRect.left;
-    const offsetY = cRect.top - conRect.top;
-    const scale = cRect.width / canvas.width || 1;
+    // Overlay shares the canvas transform; use untransformed CSS pixels.
+    const scale = parseFloat(canvas.style.width) / canvas.width || 1;
     return {
-      left: offsetX + editingText.x * scale,
-      top: offsetY + editingText.y * scale,
+      left: editingText.x * scale,
+      top: editingText.y * scale,
       width: editingText.width * scale,
       height: editingText.height * scale,
       fontSize: editingText.fontSize * scale,
@@ -1190,70 +1191,90 @@ export const AnnotationCanvas = memo(function AnnotationCanvas({
     onAnnotationUpdate({ ...editingText, text: next });
   };
 
+  if (!previewImage) return null;
+
   return (
-    <div ref={containerRef} className="relative flex items-center justify-center w-full h-full min-w-0 min-h-0">
-      <canvas
-        ref={canvasRef}
-        data-editor-canvas
-        onMouseDown={handleMouseDown}
-        onMouseMove={handleMouseMove}
-        onMouseUp={handleMouseUp}
-        onMouseLeave={handleMouseUp}
-        onDoubleClick={handleDoubleClick}
-        style={{
-          maxWidth: "100%",
-          maxHeight: "100%",
-          width: "auto",
-          height: "auto",
-          display: "block",
-        }}
-        className={cn(
-          showTransparencyGrid &&
-            "bg-[url('data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMjAiIGhlaWdodD0iMjAiIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyI+PGRlZnM+PHBhdHRlcm4gaWQ9ImNoZWNrZXJib2FyZCIgd2lkdGg9IjEwIiBoZWlnaHQ9IjEwIiBwYXR0ZXJuVW5pdHM9InVzZXJTcGFjZU9uVXNlIj48cmVjdCB3aWR0aD0iNSIgaGVpZ2h0PSI1IiBmaWxsPSIjZmZmIi8+PHJlY3QgeD0iNSIgd2lkdGg9IjUiIGhlaWdodD0iNSIgZmlsbD0iI2UwZTBlMCIvPjxyZWN0IHk9IjUiIHdpZHRoPSI1IiBoZWlnaHQ9IjUiIGZpbGw9IiNlMGUwZTAiLz48cmVjdCB4PSI1IiB5PSI1IiB3aWR0aD0iNSIgaGVpZ2h0PSI1IiBmaWxsPSIjZmZmIi8+PC9wYXR0ZXJuPjwvZGVmcz48cmVjdCB3aWR0aD0iMjAiIGhlaWdodD0iMjAiIGZpbGw9InVybCgjY2hlY2tlcmJvYXJkKSIvPjwvc3ZnPg==')]",
-          selectedTool === "select" ? "" : "cursor-crosshair"
-        )}
-      />
-      {editingTextOverlay && (
-        <textarea
-          ref={editingTextRef}
-          defaultValue={editingTextOverlay.value}
-          onBlur={(e) => {
-            commitEditingText(e.target.value);
-            setEditingTextId(null);
-          }}
-          onKeyDown={(e) => {
-            if (e.key === "Escape") {
-              e.preventDefault();
-              setEditingTextId(null);
-            } else if (e.key === "Enter" && !e.shiftKey) {
-              e.preventDefault();
-              const val = (e.target as HTMLTextAreaElement).value;
-              commitEditingText(val);
-              setEditingTextId(null);
-            }
-          }}
-          spellCheck={false}
+    <div ref={containerRef} {...pointerHandlers} data-editor-viewport className="relative flex items-center justify-center w-full h-full min-w-0 min-h-0 overflow-hidden touch-none select-none">
+      <div
+        className="relative shrink-0"
+        data-editor-transform
+        style={{ transform: `translate(${viewport.x}px, ${viewport.y}px) scale(${viewport.zoom})` }}
+      >
+        <canvas
+          ref={canvasRef}
+          data-editor-canvas
+          onMouseDown={handleMouseDown}
+          onMouseMove={handleMouseMove}
+          onMouseUp={handleMouseUp}
+          onMouseLeave={handleMouseUp}
+          onDoubleClick={handleDoubleClick}
           style={{
-            position: "absolute",
-            left: editingTextOverlay.left,
-            top: editingTextOverlay.top,
-            width: editingTextOverlay.width,
-            height: editingTextOverlay.height,
-            fontSize: editingTextOverlay.fontSize,
-            fontFamily: editingTextOverlay.fontFamily,
-            color: editingTextOverlay.color,
-            lineHeight: 1,
-            padding: 0,
-            margin: 0,
-            border: "1px dashed rgba(59,130,246,0.7)",
-            outline: "none",
-            background: "transparent",
-            resize: "none",
-            overflow: "hidden",
-            zIndex: 30,
+            width: "auto",
+            height: "auto",
+            display: "block",
+            cursor: isPanning ? "grabbing" : selectedTool === "pan" || spacePressed ? "grab" : undefined,
           }}
+          className={cn(
+            showTransparencyGrid &&
+              "bg-[url('data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMjAiIGhlaWdodD0iMjAiIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyI+PGRlZnM+PHBhdHRlcm4gaWQ9ImNoZWNrZXJib2FyZCIgd2lkdGg9IjEwIiBoZWlnaHQ9IjEwIiBwYXR0ZXJuVW5pdHM9InVzZXJTcGFjZU9uVXNlIj48cmVjdCB3aWR0aD0iNSIgaGVpZ2h0PSI1IiBmaWxsPSIjZmZmIi8+PHJlY3QgeD0iNSIgd2lkdGg9IjUiIGhlaWdodD0iNSIgZmlsbD0iI2UwZTBlMCIvPjxyZWN0IHk9IjUiIHdpZHRoPSI1IiBoZWlnaHQ9IjUiIGZpbGw9IiNlMGUwZTAiLz48cmVjdCB4PSI1IiB5PSI1IiB3aWR0aD0iNSIgaGVpZ2h0PSI1IiBmaWxsPSIjZmZmIi8+PC9wYXR0ZXJuPjwvZGVmcz48cmVjdCB3aWR0aD0iMjAiIGhlaWdodD0iMjAiIGZpbGw9InVybCgjY2hlY2tlcmJvYXJkKSIvPjwvc3ZnPg==')]",
+            selectedTool === "select" || selectedTool === "pan" ? "" : "cursor-crosshair"
+          )}
         />
-      )}
+        {editingTextOverlay && (
+          <textarea
+            ref={editingTextRef}
+            defaultValue={editingTextOverlay.value}
+            onBlur={(e) => {
+              commitEditingText(e.target.value);
+              setEditingTextId(null);
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "Escape") {
+                e.preventDefault();
+                setEditingTextId(null);
+              } else if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                const val = (e.target as HTMLTextAreaElement).value;
+                commitEditingText(val);
+                setEditingTextId(null);
+              }
+            }}
+            spellCheck={false}
+            style={{
+              position: "absolute",
+              left: editingTextOverlay.left,
+              top: editingTextOverlay.top,
+              width: editingTextOverlay.width,
+              height: editingTextOverlay.height,
+              fontSize: editingTextOverlay.fontSize,
+              fontFamily: editingTextOverlay.fontFamily,
+              color: editingTextOverlay.color,
+              lineHeight: 1,
+              padding: 0,
+              margin: 0,
+              border: "1px dashed rgba(59,130,246,0.7)",
+              outline: "none",
+              background: "transparent",
+              resize: "none",
+              overflow: "hidden",
+              zIndex: 30,
+            }}
+          />
+        )}
+      </div>
+      <div
+        data-viewport-controls
+        role="group"
+        aria-label="Preview zoom"
+        className="absolute bottom-3 left-1/2 z-10 flex -translate-x-1/2 items-center gap-1 rounded-lg border border-white/10 bg-black/90 p-1 text-white shadow-lg"
+        title="Pinch or ⌘/Ctrl + scroll to zoom · Scroll to move · Space + drag to move"
+      >
+        <Button variant="ghost" size="icon" className="size-8" aria-label="Zoom out" title="Zoom out (⌘/Ctrl −)" onClick={zoomOut} disabled={!canZoomOut}><ZoomOut className="size-4" /></Button>
+        <span className="min-w-12 text-center text-xs tabular-nums" aria-label="Image zoom">{Math.round(displayScale * 100)}%</span>
+        <Button variant="ghost" size="icon" className="size-8" aria-label="Zoom in" title="Zoom in (⌘/Ctrl +)" onClick={zoomIn} disabled={!canZoomIn}><ZoomIn className="size-4" /></Button>
+        <Button variant="ghost" size="icon" className="size-8" aria-label="Fit image to window" title="Fit to window (⌘/Ctrl 0)" onClick={fitToWindow}><Maximize className="size-4" /></Button>
+        <Button variant="ghost" size="sm" className="h-8 px-2 text-xs" aria-label="Actual image size" title="Actual size (⌘/Ctrl 1)" onClick={actualSize}>1:1</Button>
+      </div>
     </div>
   );
 });

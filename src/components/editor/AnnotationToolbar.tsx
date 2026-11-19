@@ -1,5 +1,5 @@
 import { memo } from "react";
-import { Circle, Square, Minus, ArrowUpRight, Type, Hash, MousePointer2, Trash2, Scan, Crop, FileText, Loader2, Check } from "lucide-react";
+import { Circle, Square, Minus, ArrowUpRight, Type, Hash, MousePointer2, Hand, Trash2, Scan, Crop, FileText, Loader2, Check } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { ToolType } from "@/types/annotations";
@@ -20,6 +20,7 @@ interface AnnotationToolbarProps {
 
 const tools: Array<{ type: ToolType; icon: React.ReactNode; label: string }> = [
   { type: "select", icon: <MousePointer2 className="size-4" />, label: "Select" },
+  { type: "pan", icon: <Hand className="size-4" />, label: "Move image — or hold Space and drag" },
   { type: "circle", icon: <Circle className="size-4" />, label: "Circle" },
   { type: "rectangle", icon: <Square className="size-4" />, label: "Rectangle" },
   { type: "line", icon: <Minus className="size-4" />, label: "Line" },
@@ -53,6 +54,7 @@ export const AnnotationToolbar = memo(function AnnotationToolbar({ selectedTool,
                       : "text-muted-foreground hover:text-foreground hover:bg-white/5"
                   )}
                   aria-label={tool.label}
+                  aria-pressed={selectedTool === tool.type}
                 >
                   {tool.icon}
                 </Button>
